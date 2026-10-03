@@ -315,6 +315,8 @@ pm2 save
 
 Use **Settings → Behavior → Auto-join channels** to limit automatic recording to selected voice channels. Existing servers start with **All voice channels**. An empty selection under **Only selected voice channels** disables automatic starts. Manual `/join` remains available.
 
+Use **Settings → Transcription vocabulary** to import a UTF-8 text or Markdown file with one literal term per line. The shared list helps new transcriptions and retries recognize recurring names and terms.
+
 Enable **Settings → Behavior → Keep recordings** for future meetings. Find the WAV download in a completed meeting’s action menu. Recordings expire after 30 days by default. Set `AUDIO_RETENTION_DAYS` to configure that period.
 
 Edit speaker labels in **Settings → Speaker display names**. Overrides apply by Discord user ID to transcripts and new summaries. Use **Regenerate summary** in a completed meeting’s action menu to apply new names or prompt/model settings to existing notes. The background job uses the saved transcript, and regenerated notes stay in Parley.

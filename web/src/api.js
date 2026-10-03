@@ -60,6 +60,8 @@ export const api = {
   commands: () => fetch('/api/commands').then(json),
   config: (g) => fetch(`/api/guilds/${g}/config`).then(json),
   saveConfig: (g, patch) => fetch(`/api/guilds/${g}/config`, jsonBody('PATCH', patch)).then(json),
+  vocabulary: () => fetch('/api/vocabulary').then(json),
+  importVocabulary: (text) => fetch('/api/vocabulary', jsonBody('PUT', { text })).then(json),
   speakerNames: (g) => fetch(`/api/guilds/${g}/speaker-names`).then(json),
   setSpeakerName: (g, id, name) => fetch(`/api/guilds/${g}/speaker-names/${id}`, jsonBody('PUT', { name })).then(json),
   providerModels: (provider, refresh = false) => fetch(`/api/providers/${provider}/models${refresh ? '?refresh=1' : ''}`).then(json),

@@ -6,6 +6,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { ensureMixedWav } from '../voice/mix.js';
 import { getGuildConfig, setGuildConfig } from '../store/config.js';
+import { getVocabulary, setVocabulary } from '../store/vocabulary.js';
 import { validateSetup, availableProviders } from '../commands/setup-logic.js';
 import { config as env } from '../config/env.js';
 import { askMeeting } from '../adapters/summarizer/ask.js';
@@ -289,6 +290,16 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
   r.get('/guilds/:g/search', (req, res) => {
     const q = (req.query.q || '').trim();
     res.json(q ? db.searchUtterances(req.params.g, q) : []);
+  });
+
+  r.get('/vocabulary', (_req, res) => res.json({ vocabulary: getVocabulary(db) }));
+  r.put('/vocabulary', requireAdmin, (req, res) => {
+    try {
+      const vocabulary = setVocabulary(db, req.body?.text);
+      res.json({ ok: true, vocabulary });
+    } catch (error) {
+      res.status(400).json({ error: error.message });
+    }
   });
 
   r.get('/guilds/:g/speaker-names', requireAdmin, (req, res) => {
