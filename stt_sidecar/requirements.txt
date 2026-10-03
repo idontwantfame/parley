@@ -1,4 +1,7 @@
 faster-whisper>=1.1.0
+# faster-whisper (<=1.2.1) calls av.open(metadata_errors=...), which PyAV 19
+# removed; every /transcribe then fails with a TypeError. Lift once fixed upstream.
+av<19
 fastapi>=0.115.0
 uvicorn>=0.32.0
 python-multipart>=0.0.12
