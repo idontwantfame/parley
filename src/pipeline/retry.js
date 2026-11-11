@@ -20,6 +20,7 @@ import { describeSummarizerError } from '../adapters/summarizer/errors.js';
 import { parsePcmName } from '../voice/audio.js';
 import { processMeeting } from './orchestrator.js';
 import { autoExportMeeting } from '../delivery/meeting-export.js';
+import { campaignContextFor, foldMeetingIntoJournal } from '../campaign/journal.js';
 
 // Statuses the UI should offer a retry for.
 export const RETRYABLE_STATUSES = new Set(['transcription_failed', 'summary_failed', 'processing', 'recording']);
@@ -39,6 +40,7 @@ async function summarizeStored(db, meeting, cfg) {
     attendees: db.listAttendees(meeting.id).map((a) => a.display_name),
     summaryLanguage: resolveSummaryLanguage(cfg),
     summaryPrompt: cfg.summaryPrompt,
+    campaignContext: campaignContextFor(db, meeting),
   };
   const summarizer = getSummarizer(cfg);
   const notes = await summarizer.summarize(transcript, meta);
@@ -139,6 +141,9 @@ export async function retryMeeting(db, meetingId, { dataDir, deliver = null } = 
     if (!hasAudio) await rm(audioDir, { recursive: true, force: true }).catch(() => {});
     const exportResult = await autoExportMeeting(db, meetingId);
     if (deliver) await deliver(notes, talktime, meta).catch(() => {});
+    // A session that failed earlier never reached its campaign journal.
+    await foldMeetingIntoJournal(db, meetingId, { cfg })
+      .catch((err) => console.error(`[retry] meeting ${meetingId}: campaign journal update failed: ${err.message}`));
     return { ok: true, action: 'resummarize', status: 'done', ...exportResult };
   }
 

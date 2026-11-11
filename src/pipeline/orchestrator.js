@@ -5,6 +5,7 @@ import { describeSummarizerError } from '../adapters/summarizer/errors.js';
 import { resolveSummaryLanguage } from '../adapters/summarizer/languages.js';
 import { autoExportMeeting } from '../delivery/meeting-export.js';
 import { getVocabulary } from '../store/vocabulary.js';
+import { campaignContextFor, foldMeetingIntoJournal } from '../campaign/journal.js';
 
 export async function processMeeting(db, meetingId, opts) {
   const meeting = db.getMeeting(meetingId);
@@ -76,6 +77,7 @@ export async function processMeeting(db, meetingId, opts) {
     attendees,
     summaryLanguage: resolveSummaryLanguage(opts.cfg),
     summaryPrompt: opts.cfg.summaryPrompt,
+    campaignContext: campaignContextFor(db, meeting),
   };
 
   let notes;
@@ -127,5 +129,18 @@ export async function processMeeting(db, meetingId, opts) {
       console.error(`[pipeline] meeting ${meetingId} summarized but delivery failed: ${deliveryError}`);
     }
   }
-  return { notes, talktime, delivered, deliveryError, audioRetained, ...exportResult };
+
+  // Campaign sessions also update the campaign journal. Best-effort and last:
+  // the notes are already saved and delivered, and a journal failure can be
+  // retried from the Campaigns page ("Update journal").
+  let journal = null;
+  if (meeting.campaign_id) {
+    try {
+      journal = await foldMeetingIntoJournal(db, meetingId, { cfg: opts.cfg, summarizer });
+    } catch (err) {
+      journal = { error: err.message };
+      console.error(`[pipeline] meeting ${meetingId}: campaign journal update failed: ${err.message}`);
+    }
+  }
+  return { notes, talktime, delivered, deliveryError, journal, audioRetained, ...exportResult };
 }
