@@ -23,6 +23,67 @@ import { processMeeting } from './orchestrator.js';
 // Statuses the UI should offer a retry for.
 export const RETRYABLE_STATUSES = new Set(['transcription_failed', 'summary_failed', 'processing', 'recording']);
 
+
+// Summarize a meeting's stored utterances with the guild's current summarizer
+// config (provider, model, language, prompt). Throws on summarizer failure;
+// writes nothing.
+async function summarizeStored(db, meeting, cfg) {
+  const utterances = db.listUtterances(meeting.id).map((u) => ({
+    userId: u.user_id, displayName: u.display_name, startMs: u.start_ms, endMs: u.end_ms, text: u.text,
+  }));
+  const transcript = buildTranscript(utterances);
+  const talktime = computeTalkTime(utterances);
+  const meta = {
+    channelName: meeting.channel_name, date: meeting.started_at,
+    attendees: db.listAttendees(meeting.id).map((a) => a.display_name),
+    summaryLanguage: resolveSummaryLanguage(cfg),
+    summaryPrompt: cfg.summaryPrompt,
+  };
+  const summarizer = getSummarizer(cfg);
+  const notes = await summarizer.summarize(transcript, meta);
+  const modelUsed = summarizer.lastUsed ?? `${cfg.summarizerProvider}:${cfg.summarizerModel || ''}`;
+  return { notes, talktime, meta, modelUsed };
+}
+
+/** Can this meeting's summary be regenerated from its stored transcript? */
+export function regeneratePlan(db, meetingId) {
+  const meeting = db.getMeeting(meetingId);
+  if (!meeting) return { ok: false, reason: 'Meeting not found.' };
+  // Only finished meetings: failed ones go through retry (which may need to
+  // re-transcribe), and recording/processing rows are still owned by the pipeline.
+  if (meeting.status !== 'done') {
+    return { ok: false, meeting, reason: meeting.status === 'recording' || meeting.status === 'processing'
+      ? 'This meeting is still being recorded or processed.'
+      : 'Only completed meetings can be regenerated — use Retry for failed ones.' };
+  }
+  if (db.listUtterances(meetingId).length === 0) {
+    return { ok: false, meeting, reason: 'This meeting has no transcript to summarize.' };
+  }
+  return { ok: true, meeting };
+}
+
+/**
+ * Regenerate a finished meeting's summary from its stored transcript using the
+ * guild's current summarizer settings. Unlike a retry, a failure leaves the
+ * existing summary and status untouched — the old notes stay until a new set
+ * is actually in hand. Does not re-post to Discord.
+ */
+export async function regenerateSummary(db, meetingId) {
+  const plan = regeneratePlan(db, meetingId);
+  if (!plan.ok) return { ok: false, reason: plan.reason };
+  const meeting = plan.meeting;
+  const cfg = getGuildConfig(db, meeting.guild_id);
+  let result;
+  try {
+    result = await summarizeStored(db, meeting, cfg);
+  } catch (err) {
+    return { ok: false, reason: err.userMessage ?? describeSummarizerError(err, cfg.summarizerProvider) };
+  }
+  const { notes, talktime, modelUsed } = result;
+  db.replaceSummary(meetingId, meeting.guild_id, notes, talktime, modelUsed, meeting.started_at);
+  return { ok: true, status: 'done', modelUsed };
+}
+
 /** Decide what a retry would do, without doing it (for enabling UI + messaging). */
 export function retryPlan(db, meetingId, { dataDir, exists = readdirSync } = {}) {
   const meeting = db.getMeeting(meetingId);
@@ -52,30 +113,17 @@ export async function retryMeeting(db, meetingId, { dataDir, deliver = null } = 
   const cfg = getGuildConfig(db, meeting.guild_id);
 
   if (plan.action === 'resummarize') {
-    const utterances = db.listUtterances(meetingId).map((u) => ({
-      userId: u.user_id, displayName: u.display_name, startMs: u.start_ms, endMs: u.end_ms, text: u.text,
-    }));
-    const transcript = buildTranscript(utterances);
-    const talktime = computeTalkTime(utterances);
-    const meta = {
-      channelName: meeting.channel_name, date: meeting.started_at,
-      attendees: db.listAttendees(meetingId).map((a) => a.display_name),
-      summaryLanguage: resolveSummaryLanguage(cfg),
-      summaryPrompt: cfg.summaryPrompt,
-    };
     db.setMeetingStatus(meetingId, 'processing');
-    let notes;
-    const summarizer = getSummarizer(cfg);
+    let result;
     try {
-      notes = await summarizer.summarize(transcript, meta);
+      result = await summarizeStored(db, meeting, cfg);
     } catch (err) {
       db.setMeetingStatus(meetingId, 'summary_failed');
       return { ok: false, action: 'resummarize', status: 'summary_failed',
         reason: err.userMessage ?? describeSummarizerError(err, cfg.summarizerProvider) };
     }
-    db.clearSummary(meetingId);
-    db.saveSummary(meetingId, notes, talktime, summarizer.lastUsed ?? `${cfg.summarizerProvider}:${cfg.summarizerModel || ''}`);
-    db.seedTodos(meetingId, meeting.guild_id, notes.actionItems || [], meeting.started_at);
+    const { notes, talktime, meta, modelUsed } = result;
+    db.replaceSummary(meetingId, meeting.guild_id, notes, talktime, modelUsed, meeting.started_at);
     db.setMeetingStatus(meetingId, 'done', new Date().toISOString());
     if (deliver) await deliver(notes, talktime, meta).catch(() => {});
     return { ok: true, action: 'resummarize', status: 'done' };

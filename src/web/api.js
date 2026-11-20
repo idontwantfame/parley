@@ -15,7 +15,7 @@ import { DEFAULT_OVERVIEW_PROMPT } from '../adapters/summarizer/ollama.js';
 import { listModels, clearModelCache, DEFAULT_MODELS, CATALOG_PROVIDERS } from '../adapters/summarizer/models.js';
 import { secretStatus, setProviderKey, isSecretProvider, connectionStatus, setConnection } from '../store/secrets.js';
 import { COMMAND_CATALOG } from '../commands/definitions.js';
-import { retryMeeting, retryPlan, RETRYABLE_STATUSES } from '../pipeline/retry.js';
+import { retryMeeting, retryPlan, RETRYABLE_STATUSES, regeneratePlan, regenerateSummary } from '../pipeline/retry.js';
 import { availableSttProviders } from '../adapters/stt/index.js';
 import { requireAdmin } from './auth.js';
 
@@ -39,6 +39,8 @@ function anyGuildUsesSidecar(db) {
 
 export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
   const r = Router();
+  // Meeting ids with a summary regeneration in flight (guards double-submits).
+  const regenerating = new Set();
   // The live Discord client may not exist yet (bot starts lazily once creds are
   // set). Always resolve it fresh from the controller so routes pick it up the
   // moment the bot connects, without rebuilding the router. `client` is still
@@ -120,12 +122,14 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     const meeting = db.getMeeting(id);
     if (!meeting) return res.status(404).json({ error: 'meeting not found' });
     const plan = retryPlan(db, id, { dataDir: env.dataDir });
+    const regen = regeneratePlan(db, id);
     res.json({
       meeting,
       summary: db.getSummary(id),
       attendees: db.listAttendees(id),
       utterances: db.listUtterances(id),
       retry: { eligible: RETRYABLE_STATUSES.has(meeting.status) && plan.ok, action: plan.action, reason: plan.reason || null },
+      regenerate: { eligible: regen.ok, reason: regen.reason || null },
     });
   });
 
@@ -184,6 +188,25 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
       res.json({ ok: true, ...result, meeting: db.getMeeting(id) });
     } catch (e) {
       res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Regenerate a completed meeting's summary from its stored transcript with the
+  // guild's current summarizer settings (e.g. after changing model or prompt).
+  // On failure the existing notes are kept. Not re-posted to Discord.
+  r.post('/meetings/:id/regenerate', requireAdmin, async (req, res) => {
+    const id = Number(req.params.id);
+    if (!db.getMeeting(id)) return res.status(404).json({ error: 'meeting not found' });
+    if (regenerating.has(id)) return res.status(409).json({ error: 'A regeneration is already running for this meeting.' });
+    regenerating.add(id);
+    try {
+      const result = await regenerateSummary(db, id);
+      if (!result.ok) return res.status(502).json({ error: result.reason || 'Regeneration failed.', ...result });
+      res.json({ ok: true, ...result, summary: db.getSummary(id) });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    } finally {
+      regenerating.delete(id);
     }
   });
 

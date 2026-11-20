@@ -188,8 +188,8 @@ function AskBox({ guildId, meetingId }) {
   );
 }
 
-/* ── meeting actions (delete / merge / export) ─────────────────────────── */
-function MeetingActions({ meeting, meetings }) {
+/* ── meeting actions (export / regenerate / merge / delete) ────────────── */
+function MeetingActions({ meeting, meetings, regenerate, regenerating, onRegenerate }) {
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState(false); // false | 'pick' | 'busy'
@@ -226,6 +226,12 @@ function MeetingActions({ meeting, meetings }) {
             className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-ink hover:bg-surface-2 no-underline">
             <Icon.Download width={15} height={15} /> Export (markdown)
           </a>
+          <button role="menuitem" onClick={() => { setOpen(false); onRegenerate?.(); }}
+            disabled={!regenerate?.eligible || regenerating}
+            title={!regenerate?.eligible && regenerate?.reason ? regenerate.reason : 'Re-run the summary with the current summarizer settings'}
+            className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-ink hover:bg-surface-2 disabled:opacity-40">
+            <Icon.Refresh width={15} height={15} /> Regenerate summary
+          </button>
           <button role="menuitem" onClick={() => { setMode('pick'); setOpen(false); }} disabled={others.length === 0}
             className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-ink hover:bg-surface-2 disabled:opacity-40">
             <Icon.Merge width={15} height={15} /> Merge another meeting
@@ -292,6 +298,19 @@ function Note({ data, todos, guildId, meetings, refetchTodos, onReload }) {
   const duration = fmtDuration(meeting.started_at, meeting.ended_at);
   const meetingTodos = todos.filter((t) => String(t.meeting_id) === String(meeting.id));
   const isFailed = ['transcription_failed', 'summary_failed', 'processing'].includes(meeting.status);
+  const [regen, setRegen] = useState({ busy: false, err: null });
+
+  async function regenerateSummary() {
+    if (!window.confirm('Regenerate the summary with the current summarizer settings? The current notes will be replaced; action items you already checked off stay checked if they reappear.')) return;
+    setRegen({ busy: true, err: null });
+    try {
+      await api.regenerateSummary(meeting.id);
+      setRegen({ busy: false, err: null });
+      onReload?.();
+    } catch (e) {
+      setRegen({ busy: false, err: e?.message || 'Regeneration failed.' });
+    }
+  }
 
   return (
     <article className="max-w-[760px] mx-auto pb-12 animate-fade-up">
@@ -311,7 +330,8 @@ function Note({ data, todos, guildId, meetings, refetchTodos, onReload }) {
               {attendees?.length > 0 && <span className="inline-flex items-center gap-1.5"><Icon.Users width={14} height={14} />{attendees.length} attendees</span>}
             </p>
           </div>
-          <MeetingActions meeting={meeting} meetings={meetings} />
+          <MeetingActions meeting={meeting} meetings={meetings} regenerate={data.regenerate}
+            regenerating={regen.busy} onRegenerate={regenerateSummary} />
         </div>
 
         {attendees?.length > 0 && (
@@ -322,6 +342,24 @@ function Note({ data, todos, guildId, meetings, refetchTodos, onReload }) {
       </header>
 
       {isFailed && <RetryBanner meeting={meeting} retry={retry} onDone={onReload} />}
+
+      {regen.busy && (
+        <div className="card p-4 mt-8 flex items-center gap-3" role="status">
+          <span className="h-4 w-4 rounded-full border-2 border-primary border-t-transparent animate-spin shrink-0" />
+          <p className="text-[13.5px] text-muted">Regenerating the summary with the current summarizer settings…</p>
+        </div>
+      )}
+      {regen.err && (
+        <div className="card p-4 mt-8 border-l-2 flex items-start gap-3" style={{ borderColor: 'var(--error)' }} role="alert">
+          <Icon.Alert width={18} height={18} className="text-error shrink-0 mt-0.5" />
+          <div className="min-w-0 flex-1">
+            <p className="text-[14px] font-semibold text-ink">Couldn't regenerate the summary</p>
+            <p className="text-[13px] text-error mt-1">{regen.err}</p>
+            <p className="text-[13px] text-muted mt-1">The previous notes were kept.</p>
+          </div>
+          <button onClick={() => setRegen({ busy: false, err: null })} className="btn btn-ghost !py-1 !px-2 text-xs shrink-0">Dismiss</button>
+        </div>
+      )}
 
       {!notes && !isFailed && <p className="text-sm text-muted mt-8">No summary available — status: {meeting.status}.</p>}
 

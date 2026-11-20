@@ -176,6 +176,34 @@ export function openDb(path) {
       sql.prepare(`DELETE FROM summaries WHERE meeting_id = ?`).run(meetingId);
       sql.prepare(`DELETE FROM todos WHERE meeting_id = ?`).run(meetingId);
     },
+    // Atomically swap a meeting's summary + seeded todos for a freshly generated
+    // one. Action items that survive the regeneration (same assignee + task)
+    // keep their done state, so re-running the summary doesn't silently re-open
+    // work people already ticked off. Returns the number of todos seeded.
+    replaceSummary(meetingId, guildId, notes, talktime, modelUsed, todoCreatedAt) {
+      const key = (assignee, task) => `${assignee ?? ''}\u0000${task}`;
+      sql.exec('BEGIN');
+      try {
+        const doneKeys = new Set(
+          sql.prepare(`SELECT assignee, task FROM todos WHERE meeting_id = ? AND done = 1`).all(meetingId)
+            .map((t) => key(t.assignee, t.task))
+        );
+        this.clearSummary(meetingId);
+        this.saveSummary(meetingId, notes, talktime, modelUsed);
+        const n = this.seedTodos(meetingId, guildId, notes.actionItems || [], todoCreatedAt);
+        if (doneKeys.size) {
+          const mark = sql.prepare(`UPDATE todos SET done = 1 WHERE id = ?`);
+          for (const t of sql.prepare(`SELECT id, assignee, task FROM todos WHERE meeting_id = ?`).all(meetingId)) {
+            if (doneKeys.has(key(t.assignee, t.task))) mark.run(t.id);
+          }
+        }
+        sql.exec('COMMIT');
+        return n;
+      } catch (e) {
+        sql.exec('ROLLBACK');
+        throw e;
+      }
+    },
     setMeetingStatus(id, status, endedAt = null) {
       // ended_at only fills in when still null: the recording-stop timestamp
       // (stamped at 'processing') must win over the pipeline-finish timestamp
