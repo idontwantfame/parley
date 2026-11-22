@@ -40,6 +40,7 @@ export const api = {
   meeting: (id) => fetch(`/api/meetings/${id}`).then(json),
   // Export URL for a download link/button (md or json). Not fetched via json().
   exportMeetingUrl: (id, format = 'md') => `/api/meetings/${id}/export?format=${format}`,
+  meetingAudioUrl: (id) => `/api/meetings/${id}/audio`,
   todos: (g, { open, assignee } = {}) => {
     const p = new URLSearchParams();
     if (open) p.set('open', '1');
@@ -55,9 +56,12 @@ export const api = {
   search: (g, q) => fetch(`/api/guilds/${g}/search?q=${encodeURIComponent(q)}`).then(json),
   retryMeeting: (id) => fetch(`/api/meetings/${id}/retry`, { method: 'POST' }).then(json),
   regenerateSummary: (id) => fetch(`/api/meetings/${id}/regenerate`, { method: 'POST' }).then(json),
+  regenerationStatus: (id) => fetch(`/api/meetings/${id}/regenerate`).then(json),
   commands: () => fetch('/api/commands').then(json),
   config: (g) => fetch(`/api/guilds/${g}/config`).then(json),
   saveConfig: (g, patch) => fetch(`/api/guilds/${g}/config`, jsonBody('PATCH', patch)).then(json),
+  speakerNames: (g) => fetch(`/api/guilds/${g}/speaker-names`).then(json),
+  setSpeakerName: (g, id, name) => fetch(`/api/guilds/${g}/speaker-names/${id}`, jsonBody('PUT', { name })).then(json),
   providerModels: (provider, refresh = false) => fetch(`/api/providers/${provider}/models${refresh ? '?refresh=1' : ''}`).then(json),
   setProviderKey: (provider, key) => fetch(`/api/providers/${provider}/key`, jsonBody('PUT', { key })).then(json),
   systemStatus: () => fetch('/api/system/status').then(json),

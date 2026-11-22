@@ -139,17 +139,18 @@ A fully self-hosted alternative to Otter/Fathom/Fireflies, built for Discord. Au
 
 1. The bot joins a voice channel (via `/join` or automatically when 2+ humans are present) and writes each speaker's audio to its own track.
 2. When the meeting ends, the bot leaves immediately and processes in the background (the dashboard shows a **Processing** card): the orchestrator transcribes the tracks concurrently through the local sidecar, merges utterances into one timestamp-ordered, speaker-labeled transcript, and stores it in SQLite.
-3. The transcript goes to your chosen summarizer, and the structured notes are posted to a Discord thread. Audio is deleted after a successful run; if posting to Discord fails (missing perms, deleted channel) the notes are still saved and readable in the dashboard, so nothing is lost. Per-stage timings (transcribe/summarize) are stored with each meeting.
+3. The transcript goes to your chosen summarizer and the structured notes are posted to Discord. The notes remain in the dashboard if Discord delivery fails. After a successful run, Parley deletes audio unless **Keep recordings** is enabled for that Discord server.
 
 ## 🐳 Quick start (Docker)
 
 The fastest way to self-host. You need [Docker](https://docs.docker.com/get-docker/) (Compose v2) and a Discord bot token. Everything else — Node, Python, ffmpeg, the whisper model — is handled for you.
 
 ```bash
-git clone https://github.com/SakethKanchi/parley.git
+git clone https://github.com/idontwantfame/parley.git
 cd parley
 cp .env.example .env          # you can leave it empty and configure in the browser
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
 Then open **<http://127.0.0.1:3000>** and follow the first-run wizard:
@@ -169,7 +170,9 @@ flowchart LR
   YOU[you] -->|127.0.0.1:3000| BOT
 ```
 
-> **Updating:** `git pull && docker compose up -d --build`. Your volume keeps every meeting and your settings.
+> **Updating:** `git pull && docker compose pull && docker compose up -d`. The volume keeps meetings and settings.
+
+The **Publish container images** workflow pushes both images to GitHub Container Registry with `latest` and `sha-<commit>` tags. Set `PARLEY_BOT_IMAGE` and `PARLEY_SIDECAR_IMAGE` to use specific tags or local builds.
 
 ## 🌍 Where to host it
 
@@ -312,6 +315,10 @@ pm2 save
 
 Use **Settings → Behavior → Auto-join channels** to limit automatic recording to selected voice channels. Existing servers start with **All voice channels**. An empty selection under **Only selected voice channels** disables automatic starts. Manual `/join` remains available.
 
+Enable **Settings → Behavior → Keep recordings** for future meetings. Find the WAV download in a completed meeting’s action menu. Recordings expire after 30 days by default. Set `AUDIO_RETENTION_DAYS` to configure that period.
+
+Edit speaker labels in **Settings → Speaker display names**. Overrides apply by Discord user ID to transcripts and new summaries. Use **Regenerate summary** in a completed meeting’s action menu to apply new names or prompt/model settings to existing notes. The background job uses the saved transcript, and regenerated notes stay in Parley.
+
 ## 🎛️ Configuration
 
 In **Settings → Summarizer**, the **Summary prompt** instructs the model to extract structured JSON notes from the transcript. For long Ollama summaries, the **Overview prompt** controls the final recap from the chunk overviews. Ask for plain text in that field. The prompts are saved per server, and **Restore default** restores the built-in wording.
@@ -342,7 +349,7 @@ Set `DISCORD_RECORDING_NICKNAME` in your environment to customize the bot's nick
 - **openai** — any OpenAI-compatible endpoint. Set `OPENAI_API_KEY` (and `OPENAI_BASE_URL` for third-party gateways).
 - **opencode** — [OpenCode Zen Go](https://opencode.ai/zen/go/v1/models) gateway (OpenAI-compatible). Set `OPENCODE_API_KEY`. Defaults to `glm-5.3` if no model is set. Use the **bare** model id (no `opencode/` prefix) — e.g. `glm-5.3`, `minimax-m3`, `kimi-k3`, `qwen3.8-max`. Override the endpoint with `OPENCODE_BASE_URL` (default `https://opencode.ai/zen/go/v1`).
 - **openrouter** — [OpenRouter](https://openrouter.ai/models) gateway (OpenAI-compatible): one key for models from many vendors. Set `OPENROUTER_API_KEY`. Defaults to `openai/gpt-4o-mini` if no model is set. Model ids are **vendor-namespaced** — e.g. `openai/gpt-4o-mini`, `anthropic/claude-sonnet-4`, `google/gemini-2.5-flash`. Override the endpoint with `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`).
-- **ollama** — fully offline, no key. Run Ollama locally and set `OLLAMA_URL`.
+- **ollama** — fully offline, no key. Set the reachable base address in **Settings → Summarizer → Ollama URL**, or with `OLLAMA_URL`. Dashboard edits apply immediately.
 
 All providers return the same structured-notes shape, so output is consistent regardless of which you pick.
 

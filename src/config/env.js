@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import dotenv from 'dotenv';
 const REQUIRED = ['DISCORD_TOKEN', 'DISCORD_CLIENT_ID'];
+export const DEFAULT_OLLAMA_URL = 'http://127.0.0.1:11434';
 export function resolveDataDir(env = process.env, exists = existsSync, cwd = process.cwd()) {
   if (env.DATA_DIR) return env.DATA_DIR;
   if (exists('/data')) return '/data';
@@ -37,10 +38,12 @@ export function validateEnv(env = process.env) {
   return true;
 }
 
+const retention = process.env.AUDIO_RETENTION_DAYS?.trim();
 export const config = {
   dataDir: resolveDataDir(),
   exportDir: process.env.EXPORT_DIR || join(resolveDataDir(), 'exports'),
   autoExport: !['0', 'false'].includes((process.env.AUTO_EXPORT || '').toLowerCase()),
+  audioRetentionDays: retention && /^\d+$/.test(retention) && Number.isSafeInteger(Number(retention)) ? Number(retention) : 30,
   discordToken: process.env.DISCORD_TOKEN,
   discordClientId: process.env.DISCORD_CLIENT_ID,
   recordingNickname: resolveRecordingNickname(),
@@ -49,5 +52,5 @@ export const config = {
   openai: { apiKey: process.env.OPENAI_API_KEY, baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1' },
   opencode: { apiKey: process.env.OPENCODE_API_KEY, baseUrl: process.env.OPENCODE_BASE_URL || 'https://opencode.ai/zen/go/v1' },
   openrouter: { apiKey: process.env.OPENROUTER_API_KEY, baseUrl: process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1' },
-  ollama: { url: process.env.OLLAMA_URL || 'http://127.0.0.1:11434' },
+  ollama: { url: (process.env.OLLAMA_URL || DEFAULT_OLLAMA_URL).replace(/\/+$/, '') },
 };

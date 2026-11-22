@@ -84,6 +84,10 @@ export function validateSetup(input, env) {
   if (input.notesChannelId !== undefined) patch.notesChannelId = input.notesChannelId;
   if (input.useThread !== undefined) patch.useThread = !!input.useThread;
   if (input.autoJoin !== undefined) patch.autoJoin = !!input.autoJoin;
+  if (input.keepAudio !== undefined) {
+    if (typeof input.keepAudio !== 'boolean') return { ok: false, error: 'Keep recordings must be true or false.' };
+    patch.keepAudio = input.keepAudio;
+  }
   if (input.autoJoinMinPeople !== undefined) {
     if (!Number.isSafeInteger(input.autoJoinMinPeople) || input.autoJoinMinPeople < 1) {
       return { ok: false, error: 'Auto-join minimum must be a whole number of at least 1.' };

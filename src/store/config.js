@@ -15,6 +15,7 @@ export const DEFAULTS = {
   autoJoin: true,
   autoJoinMinPeople: DEFAULT_AUTO_JOIN_MIN_PEOPLE,
   autoJoinChannelIds: null,
+  keepAudio: false,
   language: 'auto',
   summaryLanguage: 'en',
   // null = the built-in SUMMARY_PROMPT (notes.js), resolved at summarize time so
@@ -36,6 +37,7 @@ const COLS = {
   autoJoin: 'auto_join',
   autoJoinMinPeople: 'auto_join_min_people',
   autoJoinChannelIds: 'auto_join_channel_ids',
+  keepAudio: 'keep_audio',
   language: 'language',
   summaryLanguage: 'summary_language',
   summaryPrompt: 'summary_prompt',
@@ -66,6 +68,7 @@ function fromRow(row) {
     autoJoin: row.auto_join == null ? DEFAULTS.autoJoin : !!row.auto_join,
     autoJoinMinPeople: row.auto_join_min_people ?? DEFAULTS.autoJoinMinPeople,
     autoJoinChannelIds: parseAutoJoinChannels(row.auto_join_channel_ids),
+    keepAudio: !!row.keep_audio,
     language: row.language ?? DEFAULTS.language,
     summaryLanguage: row.summary_language ?? DEFAULTS.summaryLanguage,
     summaryPrompt: row.summary_prompt ?? DEFAULTS.summaryPrompt,
@@ -86,8 +89,8 @@ export function setGuildConfig(db, guildId, patch) {
   const merged = { ...current, ...safePatch, guildId };
   db.sql.prepare(
     `INSERT OR REPLACE INTO guild_config
-       (guild_id, summarizer_provider, summarizer_model, summarizer_fallback_provider, summarizer_fallback_model, stt_provider, stt_model, whisper_model, notes_channel_id, use_thread, auto_join, auto_join_min_people, auto_join_channel_ids, language, summary_language, summary_prompt, overview_prompt)
-     VALUES (@guildId, @summarizerProvider, @summarizerModel, @summarizerFallbackProvider, @summarizerFallbackModel, @sttProvider, @sttModel, @whisperModel, @notesChannelId, @useThread, @autoJoin, @autoJoinMinPeople, @autoJoinChannelIds, @language, @summaryLanguage, @summaryPrompt, @overviewPrompt)`
+       (guild_id, summarizer_provider, summarizer_model, summarizer_fallback_provider, summarizer_fallback_model, stt_provider, stt_model, whisper_model, notes_channel_id, use_thread, auto_join, auto_join_min_people, auto_join_channel_ids, language, summary_language, summary_prompt, overview_prompt, keep_audio)
+     VALUES (@guildId, @summarizerProvider, @summarizerModel, @summarizerFallbackProvider, @summarizerFallbackModel, @sttProvider, @sttModel, @whisperModel, @notesChannelId, @useThread, @autoJoin, @autoJoinMinPeople, @autoJoinChannelIds, @language, @summaryLanguage, @summaryPrompt, @overviewPrompt, @keepAudio)`
   ).run({
     guildId,
     summarizerProvider: merged.summarizerProvider,
@@ -106,6 +109,7 @@ export function setGuildConfig(db, guildId, patch) {
     summaryLanguage: merged.summaryLanguage,
     summaryPrompt: merged.summaryPrompt,
     overviewPrompt: merged.overviewPrompt,
+    keepAudio: merged.keepAudio ? 1 : 0,
   });
   return merged;
 }

@@ -63,8 +63,7 @@ export function startBot({ db, audioRoot }) {
           summarizer: getSummarizer(cfg),
           deliver: async (notes, talktime) => postNotes({ client, meeting, cfg, notes, talktime }),
         });
-        // Success: delete the meeting's audio. On failure we keep the PCM for manual retry.
-        await rm(session.audioDir, { recursive: true, force: true }).catch(() => {});
+        if (!result?.audioRetained) await rm(session.audioDir, { recursive: true, force: true }).catch(() => {});
         // Nobody spoke — drop the empty meeting record entirely.
         if (result?.empty) db.deleteMeeting(meetingId);
         // Summary succeeded but posting didn't (perms/deleted channel): the notes

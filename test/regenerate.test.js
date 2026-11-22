@@ -90,16 +90,23 @@ test('POST /api/meetings/:id/regenerate regenerates and the bundle advertises el
     assert.equal(bundle.regenerate.eligible, true);
 
     const r = await fetch(`${base}/api/meetings/${id}/regenerate`, { method: 'POST' });
-    assert.equal(r.status, 200);
+    assert.equal(r.status, 202);
     const body = await r.json();
-    assert.equal(body.ok, true);
-    assert.equal(body.summary.notes.tldr, 'Fake summary.');
+    assert.equal(body.state, 'running');
+    let status;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      status = await (await fetch(`${base}/api/meetings/${id}/regenerate`)).json();
+      if (status.state !== 'running') break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(status.state, 'done');
+    assert.equal(db.getSummary(id).notes.tldr, 'Fake summary.');
 
     assert.equal((await fetch(`${base}/api/meetings/9999/regenerate`, { method: 'POST' })).status, 404);
 
     db.setMeetingStatus(id, 'processing');
     const busy = await fetch(`${base}/api/meetings/${id}/regenerate`, { method: 'POST' });
-    assert.equal(busy.status, 502);
+    assert.equal(busy.status, 409);
   } finally { close(); }
 });
 

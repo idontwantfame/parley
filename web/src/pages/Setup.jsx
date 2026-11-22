@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api.js';
 import { useGuild } from '../GuildContext.jsx';
+import { useAuth } from '../AuthContext.jsx';
 import { useSystem } from '../SystemContext.jsx';
 import { Page, PageHead } from '../components/Page.jsx';
 import { Icon, Empty } from '../components/ui.jsx';
@@ -9,7 +10,7 @@ import { ConnectionForm, BotStatusBadge } from '../components/Connection.jsx';
 
 const WHISPER = ['tiny', 'base', 'small', 'medium', 'large-v3', 'large-v3-turbo'];
 const LANGS = [['auto', 'Auto-detect'], ['en', 'English'], ['de', 'German'], ['es', 'Spanish'], ['fr', 'French'],
-  ['it', 'Italian'], ['pt', 'Portuguese'], ['nl', 'Dutch'], ['ru', 'Russian'], ['ja', 'Japanese'], ['zh', 'Chinese']];
+  ['it', 'Italian'], ['pt', 'Portuguese'], ['nl', 'Dutch'], ['pl', 'Polish'], ['ru', 'Russian'], ['ja', 'Japanese'], ['zh', 'Chinese']];
 const SUMMARY_LANGS = [['match', 'Match transcription'], ...LANGS.filter(([c]) => c !== 'auto')];
 
 // Model defaults come from the server (adapters/summarizer/models.js) so the
@@ -414,6 +415,11 @@ export default function Setup() {
       <div className="space-y-5">
         <ConnectionCard sys={sys} onChanged={refreshSys} />
         <Card title="Summarizer" desc="Which AI turns transcripts into structured notes.">
+          <OllamaConnection url={sys?.connection?.ollamaUrl?.value} onSaved={async () => {
+            await refreshSys?.();
+            if (c.summarizerProvider === 'ollama') models.reload();
+            if (c.summarizerFallbackProvider === 'ollama') fbModels.reload();
+          }} />
           <Field label="Provider" hint={sumDraft ? 'Add the API key below to switch to this provider.' : undefined}>
             <div className="relative">
               <select className={sel} value={sumProvider}
@@ -567,7 +573,9 @@ export default function Setup() {
           </Field>
           <AutoJoinChannels key={JSON.stringify([guildId, c.autoJoinChannelIds])}
             channels={voiceChannels} selected={c.autoJoinChannelIds} save={save} />
+          <RecordingRetention enabled={c.keepAudio} save={save} />
         </Card>
+        <SpeakerNames key={guildId} guildId={guildId} />
       </div>
     </Page>
   );
@@ -614,5 +622,106 @@ function AutoJoinChannels({ channels = [], selected = null, save }) {
         <button className="btn btn-primary mt-2" type="submit" disabled={saving}>Save channels</button>
       </form>
     </Field>
+  );
+}
+
+function OllamaConnection({ url, onSaved }) {
+  const { user, authEnabled } = useAuth();
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState(null);
+  if (authEnabled && !user?.isAdmin) return null;
+
+  async function save(event) {
+    event.preventDefault();
+    const { value } = event.currentTarget.elements.ollamaUrl;
+    setSaving(true);
+    try {
+      await api.setConnection({ ollamaUrl: value });
+      setMessage({ text: 'Ollama URL saved.' });
+      await onSaved();
+    } catch (error) {
+      setMessage({ text: error.message, error: true });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Field label="Ollama URL" hint="Use a URL reachable from Parley. An empty value restores http://127.0.0.1:11434.">
+      <form className="flex flex-wrap items-center gap-2" onSubmit={save}>
+        <input key={url} className="input min-w-0 flex-1" name="ollamaUrl" aria-label="Ollama URL"
+          type="url" defaultValue={url} placeholder="http://ollama:11434" />
+        <button type="submit" className="btn btn-primary" disabled={saving}>Save URL</button>
+      </form>
+      {message && <p role={message.error ? 'alert' : 'status'} className={message.error ? 'text-xs text-error' : 'text-xs text-muted'}>{message.text}</p>}
+    </Field>
+  );
+}
+
+function RecordingRetention({ enabled, save }) {
+  const { user, authEnabled } = useAuth();
+  if (authEnabled && !user?.isAdmin) return null;
+  return <Switch checked={!!enabled} onChange={(event) => save({ keepAudio: event.target.checked })}
+    label="Keep recordings" desc="Save audio from future completed meetings for authenticated WAV downloads." />;
+}
+
+function SpeakerNames({ guildId }) {
+  const { user, authEnabled } = useAuth();
+  const canEdit = !authEnabled || user?.isAdmin;
+  const [speakers, setSpeakers] = useState(null);
+  const [speakerId, setSpeakerId] = useState('');
+  const [message, setMessage] = useState(null);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    if (!canEdit) return;
+    let current = true;
+    api.speakerNames(guildId).then((rows) => {
+      if (current) setSpeakers(rows);
+    }).catch((error) => { if (current) setMessage({ text: error.message, error: true }); });
+    return () => { current = false; };
+  }, [guildId, canEdit]);
+  if (!canEdit) return null;
+  const speaker = speakers?.find((row) => row.user_id === speakerId);
+
+  async function save(event) {
+    event.preventDefault();
+    const name = event.currentTarget.elements.speakerName.value;
+    setSaving(true);
+    try {
+      const result = await api.setSpeakerName(guildId, speakerId, name);
+      setSpeakers((rows) => rows.map((row) => row.user_id === speakerId ? { ...row, override: result.name } : row));
+      setMessage({ text: 'Display name saved.' });
+    } catch (error) {
+      setMessage({ text: error.message, error: true });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card title="Speaker display names" desc="Applies to transcripts and future summaries for this server.">
+      {speakers?.length === 0 && <p className="text-sm text-muted">No speakers found yet.</p>}
+      {speakers?.length > 0 && (
+        <form className="space-y-2" onSubmit={save}>
+          <select className="input" aria-label="Discord speaker" value={speakerId}
+            disabled={saving} onChange={(event) => { setSpeakerId(event.target.value); setMessage(null); }}>
+            <option value="">Choose a speaker</option>
+            {speakers.map((row) => <option key={row.user_id} value={row.user_id}>
+              {row.display_name ?? row.user_id}{row.override ? ` → ${row.override}` : ''}
+            </option>)}
+          </select>
+          {speaker && (
+            <Field label="Display name" hint="Leave blank to use the captured Discord name.">
+              <div className="flex gap-2">
+                <input key={speakerId} className="input min-w-0 flex-1" name="speakerName" aria-label="Speaker display name"
+                  maxLength={80} defaultValue={speaker.override ?? ''} />
+                <button type="submit" className="btn btn-primary" disabled={saving}>Save name</button>
+              </div>
+            </Field>
+          )}
+        </form>
+      )}
+      {message && <p role={message.error ? 'alert' : 'status'} className={message.error ? 'text-xs text-error' : 'text-xs text-muted'}>{message.text}</p>}
+    </Card>
   );
 }

@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS meetings (
   guild_id TEXT, channel_id TEXT, channel_name TEXT,
   started_at TEXT, ended_at TEXT,
   status TEXT NOT NULL DEFAULT 'recording',
-  transcription_complete INTEGER
+  transcription_complete INTEGER, audio_retained INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS attendees (
   meeting_id INTEGER, user_id TEXT, display_name TEXT,
@@ -38,12 +38,16 @@ CREATE TABLE IF NOT EXISTS guild_config (
   whisper_model TEXT, notes_channel_id TEXT,
   use_thread INTEGER, auto_join INTEGER, auto_join_min_people INTEGER, auto_join_channel_ids TEXT,
   language TEXT, summary_language TEXT,
-  summary_prompt TEXT, overview_prompt TEXT
+  summary_prompt TEXT, overview_prompt TEXT, keep_audio INTEGER
 );
 CREATE TABLE IF NOT EXISTS guilds (
   guild_id TEXT PRIMARY KEY,
   name TEXT,
   updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS speaker_names (
+  guild_id TEXT NOT NULL, user_id TEXT NOT NULL, display_name TEXT NOT NULL,
+  PRIMARY KEY (guild_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS todos (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,6 +85,12 @@ export function openDb(path) {
 
   // Migration: add summary_language to dbs created before the column existed.
   const cols = sql.prepare(`PRAGMA table_info(guild_config)`).all();
+  if (!cols.some((c) => c.name === 'keep_audio')) {
+    sql.exec('ALTER TABLE guild_config ADD COLUMN keep_audio INTEGER');
+  }
+  if (!sql.prepare('PRAGMA table_info(meetings)').all().some((c) => c.name === 'audio_retained')) {
+    sql.exec('ALTER TABLE meetings ADD COLUMN audio_retained INTEGER NOT NULL DEFAULT 0');
+  }
   if (!cols.some((c) => c.name === 'summary_language')) {
     sql.exec(`ALTER TABLE guild_config ADD COLUMN summary_language TEXT`);
   }
@@ -224,8 +234,39 @@ export function openDb(path) {
       sql.prepare(`INSERT OR IGNORE INTO attendees (meeting_id, user_id, display_name) VALUES (?, ?, ?)`)
         .run(meetingId, userId, displayName);
     },
+    setAudioRetained(meetingId, retained) {
+      sql.prepare('UPDATE meetings SET audio_retained = ? WHERE id = ?').run(retained ? 1 : 0, meetingId);
+    },
     listAttendees(meetingId) {
-      return sql.prepare(`SELECT * FROM attendees WHERE meeting_id = ?`).all(meetingId);
+      return sql.prepare(`
+        SELECT a.meeting_id, a.user_id, COALESCE(n.display_name, a.display_name) AS display_name
+        FROM attendees a JOIN meetings m ON m.id = a.meeting_id
+        LEFT JOIN speaker_names n ON n.guild_id = m.guild_id AND n.user_id = a.user_id
+        WHERE a.meeting_id = ?`).all(meetingId);
+    },
+    listGuildSpeakers(guildId) {
+      return sql.prepare(`
+        WITH recent AS (
+          SELECT a.user_id, a.display_name,
+            ROW_NUMBER() OVER (PARTITION BY a.user_id ORDER BY m.id DESC) AS position
+          FROM attendees a JOIN meetings m ON m.id = a.meeting_id WHERE m.guild_id = ?
+        ), known AS (
+          SELECT user_id FROM recent UNION SELECT user_id FROM speaker_names WHERE guild_id = ?
+        )
+        SELECT k.user_id, r.display_name, n.display_name AS override
+        FROM known k
+        LEFT JOIN recent r ON r.user_id = k.user_id AND r.position = 1
+        LEFT JOIN speaker_names n ON n.guild_id = ? AND n.user_id = k.user_id
+        ORDER BY COALESCE(r.display_name, n.display_name, k.user_id) COLLATE NOCASE
+      `).all(guildId, guildId, guildId);
+    },
+    setSpeakerName(guildId, userId, name) {
+      if (name === null) {
+        sql.prepare('DELETE FROM speaker_names WHERE guild_id = ? AND user_id = ?').run(guildId, userId);
+      } else {
+        sql.prepare(`INSERT INTO speaker_names (guild_id, user_id, display_name) VALUES (?, ?, ?)
+          ON CONFLICT(guild_id, user_id) DO UPDATE SET display_name = excluded.display_name`).run(guildId, userId, name);
+      }
     },
     addUtterance({ meetingId, userId, displayName, startMs, endMs, text }) {
       sql.prepare(`INSERT INTO utterances (meeting_id, user_id, display_name, start_ms, end_ms, text)
@@ -255,15 +296,22 @@ export function openDb(path) {
       }
     },
     listUtterances(meetingId) {
-      return sql.prepare(`SELECT * FROM utterances WHERE meeting_id = ? ORDER BY start_ms`).all(meetingId);
+      return sql.prepare(`
+        SELECT u.id, u.meeting_id, u.user_id, COALESCE(n.display_name, u.display_name) AS display_name,
+          u.start_ms, u.end_ms, u.text
+        FROM utterances u JOIN meetings m ON m.id = u.meeting_id
+        LEFT JOIN speaker_names n ON n.guild_id = m.guild_id AND n.user_id = u.user_id
+        WHERE u.meeting_id = ? ORDER BY u.start_ms`).all(meetingId);
     },
     searchUtterances(guildId, keyword) {
       // Bind user input as a quoted FTS5 phrase literal so operator chars never throw.
       const safe = `"${String(keyword).replace(/"/g, '""')}"`;
       return sql.prepare(
-        `SELECT u.* FROM utterances_fts f
+        `SELECT u.id, u.meeting_id, u.user_id, COALESCE(n.display_name, u.display_name) AS display_name,
+           u.start_ms, u.end_ms, u.text FROM utterances_fts f
          JOIN utterances u ON u.id = f.rowid
          JOIN meetings m ON m.id = u.meeting_id
+         LEFT JOIN speaker_names n ON n.guild_id = m.guild_id AND n.user_id = u.user_id
          WHERE m.guild_id = ? AND utterances_fts MATCH ?
          ORDER BY u.meeting_id DESC LIMIT 50`
       ).all(guildId, safe);

@@ -5,7 +5,7 @@
 // `config` singleton so changes take effect without an env reload:
 //
 //   • Provider API keys      — GEMINI/OPENAI/OPENCODE/OPENROUTER_API_KEY  (secret: presence-only)
-//   • Connection settings    — DISCORD_TOKEN, DISCORD_CLIENT_ID, STT_URL
+//   • Connection settings    — DISCORD_TOKEN, DISCORD_CLIENT_ID, STT_URL, OLLAMA_URL
 //
 // Security: the web server binds 127.0.0.1 only. Secret values (API keys, the
 // Discord token) are NEVER returned to the client — only whether they are set.
@@ -14,7 +14,7 @@
 
 import { readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { config, resolveEnvFile } from '../config/env.js';
+import { config, DEFAULT_OLLAMA_URL, resolveEnvFile } from '../config/env.js';
 
 // provider -> { env: ENV_VAR_NAME, apply(config, value) }
 // Covers summarizer keys (gemini/openai/opencode/openrouter); openai's key is
@@ -32,6 +32,7 @@ const CONNECTION_SETTINGS = {
   discordToken: { env: 'DISCORD_TOKEN', secret: true, apply: (c, v) => { c.discordToken = v; } },
   discordClientId: { env: 'DISCORD_CLIENT_ID', secret: false, apply: (c, v) => { c.discordClientId = v; } },
   sttUrl: { env: 'STT_URL', secret: false, apply: (c, v) => { c.sttUrl = v || 'http://127.0.0.1:8000'; } },
+  ollamaUrl: { env: 'OLLAMA_URL', secret: false, apply: (c, v) => { c.ollama = { ...c.ollama, url: v || DEFAULT_OLLAMA_URL }; } },
 };
 
 export function isSecretProvider(provider) {
@@ -59,7 +60,7 @@ export function upsertEnvLine(text, key, value) {
   // corrupt the match (keys are hardcoded today, but this keeps it safe).
   const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const re = new RegExp(`^${escapedKey}=.*$`, 'm');
-  if (re.test(text)) return text.replace(re, line);
+  if (re.test(text)) return text.replace(re, () => line);
   const sep = text.length && !text.endsWith('\n') ? '\n' : '';
   return `${text}${sep}${line}\n`;
 }
@@ -100,10 +101,33 @@ function assertSttUrlSafe(value) {
   }
 }
 
+function normalizeOllamaUrl(value) {
+  if (!value) return '';
+  let url;
+  try { url = new URL(value); } catch { throw new Error('Ollama URL is not valid.'); }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error('Use an HTTP or HTTPS Ollama base URL without credentials, queries, or fragments.');
+  }
+  if (/^(169\.254\.|\[fe[89ab][\da-f]:|\[::ffff:a9fe:)/i.test(url.hostname) || url.hostname === 'metadata.google.internal') {
+    throw new Error('Ollama URL must not use a metadata or link-local address.');
+  }
+  return url.href.replace(/\/+$/, '');
+}
+
 /** Persist a single KEY=value to the env file (creating it if needed). */
+const pendingWrites = new Map();
 async function persistEnv(key, value, envPath) {
-  const existing = existsSync(envPath) ? await readFile(envPath, 'utf8') : '';
-  await writeFile(envPath, upsertEnvLine(existing, key, value), 'utf8');
+  const previous = pendingWrites.get(envPath) ?? Promise.resolve();
+  const write = previous.catch(() => {}).then(async () => {
+    const existing = existsSync(envPath) ? await readFile(envPath, 'utf8') : '';
+    await writeFile(envPath, upsertEnvLine(existing, key, value), { encoding: 'utf8', mode: 0o600 });
+  });
+  pendingWrites.set(envPath, write);
+  try {
+    await write;
+  } finally {
+    if (pendingWrites.get(envPath) === write) pendingWrites.delete(envPath);
+  }
 }
 
 /**
@@ -117,8 +141,8 @@ export async function setProviderKey(provider, value, { env = config, envPath = 
   if (!spec) throw new Error(`Provider "${provider}" has no editable API key.`);
   const trimmed = String(value ?? '').trim();
   assertEnvSafe(trimmed);
-  spec.apply(env, trimmed || undefined);                 // 1) live
-  await persistEnv(spec.env, trimmed, envPath);          // 2) persisted
+  await persistEnv(spec.env, trimmed, envPath);
+  spec.apply(env, trimmed || undefined);
   return secretStatus(env);
 }
 
@@ -127,10 +151,13 @@ export async function setProviderKey(provider, value, { env = config, envPath = 
  * rest. Never leaks the Discord token.
  */
 export function connectionStatus(env = config) {
+  let ollamaUrl = '';
+  try { ollamaUrl = normalizeOllamaUrl(env.ollama?.url); } catch { /* Do not expose credentials from a legacy URL. */ }
   return {
     discordToken: { set: !!env.discordToken },
     discordClientId: { set: !!env.discordClientId, value: env.discordClientId || '' },
     sttUrl: { set: !!env.sttUrl, value: env.sttUrl || '' },
+    ollamaUrl: { set: !!env.ollama?.url, value: ollamaUrl },
   };
 }
 
@@ -146,8 +173,9 @@ export async function setConnection(patch = {}, { env = config, envPath = resolv
     const trimmed = String(patch[k] ?? '').trim();
     assertEnvSafe(trimmed);
     if (k === 'sttUrl') assertSttUrlSafe(trimmed);
-    spec.apply(env, trimmed || undefined);
-    await persistEnv(spec.env, trimmed, envPath);
+    const value = k === 'ollamaUrl' ? normalizeOllamaUrl(trimmed) : trimmed;
+    await persistEnv(spec.env, value, envPath);
+    spec.apply(env, value || undefined);
   }
   return connectionStatus(env);
 }

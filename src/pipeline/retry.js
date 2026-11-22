@@ -81,7 +81,9 @@ export async function regenerateSummary(db, meetingId) {
     return { ok: false, reason: err.userMessage ?? describeSummarizerError(err, cfg.summarizerProvider) };
   }
   const { notes, talktime, modelUsed } = result;
+  if (!regeneratePlan(db, meetingId).ok) return { ok: false, reason: 'The meeting changed during regeneration.' };
   db.replaceSummary(meetingId, meeting.guild_id, notes, talktime, modelUsed, meeting.started_at);
+  await autoExportMeeting(db, meetingId);
   return { ok: true, status: 'done', modelUsed };
 }
 
@@ -126,7 +128,15 @@ export async function retryMeeting(db, meetingId, { dataDir, deliver = null } = 
     }
     const { notes, talktime, meta, modelUsed } = result;
     db.replaceSummary(meetingId, meeting.guild_id, notes, talktime, modelUsed, meeting.started_at);
+    const audioDir = join(dataDir, 'audio', String(meetingId));
+    let hasAudio = false;
+    if (cfg.keepAudio) {
+      try { hasAudio = readdirSync(audioDir).some((file) => file.endsWith('.pcm')); }
+      catch { /* No recording available to retain. */ }
+    }
+    db.setAudioRetained(meetingId, hasAudio);
     db.setMeetingStatus(meetingId, 'done', new Date().toISOString());
+    if (!hasAudio) await rm(audioDir, { recursive: true, force: true }).catch(() => {});
     const exportResult = await autoExportMeeting(db, meetingId);
     if (deliver) await deliver(notes, talktime, meta).catch(() => {});
     return { ok: true, action: 'resummarize', status: 'done', ...exportResult };
@@ -143,11 +153,12 @@ export async function retryMeeting(db, meetingId, { dataDir, deliver = null } = 
     })
     .sort((a, b) => a.startMs - b.startMs);
   try {
-    const { notes, empty, exported, exports, exportError } = await processMeeting(db, meetingId, { tracks, cfg, deliver });
+    const { notes, empty, exported, exports, exportError, audioRetained } =
+      await processMeeting(db, meetingId, { tracks, cfg, deliver });
     // Success (or a confirmed-empty meeting): the PCM has served its purpose, so
     // drop the audio dir. The bot's own finalize does this too, but a retry runs
     // outside that path and would otherwise leak the directory forever.
-    await rm(audioDir, { recursive: true, force: true }).catch(() => {});
+    if (!audioRetained) await rm(audioDir, { recursive: true, force: true }).catch(() => {});
     return { ok: true, action: 'retranscribe', status: db.getMeeting(meetingId)?.status,
       empty: !notes || !!empty, exported, exports, exportError };
   } catch (err) {

@@ -63,8 +63,11 @@ export async function processMeeting(db, meetingId, opts) {
     return { notes: null, talktime: [], empty: true };
   }
 
-  const transcript = buildTranscript(utterances);
-  const talktime = computeTalkTime(utterances);
+  const speakers = db.listUtterances(meetingId).map((u) => ({
+    userId: u.user_id, displayName: u.display_name, startMs: u.start_ms, endMs: u.end_ms, text: u.text,
+  }));
+  const transcript = buildTranscript(speakers);
+  const talktime = computeTalkTime(speakers);
   const attendees = db.listAttendees(meetingId).map((a) => a.display_name);
   const meta = {
     channelName: meeting.channel_name,
@@ -102,6 +105,8 @@ export async function processMeeting(db, meetingId, opts) {
   // timeline view. (Mirrors what db.backfillTodos + realignTodoDates already do
   // for backfilled rows.)
   db.seedTodos(meetingId, meeting.guild_id, notes.actionItems || [], meeting.started_at);
+  const audioRetained = !!opts.cfg.keepAudio && opts.tracks.length > 0;
+  db.setAudioRetained(meetingId, audioRetained);
   db.setMeetingStatus(meetingId, 'done', new Date().toISOString());
   const exportResult = await autoExportMeeting(db, meetingId);
 
@@ -121,5 +126,5 @@ export async function processMeeting(db, meetingId, opts) {
       console.error(`[pipeline] meeting ${meetingId} summarized but delivery failed: ${deliveryError}`);
     }
   }
-  return { notes, talktime, delivered, deliveryError, ...exportResult };
+  return { notes, talktime, delivered, deliveryError, audioRetained, ...exportResult };
 }

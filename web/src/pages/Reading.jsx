@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { api } from '../api.js';
 import { useGuild } from '../GuildContext.jsx';
@@ -189,7 +189,7 @@ function AskBox({ guildId, meetingId }) {
 }
 
 /* ── meeting actions (export / regenerate / merge / delete) ────────────── */
-function MeetingActions({ meeting, meetings, regenerate, regenerating, onRegenerate }) {
+function MeetingActions({ meeting, meetings, regenerate, regenerating, onRegenerate, hasAudio }) {
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState(false); // false | 'pick' | 'busy'
@@ -226,6 +226,12 @@ function MeetingActions({ meeting, meetings, regenerate, regenerating, onRegener
             className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-ink hover:bg-surface-2 no-underline">
             <Icon.Download width={15} height={15} /> Export (markdown)
           </a>
+          {hasAudio && (
+            <a href={api.meetingAudioUrl(meeting.id)} role="menuitem" onClick={() => setOpen(false)}
+              className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-ink hover:bg-surface-2 no-underline">
+              <Icon.Download width={15} height={15} /> Download recording (WAV)
+            </a>
+          )}
           <button role="menuitem" onClick={() => { setOpen(false); onRegenerate?.(); }}
             disabled={!regenerate?.eligible || regenerating}
             title={!regenerate?.eligible && regenerate?.reason ? regenerate.reason : 'Re-run the summary with the current summarizer settings'}
@@ -298,17 +304,41 @@ function Note({ data, todos, guildId, meetings, refetchTodos, onReload }) {
   const duration = fmtDuration(meeting.started_at, meeting.ended_at);
   const meetingTodos = todos.filter((t) => String(t.meeting_id) === String(meeting.id));
   const isFailed = ['transcription_failed', 'summary_failed', 'processing'].includes(meeting.status);
-  const [regen, setRegen] = useState({ busy: false, err: null });
+  const [regen, setRegen] = useState(() => ({
+    busy: data.regenerate?.state === 'running', err: data.regenerate?.error ?? null,
+  }));
+  const [starting, setStarting] = useState(false);
+
+  useEffect(() => {
+    if (!regen.busy) return;
+    let stop = false;
+    let timer;
+    async function poll() {
+      try {
+        const status = await api.regenerationStatus(meeting.id);
+        if (stop) return;
+        if (status.state !== 'running') {
+          setRegen({ busy: false, err: status.error ?? (status.state === 'idle' ? 'The regeneration was interrupted.' : null) });
+          if (status.state === 'done') onReload?.();
+          return;
+        }
+      } catch { /* A temporary disconnect should not end a running job. */ }
+      if (!stop) timer = setTimeout(poll, 2000);
+    }
+    void poll();
+    return () => { stop = true; clearTimeout(timer); };
+  }, [regen.busy, meeting.id, onReload]);
 
   async function regenerateSummary() {
     if (!window.confirm('Regenerate the summary with the current summarizer settings? The current notes will be replaced; action items you already checked off stay checked if they reappear.')) return;
-    setRegen({ busy: true, err: null });
+    setStarting(true);
     try {
       await api.regenerateSummary(meeting.id);
-      setRegen({ busy: false, err: null });
-      onReload?.();
+      setRegen({ busy: true, err: null });
     } catch (e) {
       setRegen({ busy: false, err: e?.message || 'Regeneration failed.' });
+    } finally {
+      setStarting(false);
     }
   }
 
@@ -331,7 +361,7 @@ function Note({ data, todos, guildId, meetings, refetchTodos, onReload }) {
             </p>
           </div>
           <MeetingActions meeting={meeting} meetings={meetings} regenerate={data.regenerate}
-            regenerating={regen.busy} onRegenerate={regenerateSummary} />
+            regenerating={starting || regen.busy} onRegenerate={regenerateSummary} hasAudio={data.hasAudio} />
         </div>
 
         {attendees?.length > 0 && (
@@ -498,13 +528,13 @@ export default function Reading() {
     api.todos(guildId).then((t) => setTodos(Array.isArray(t) ? t : [])).catch(() => {});
   }
 
-  function reloadMeeting() {
+  const reloadMeeting = useCallback(() => {
     if (!id || !guildId) return;
     Promise.all([api.meeting(id), api.todos(guildId)])
       .then(([m, t]) => { setData(m); setTodos(Array.isArray(t) ? t : []); })
       .catch(() => {});
     api.meetings(guildId).then((rows) => setMeetings((Array.isArray(rows) ? rows : []).filter((m) => (m.utterance_count ?? 1) > 0 || m.failed))).catch(() => {});
-  }
+  }, [id, guildId]);
 
   useEffect(() => {
     if (!id || !guildId) return;

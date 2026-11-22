@@ -98,6 +98,18 @@ test('setConnection clearing the STT url falls back to the default', async () =>
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('Ollama URL updates live and persists a normalized LAN base URL', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'parley-ollama-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const envPath = join(dir, '.env');
+  const env = { ollama: { url: 'http://127.0.0.1:11434' } };
+  await assert.rejects(() => setConnection({ ollamaUrl: 'http://user:password@ollama:11434' }, { env, envPath }), /without credentials/);
+  const next = await setConnection({ ollamaUrl: 'http://ollama:11434/' }, { env, envPath });
+  assert.equal(next.ollamaUrl.value, 'http://ollama:11434');
+  assert.equal(env.ollama.url, 'http://ollama:11434');
+  assert.match(readFileSync(envPath, 'utf8'), /^OLLAMA_URL=http:\/\/ollama:11434$/m);
+});
+
 // ── Injection / SSRF hardening ────────────────────────────────────────────────
 
 test('setProviderKey rejects a value with embedded newlines (.env injection)', async () => {

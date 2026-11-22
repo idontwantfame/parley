@@ -2,7 +2,9 @@
 import { Router } from 'express';
 import { ChannelType } from 'discord.js';
 import { rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { ensureMixedWav } from '../voice/mix.js';
 import { getGuildConfig, setGuildConfig } from '../store/config.js';
 import { validateSetup, availableProviders } from '../commands/setup-logic.js';
 import { config as env } from '../config/env.js';
@@ -41,7 +43,7 @@ function anyGuildUsesSidecar(db) {
 export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
   const r = Router();
   // Meeting ids with a summary regeneration in flight (guards double-submits).
-  const regenerating = new Set();
+  const regeneration = new Map();
   // The live Discord client may not exist yet (bot starts lazily once creds are
   // set). Always resolve it fresh from the controller so routes pick it up the
   // moment the bot connects, without rebuilding the router. `client` is still
@@ -130,8 +132,21 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
       attendees: db.listAttendees(id),
       utterances: db.listUtterances(id),
       retry: { eligible: RETRYABLE_STATUSES.has(meeting.status) && plan.ok, action: plan.action, reason: plan.reason || null },
-      regenerate: { eligible: regen.ok, reason: regen.reason || null },
+      regenerate: { eligible: regen.ok, reason: regen.reason || null, ...regeneration.get(id) },
+      hasAudio: meeting.status === 'done' && !!meeting.audio_retained && existsSync(audioDir(id)),
     });
+  });
+
+  r.get('/meetings/:id/audio', async (req, res) => {
+    const id = Number(req.params.id);
+    const meeting = db.getMeeting(id);
+    if (meeting?.status !== 'done' || !meeting.audio_retained) {
+      return res.status(404).json({ error: 'No recording is available for this meeting.' });
+    }
+    const wav = await ensureMixedWav(audioDir(id));
+    if (!wav) return res.status(404).json({ error: 'No recording is available for this meeting.' });
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.download(wav, `${meetingExportBasename(meeting)}.wav`);
   });
 
   // Shared snapshot and renderer for downloads and automatic local archives.
@@ -177,26 +192,34 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
   // Regenerate a completed meeting's summary from its stored transcript with the
   // guild's current summarizer settings (e.g. after changing model or prompt).
   // On failure the existing notes are kept. Not re-posted to Discord.
-  r.post('/meetings/:id/regenerate', requireAdmin, async (req, res) => {
+  r.get('/meetings/:id/regenerate', (req, res) => {
     const id = Number(req.params.id);
     if (!db.getMeeting(id)) return res.status(404).json({ error: 'meeting not found' });
-    if (regenerating.has(id)) return res.status(409).json({ error: 'A regeneration is already running for this meeting.' });
-    regenerating.add(id);
-    try {
-      const result = await regenerateSummary(db, id);
-      if (!result.ok) return res.status(502).json({ error: result.reason || 'Regeneration failed.', ...result });
-      res.json({ ok: true, ...result, summary: db.getSummary(id) });
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    } finally {
-      regenerating.delete(id);
-    }
+    res.json(regeneration.get(id) ?? { state: 'idle' });
+  });
+
+  r.post('/meetings/:id/regenerate', requireAdmin, (req, res) => {
+    const id = Number(req.params.id);
+    const plan = regeneratePlan(db, id);
+    if (!plan.meeting) return res.status(404).json({ error: 'meeting not found' });
+    if (!plan.ok) return res.status(409).json({ error: plan.reason });
+    if (regeneration.get(id)?.state === 'running') return res.status(409).json({ error: 'A regeneration is already running for this meeting.' });
+    regeneration.set(id, { state: 'running' });
+    res.status(202).json({ state: 'running' });
+    void regenerateSummary(db, id).then((result) => {
+      regeneration.set(id, result.ok ? { state: 'done' } : { state: 'failed', error: result.reason });
+    }).catch((error) => {
+      console.error(`[summarizer] regeneration for meeting ${id} failed:`, error.message);
+      regeneration.set(id, { state: 'failed', error: 'The new summary could not be saved.' });
+    });
   });
 
   r.delete('/meetings/:id', requireAdmin, async (req, res) => {
     const id = Number(req.params.id);
     const meeting = db.getMeeting(id);
     if (!meeting) return res.status(404).json({ error: 'meeting not found' });
+    if (regeneration.get(id)?.state === 'running') return res.status(409).json({ error: 'The meeting summary is being regenerated.' });
+    regeneration.delete(id);
     db.deleteMeeting(id);
     await rm(audioDir(id), { recursive: true, force: true }).catch(() => {});
     res.json({ ok: true });
@@ -268,6 +291,28 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     res.json(q ? db.searchUtterances(req.params.g, q) : []);
   });
 
+  r.get('/guilds/:g/speaker-names', requireAdmin, (req, res) => {
+    const guildId = req.params.g;
+    const members = liveClient()?.guilds?.cache?.get(guildId)?.members?.cache;
+    const speakers = new Map(db.listGuildSpeakers(guildId).map((speaker) => [speaker.user_id, speaker]));
+    for (const member of members?.values() ?? []) {
+      if (!member.user.bot) {
+        speakers.set(member.id, { user_id: member.id, display_name: member.displayName, override: speakers.get(member.id)?.override ?? null });
+      }
+    }
+    res.json([...speakers.values()]);
+  });
+
+  r.put('/guilds/:g/speaker-names/:userId', requireAdmin, (req, res) => {
+    const { g, userId } = req.params;
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : req.body?.name;
+    if (!/^[1-9]\d{16,19}$/.test(userId) || !(name === null || (typeof name === 'string' && name.length <= 80 && !/[\x00-\x1f\x7f]/.test(name)))) {
+      return res.status(400).json({ error: 'Enter a valid Discord user ID and a display name of up to 80 characters.' });
+    }
+    db.setSpeakerName(g, userId, name || null);
+    res.json({ name: name || null });
+  });
+
   r.get('/guilds/:g/config', (req, res) => {
     const guild = liveClient()?.guilds?.cache?.get(req.params.g);
     const channels = guild
@@ -291,7 +336,8 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     });
   });
 
-  r.patch('/guilds/:g/config', async (req, res) => {
+  r.patch('/guilds/:g/config', (req, res, next) =>
+    req.body?.keepAudio !== undefined ? requireAdmin(req, res, next) : next(), async (req, res) => {
     const result = validateSetup(req.body, env);
     if (!result.ok) return res.status(400).json({ error: result.error });
     const config = setGuildConfig(db, req.params.g, result.patch);
@@ -369,17 +415,18 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     });
   });
 
-  // Save Discord token / client id / STT url (any subset), persist to .env,
+  // Save connection settings (any subset), persist to .env,
   // apply live, and (re)start the bot if it's managed and creds are present.
   r.put('/system/connection', requireAdmin, async (req, res) => {
     const patch = {};
-    for (const k of ['discordToken', 'discordClientId', 'sttUrl']) {
+    for (const k of ['discordToken', 'discordClientId', 'sttUrl', 'ollamaUrl']) {
       if (typeof req.body?.[k] === 'string') patch[k] = req.body[k];
     }
     if (Object.keys(patch).length === 0) return res.status(400).json({ error: 'No recognized settings to update.' });
     let connection;
     try {
       connection = await setConnection(patch, { env });
+      if (patch.ollamaUrl !== undefined) clearModelCache('ollama');
     } catch (e) {
       // Invalid input (bad STT URL, control chars) → 400, not a server error.
       return res.status(400).json({ error: e.message });

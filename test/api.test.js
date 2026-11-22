@@ -53,6 +53,28 @@ async function listen(app) {
   return { base: `http://127.0.0.1:${port}`, close: () => server.close() };
 }
 
+test('speaker name overrides update old transcripts and are scoped to a server', async () => {
+  const db = openDb(':memory:');
+  const userId = '123456789012345678';
+  const meetings = ['g1', 'g2'].map((guildId) => db.createMeeting({ guildId, channelId: 'c1', channelName: 'Voice', startedAt: '2026-01-01' }));
+  for (const meetingId of meetings) {
+    db.addAttendee(meetingId, userId, 'Captured');
+    db.addUtterance({ meetingId, userId, displayName: 'Captured', startMs: 1, endMs: 2, text: 'hello' });
+  }
+  const { base, close } = await listen(appWith(db));
+  try {
+    const route = `${base}/api/guilds/g1/speaker-names/${userId}`;
+    for (const [name, visible] of [['Character', 'Character'], ['', 'Captured']]) {
+      const response = await fetch(route, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }),
+      });
+      assert.equal(response.status, 200);
+      assert.equal(db.listUtterances(meetings[0])[0].display_name, visible);
+      assert.equal(db.listUtterances(meetings[1])[0].display_name, 'Captured');
+    }
+  } finally { close(); }
+});
+
 test('GET /api/guilds and meetings and todos', async () => {
   const db = openDb(':memory:');
   const id = db.createMeeting({ guildId: 'g1', channelId: 'c', channelName: 'gen', startedAt: 'now' });
