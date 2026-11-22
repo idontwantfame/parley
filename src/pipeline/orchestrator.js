@@ -7,6 +7,9 @@ import { autoExportMeeting } from '../delivery/meeting-export.js';
 import { getVocabulary } from '../store/vocabulary.js';
 import { campaignContextFor, foldMeetingIntoJournal } from '../campaign/journal.js';
 import { withMeetingProgress } from './progress.js';
+import { deliverSavedNotes } from '../delivery/status.js';
+import { dirname } from 'node:path';
+import { retainRecording } from '../voice/recording-archive.js';
 
 export function processMeeting(db, meetingId, opts) {
   return withMeetingProgress(meetingId, opts.tracks.length, (progress) => runMeeting(db, meetingId, opts, progress));
@@ -119,7 +122,11 @@ async function runMeeting(db, meetingId, opts, progress) {
   // timeline view. (Mirrors what db.backfillTodos + realignTodoDates already do
   // for backfilled rows.)
   db.seedTodos(meetingId, meeting.guild_id, notes.actionItems || [], meeting.started_at);
-  const audioRetained = !!opts.cfg.keepAudio && opts.tracks.length > 0;
+  let audioRetained = false;
+  if (opts.cfg.keepAudio && opts.tracks.length > 0) {
+    progress.stage = 'archiving';
+    audioRetained = await retainRecording(dirname(opts.tracks[0].pcmPath), failures.length === 0, meetingId);
+  }
   db.setAudioRetained(meetingId, audioRetained);
   db.setMeetingStatus(meetingId, 'done', new Date().toISOString());
   const exportResult = await autoExportMeeting(db, meetingId);
@@ -129,17 +136,9 @@ async function runMeeting(db, meetingId, opts, progress) {
   // finished meeting or flip it back to a failed state — the notes already live
   // in the dashboard. Surface it via `delivered` + `deliveryError` so callers can
   // log it or offer a re-post, without treating the meeting as failed.
-  let delivered = false;
-  let deliveryError = null;
-  if (opts.deliver) {
-    try {
-      await opts.deliver(notes, talktime, meta);
-      delivered = true;
-    } catch (err) {
-      deliveryError = err.message || String(err);
-      console.error(`[pipeline] meeting ${meetingId} summarized but delivery failed: ${deliveryError}`);
-    }
-  }
+  const { delivered = false, deliveryError = null } = opts.deliver
+    ? await deliverSavedNotes(db, meetingId, (savedNotes, savedTalktime) => opts.deliver(savedNotes, savedTalktime, meta))
+    : {};
 
   // Campaign sessions also update the campaign journal. Best-effort and last:
   // the notes are already saved and delivered, and a journal failure can be

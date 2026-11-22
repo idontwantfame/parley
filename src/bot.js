@@ -79,7 +79,7 @@ export function startBot({ db, audioRoot }) {
         console.error(`Meeting ${meetingId} failed:`, err.message);
         const reason = err.userMessage || err.message;
         const ch = await client.channels.fetch(cfg.notesChannelId || meeting.channel_id).catch(() => null);
-        if (ch) await ch.send(`⚠️ Meeting ${meetingId} failed: ${reason}\nThe transcript is saved — an admin can retry with \`node scripts/reprocess-meeting.mjs ${meetingId}\`.`).catch(() => {});
+        if (ch) await ch.send(`⚠️ Meeting ${meetingId} failed: ${reason}\nOpen the meeting in Parley to see the available recovery options.`).catch(() => {});
       }
     },
   });

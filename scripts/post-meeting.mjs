@@ -10,6 +10,7 @@ import { config } from '../src/config/env.js';
 import { openDb } from '../src/store/db.js';
 import { getGuildConfig } from '../src/store/config.js';
 import { postNotes } from '../src/delivery/post.js';
+import { deliverSavedNotes } from '../src/delivery/status.js';
 
 const meetingId = Number(process.argv[2]);
 if (!Number.isInteger(meetingId)) {
@@ -44,7 +45,8 @@ await client.login(config.discordToken);
 await ready;
 
 try {
-  await postNotes({ client, meeting, cfg, notes: summary.notes, talktime: summary.talktime });
+  const result = await deliverSavedNotes(db, meetingId, (notes, talktime) => postNotes({ client, meeting, cfg, notes, talktime }));
+  if (!result.delivered) throw new Error(result.deliveryError || 'Delivery is already in progress.');
   console.log(`Posted meeting ${meetingId} notes to ${cfg.notesChannelId || meeting.channel_id}.`);
 } catch (err) {
   console.error(`Delivery failed: ${err.message}`);

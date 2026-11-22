@@ -119,8 +119,9 @@ export function StatusPill({ status }) {
     processing: { label: 'Processing', color: 'var(--warn)', bg: 'var(--warn-soft)' },
     transcription_failed: { label: 'Transcription failed', color: 'var(--error)', bg: 'var(--error-soft)' },
     summary_failed: { label: 'Summary failed', color: 'var(--error)', bg: 'var(--error-soft)' },
+    empty: { label: 'No speech captured', color: 'var(--muted)', bg: 'var(--surface-3)' },
   };
-  const s = map[status] || { label: status || 'Unknown', color: 'var(--muted)', bg: 'var(--surface-3)' };
+  const s = map[status] || { label: status?.replaceAll('_', ' ') || 'Unknown', color: 'var(--muted)', bg: 'var(--surface-3)' };
   return (
     <span className="inline-flex items-center gap-1.5 text-xs font-medium px-2 py-0.5 rounded-full"
       style={{ color: s.color, background: s.bg }}>

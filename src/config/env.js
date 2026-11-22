@@ -39,11 +39,13 @@ export function validateEnv(env = process.env) {
 }
 
 const retention = process.env.AUDIO_RETENTION_DAYS?.trim();
+const meetingRetention = process.env.MEETING_RETENTION_DAYS?.trim();
 export const config = {
   dataDir: resolveDataDir(),
   exportDir: process.env.EXPORT_DIR || join(resolveDataDir(), 'exports'),
   autoExport: !['0', 'false'].includes((process.env.AUTO_EXPORT || '').toLowerCase()),
   audioRetentionDays: retention && /^\d+$/.test(retention) && Number.isSafeInteger(Number(retention)) ? Number(retention) : 30,
+  meetingRetentionDays: meetingRetention && /^\d+$/.test(meetingRetention) ? Number(meetingRetention) : 0,
   discordToken: process.env.DISCORD_TOKEN,
   discordClientId: process.env.DISCORD_CLIENT_ID,
   recordingNickname: resolveRecordingNickname(),

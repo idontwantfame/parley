@@ -232,7 +232,7 @@ function MeetingActions({ meeting, meetings, regenerate, regenerating, onRegener
           {hasAudio && (
             <a href={api.meetingAudioUrl(meeting.id)} role="menuitem" onClick={() => setOpen(false)}
               className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-ink hover:bg-surface-2 no-underline">
-              <Icon.Download width={15} height={15} /> Download recording (WAV)
+              <Icon.Download width={15} height={15} /> Download recording
             </a>
           )}
           {hasAudio && (!authEnabled || user?.isAdmin) && (
@@ -407,7 +407,9 @@ function Note({ data, todos, guildId, meetings, refetchTodos, onReload }) {
       </header>
 
       {isFailed && <RetryBanner meeting={meeting} retry={retry} onDone={onReload} />}
-      {running && <p className="card p-4 mt-8 text-sm text-muted" role="status"><ProgressText progress={progress} /></p>}
+      {running && !regen.busy && <p className="card p-4 mt-8 text-sm text-muted" role="status"><ProgressText progress={progress} /></p>}
+      {summary && meeting.status === 'done' &&
+        <DiscordDelivery meeting={meeting} summary={summary} target={data.deliveryTarget} onReload={onReload} busy={running || regen.busy} />}
 
       {regen.busy && (
         <div className="card p-4 mt-8 flex items-center gap-3" role="status">
@@ -518,6 +520,48 @@ function Note({ data, todos, guildId, meetings, refetchTodos, onReload }) {
       {guildId && <AskBox guildId={guildId} meetingId={meeting.id} />}
       <MeetingNav meetings={meetings} id={meeting.id} />
     </article>
+  );
+}
+
+function DiscordDelivery({ meeting, summary, target, onReload, busy }) {
+  const { user, authEnabled } = useAuth();
+  const [posting, setPosting] = useState(false);
+  const [error, setError] = useState(null);
+  const status = meeting.delivery_status;
+  const previousVersion = status === 'posted' && meeting.delivery_summary_at !== summary.created_at;
+  const label = previousVersion ? 'An earlier summary was posted to Discord.' : {
+    posted: 'Posted to Discord.',
+    sending: 'Posting to Discord…',
+    failed: 'Discord delivery failed. Your notes are saved here.',
+    unknown: 'Discord delivery could not be confirmed.',
+  }[status] || 'No Discord delivery recorded.';
+
+  async function post() {
+    const warning = status ? ' An earlier attempt may already have sent some or all of the notes.' : '';
+    const destination = target?.name ? `#${target.name}` : target?.id ? `Discord channel ${target.id}` : 'the configured Discord destination';
+    if (!window.confirm(`Post these saved notes to ${destination}?${warning}`)) return;
+    setPosting(true); setError(null);
+    try {
+      await api.postMeetingNotes(meeting.id);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setPosting(false);
+      onReload?.();
+    }
+  }
+
+  return (
+    <section className="card mt-5 p-3 flex flex-wrap items-center justify-between gap-2" aria-label="Discord delivery">
+      <div className="text-sm text-muted">
+        <p role="status">{label}</p>
+        {(error || meeting.delivery_error) && <p className="text-xs text-error" role="alert">{error || meeting.delivery_error}</p>}
+      </div>
+      {(!authEnabled || user?.isAdmin) &&
+        <button className="btn btn-ghost" onClick={post} disabled={!target || busy || posting || status === 'sending'}>
+          {posting ? 'Posting…' : 'Post to Discord'}
+        </button>}
+    </section>
   );
 }
 

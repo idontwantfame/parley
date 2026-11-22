@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS meetings (
   guild_id TEXT, channel_id TEXT, channel_name TEXT,
   started_at TEXT, ended_at TEXT,
   status TEXT NOT NULL DEFAULT 'recording',
-  transcription_complete INTEGER, audio_retained INTEGER NOT NULL DEFAULT 0
+  transcription_complete INTEGER, audio_retained INTEGER NOT NULL DEFAULT 0,
+  delivery_status TEXT, delivery_error TEXT, delivery_summary_at TEXT
 );
 CREATE TABLE IF NOT EXISTS attendees (
   meeting_id INTEGER, user_id TEXT, display_name TEXT,
@@ -61,6 +62,8 @@ CREATE TABLE IF NOT EXISTS todos (
   done INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
+-- seedTodos requires a meeting ID. SQLite intentionally treats NULL meeting IDs
+-- as distinct, so this only deduplicates tasks that belong to a meeting.
 CREATE UNIQUE INDEX IF NOT EXISTS todos_dedup ON todos(meeting_id, COALESCE(assignee, ''), task);
 CREATE INDEX IF NOT EXISTS utterances_meeting ON utterances(meeting_id);
 CREATE INDEX IF NOT EXISTS todos_meeting ON todos(meeting_id);
@@ -99,6 +102,9 @@ export function openDb(path) {
   // Migration: track whether every submitted audio track transcribed. NULL is
   // intentionally preserved for legacy meetings whose completeness is unknown.
   const meetingCols = sql.prepare(`PRAGMA table_info(meetings)`).all();
+  for (const column of ['delivery_status', 'delivery_error', 'delivery_summary_at']) {
+    if (!meetingCols.some((c) => c.name === column)) sql.exec(`ALTER TABLE meetings ADD COLUMN ${column} TEXT`);
+  }
   if (!meetingCols.some((c) => c.name === 'transcription_complete')) {
     sql.exec(`ALTER TABLE meetings ADD COLUMN transcription_complete INTEGER`);
   }
@@ -174,6 +180,24 @@ export function openDb(path) {
       return r.lastInsertRowid;
     },
     getMeeting(id) { return sql.prepare(`SELECT * FROM meetings WHERE id = ?`).get(id); },
+    expiredMeetings(cutoff) {
+      return sql.prepare(`SELECT * FROM meetings WHERE status = 'done' AND campaign_id IS NULL
+        AND delivery_status IS NOT 'sending' AND julianday(COALESCE(ended_at, started_at)) < julianday(?)
+        ORDER BY id`).all(cutoff);
+    },
+    beginDelivery(id, summaryAt) {
+      return sql.prepare(`UPDATE meetings SET delivery_status = 'sending', delivery_error = NULL,
+          delivery_summary_at = ? WHERE id = ? AND delivery_status IS NOT 'sending'`).run(summaryAt, id).changes > 0;
+    },
+    finishDelivery(id, status, error = null) {
+      sql.prepare(`UPDATE meetings SET delivery_status = ?, delivery_error = ?
+        WHERE id = ? AND delivery_status = 'sending'`).run(status, error, id);
+    },
+    interruptDeliveries() {
+      sql.prepare(`UPDATE meetings SET delivery_status = 'unknown',
+        delivery_error = 'Parley restarted during delivery. Check Discord before posting again.'
+        WHERE delivery_status = 'sending'`).run();
+    },
     // Remove a meeting and everything attached to it. The AFTER DELETE trigger
     // on utterances keeps the FTS index in sync. Audio files are removed by the
     // caller (db layer has no fs). Wrapped in a transaction — all or nothing.

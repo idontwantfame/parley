@@ -53,6 +53,35 @@ async function listen(app) {
   return { base: `http://127.0.0.1:${port}`, close: () => server.close() };
 }
 
+test('Discord repost uses saved notes, restricts posting to admins and records the outcome', async () => {
+  const db = openDb(':memory:');
+  const id = db.createMeeting({ guildId: 'g1', channelId: 'voice', channelName: 'Test', startedAt: '2025-01-01T00:00:00Z' });
+  db.setMeetingStatus(id, 'done');
+  db.saveSummary(id, { tldr: 'Existing notes' }, [], 'test');
+  let attempts = 0;
+  const client = { channels: { fetch: async () => ({
+    guildId: 'g1',
+    send: async ({ content }) => {
+      assert.match(content, /Existing notes/);
+      if (++attempts === 1) throw new Error('Mock Discord rejection');
+    },
+  }) } };
+  const app = express();
+  app.use((req, _res, next) => { req.authResolved = true; req.user = { isAdmin: req.headers['x-test-user'] === 'admin' }; next(); });
+  app.use('/api', apiRouter({ db, client }));
+  const { base, close } = await listen(app);
+  try {
+    const post = (user) => fetch(`${base}/api/meetings/${id}/repost`, { method: 'POST', headers: { 'x-test-user': user } });
+    assert.equal((await post('viewer')).status, 403);
+    assert.equal(attempts, 0);
+    assert.equal((await post('admin')).status, 502);
+    assert.equal(db.getMeeting(id).delivery_status, 'failed');
+    assert.equal((await post('admin')).status, 200);
+    assert.equal(db.getMeeting(id).delivery_status, 'posted');
+    assert.equal(db.getSummary(id).notes.tldr, 'Existing notes');
+  } finally { close(); }
+});
+
 test('speaker name overrides update old transcripts and are scoped to a server', async () => {
   const db = openDb(':memory:');
   const userId = '123456789012345678';

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useLocation } from 'react-router-dom';
 import { api } from '../api.js';
 import { useGuild } from '../GuildContext.jsx';
 import { Page, PageHead } from '../components/Page.jsx';
@@ -33,6 +34,7 @@ function GridSkeleton({ view }) {
 
 export default function Meetings() {
   const { guildId } = useGuild();
+  const { key: navigationKey } = useLocation();
   const [meetings, setMeetings] = useState(null);
   const [error, setError] = useState(null);
   const [view, setView] = useState('grid');
@@ -46,7 +48,7 @@ export default function Meetings() {
       .then((rows) => { if (!stale) setMeetings((Array.isArray(rows) ? rows : []).filter((m) => (m.utterance_count ?? 1) > 0 || m.failed)); })
       .catch((e) => { if (!stale) setError(e?.message || 'Failed to load'); });
     return () => { stale = true; };
-  }, [guildId]);
+  }, [guildId, navigationKey]);
 
   const channels = useMemo(() => {
     if (!meetings) return [];

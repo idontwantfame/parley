@@ -27,8 +27,10 @@ export async function transcribeTracks(tracks, cfg = {}, deps = {}) {
   const results = new Array(tracks.length);
   const failures = [];
 
-  async function worker(start) {
-    for (let i = start; i < tracks.length; i += concurrency) {
+  let nextTrack = 0;
+  async function worker() {
+    while (nextTrack < tracks.length) {
+      const i = nextTrack++;
       const t = tracks[i];
       const wavPath = t.pcmPath.replace(/\.pcm$/, '.wav');
       let failed = false;
@@ -56,7 +58,7 @@ export async function transcribeTracks(tracks, cfg = {}, deps = {}) {
   }
 
   const workerCount = Math.min(concurrency, tracks.length);
-  await Promise.all(Array.from({ length: workerCount }, (_, i) => worker(i)));
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
   const utterances = results.filter(Boolean);
   return { utterances, failures };

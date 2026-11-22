@@ -5,6 +5,7 @@ import { rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { ensureMixedWav } from '../voice/mix.js';
+import { MP3_NAME } from '../voice/recording-archive.js';
 import { getGuildConfig, setGuildConfig } from '../store/config.js';
 import { getVocabulary, setVocabulary } from '../store/vocabulary.js';
 import { validateSetup, availableProviders } from '../commands/setup-logic.js';
@@ -25,6 +26,9 @@ import { readMeetingExport, meetingExportBasename, renderMeetingMarkdown } from 
 import { campaignContextFor, catchUpJournal, JOURNAL_SECTIONS } from '../campaign/journal.js';
 import { askCampaign, recapCampaign } from '../campaign/ask.js';
 import { meetingProgress } from '../pipeline/progress.js';
+import { postNotes } from '../delivery/post.js';
+import { deliverSavedNotes } from '../delivery/status.js';
+import { pruneMeetings } from '../store/meeting-retention.js';
 
 function audioDir(id) {
   return join(env.dataDir, 'audio', String(id));
@@ -131,6 +135,9 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     const plan = retryPlan(db, id, { dataDir: env.dataDir });
     const regen = regeneratePlan(db, id);
     const progress = meetingProgress(id);
+    const cfg = getGuildConfig(db, meeting.guild_id);
+    const channelId = cfg.notesChannelId || meeting.channel_id;
+    const channel = liveClient()?.channels?.cache?.get(channelId);
     res.json({
       meeting,
       summary: db.getSummary(id),
@@ -138,6 +145,9 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
       utterances: db.listUtterances(id),
       retry: { eligible: !progress && RETRYABLE_STATUSES.has(meeting.status) && plan.ok, action: plan.action, reason: plan.reason || null },
       progress,
+      deliveryTarget: channelId ? {
+        id: channelId, name: channel?.name || (channelId === meeting.channel_id ? meeting.channel_name : null),
+      } : null,
       regenerate: { eligible: regen.ok, reason: regen.reason || null, ...regeneration.get(id) },
       hasAudio: meeting.status === 'done' && !!meeting.audio_retained && existsSync(audioDir(id)),
     });
@@ -150,16 +160,34 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     res.json({ progress: meetingProgress(id), status: meeting.status });
   });
 
+  r.post('/meetings/:id/repost', requireAdmin, async (req, res) => {
+    const id = Number(req.params.id);
+    const meeting = db.getMeeting(id);
+    if (!meeting) return res.status(404).json({ error: 'Meeting not found.' });
+    if (meeting.status !== 'done' || meetingProgress(id) || regeneration.get(id)?.state === 'running') {
+      return res.status(409).json({ error: 'Wait for the meeting to finish processing.' });
+    }
+    const client = liveClient();
+    if (!client) return res.status(503).json({ error: 'The Discord bot is disconnected.' });
+    const cfg = getGuildConfig(db, meeting.guild_id);
+    const result = await deliverSavedNotes(db, id, (notes, talktime) => postNotes({ client, meeting, cfg, notes, talktime }));
+    if (result.conflict) return res.status(409).json({ error: 'A saved summary must be ready and delivery must be idle.' });
+    if (!result.delivered) return res.status(502).json({ error: result.deliveryError });
+    res.json({ ok: true });
+  });
+
   r.get('/meetings/:id/audio', async (req, res) => {
     const id = Number(req.params.id);
     const meeting = db.getMeeting(id);
     if (meeting?.status !== 'done' || !meeting.audio_retained) {
       return res.status(404).json({ error: 'No recording is available for this meeting.' });
     }
-    const wav = await ensureMixedWav(audioDir(id));
-    if (!wav) return res.status(404).json({ error: 'No recording is available for this meeting.' });
+    const mp3 = join(audioDir(id), MP3_NAME);
+    const isMp3 = existsSync(mp3);
+    const file = isMp3 ? mp3 : await ensureMixedWav(audioDir(id));
+    if (!file) return res.status(404).json({ error: 'No recording is available for this meeting.' });
     res.setHeader('Cache-Control', 'private, no-store');
-    res.download(wav, `${meetingExportBasename(meeting)}.wav`);
+    res.download(file, `${meetingExportBasename(meeting)}.${isMp3 ? 'mp3' : 'wav'}`);
   });
 
   r.delete('/meetings/:id/audio', requireAdmin, async (req, res) => {
@@ -193,17 +221,19 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
   // Retry a failed/stuck meeting: re-summarize if the transcript survived, else
   // re-transcribe from the saved PCM. Posts to Discord too when a live client
   // is attached. Returns the new status so the UI can refresh.
-  r.post('/meetings/:id/retry', async (req, res) => {
+  r.post('/meetings/:id/retry', requireAdmin, async (req, res) => {
     const id = Number(req.params.id);
     if (meetingProgress(id)) return res.status(409).json({ error: 'This meeting is already being processed.' });
     const meeting = db.getMeeting(id);
     if (!meeting) return res.status(404).json({ error: 'meeting not found' });
+    if (!RETRYABLE_STATUSES.has(meeting.status) || meeting.delivery_status === 'sending') {
+      return res.status(409).json({ error: 'This meeting cannot be retried in its current state.' });
+    }
     const c = liveClient();
     const deliver = c
       ? async (notes, talktime) => {
           const cfg = getGuildConfig(db, meeting.guild_id);
-          const { postNotes } = await import('../delivery/post.js');
-          await postNotes({ client: c, meeting, cfg, notes, talktime });
+          await postNotes({ client: c, meeting: db.getMeeting(id), cfg, notes, talktime });
         }
       : null;
     try {
@@ -229,6 +259,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     const plan = regeneratePlan(db, id);
     if (!plan.meeting) return res.status(404).json({ error: 'meeting not found' });
     if (!plan.ok) return res.status(409).json({ error: plan.reason });
+    if (plan.meeting.delivery_status === 'sending') return res.status(409).json({ error: 'Discord delivery is in progress.' });
     if (regeneration.get(id)?.state === 'running') return res.status(409).json({ error: 'A regeneration is already running for this meeting.' });
     regeneration.set(id, { state: 'running' });
     res.status(202).json({ state: 'running' });
@@ -244,7 +275,9 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     const id = Number(req.params.id);
     const meeting = db.getMeeting(id);
     if (!meeting) return res.status(404).json({ error: 'meeting not found' });
-    if (regeneration.get(id)?.state === 'running') return res.status(409).json({ error: 'The meeting summary is being regenerated.' });
+    if (regeneration.get(id)?.state === 'running' || meetingProgress(id) || meeting.delivery_status === 'sending') {
+      return res.status(409).json({ error: 'The meeting is being processed.' });
+    }
     regeneration.delete(id);
     db.deleteMeeting(id);
     await rm(audioDir(id), { recursive: true, force: true }).catch(() => {});
@@ -431,6 +464,15 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
   // The slash-command reference for the dashboard's Commands page.
   r.get('/commands', (_req, res) => {
     res.json({ commands: COMMAND_CATALOG });
+  });
+
+  r.post('/system/prune', requireAdmin, async (req, res) => {
+    try {
+      res.json(await pruneMeetings(db, req.body?.days, { dryRun: req.body?.confirm !== true }));
+    } catch (error) {
+      if (error instanceof RangeError) return res.status(400).json({ error: error.message });
+      throw error;
+    }
   });
 
   // Overall onboarding + bot connection state for the UI. Never leaks secrets.

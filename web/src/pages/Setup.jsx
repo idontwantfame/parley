@@ -727,7 +727,7 @@ function RecordingRetention({ enabled, save }) {
   const { user, authEnabled } = useAuth();
   if (authEnabled && !user?.isAdmin) return null;
   return <Switch checked={!!enabled} onChange={(event) => save({ keepAudio: event.target.checked })}
-    label="Keep recordings" desc="Save audio from future completed meetings for authenticated WAV downloads." />;
+    label="Keep recordings" desc="Save audio from future completed meetings as downloadable MP3s." />;
 }
 
 function SpeakerNames({ guildId }) {

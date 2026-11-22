@@ -19,6 +19,7 @@ const KEEP_AUDIO_STATUSES = new Set(['recording', 'processing', 'transcription_f
 
 export async function reconcileOnBoot(db, audioRoot, { readdir = readdirSync, remove = rm, log = console, retentionDays = 30 } = {}) {
   let orphanMeetings = 0;
+  db.interruptDeliveries();
 
   // 1) Orphaned meetings from a crash mid-pipeline.
   for (const m of db.findOrphanedMeetings()) {

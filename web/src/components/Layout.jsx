@@ -20,7 +20,7 @@ const NAV = [
 ];
 
 function GuildSwitcher() {
-  const { guilds, guildId, setGuildId, error } = useGuild();
+  const { guilds, guildId, setGuildId, error, loading } = useGuild();
   if (error) return <span className="text-xs text-error">{error}</span>;
   return (
     <div className="relative">
@@ -28,9 +28,10 @@ function GuildSwitcher() {
         value={guildId || ''}
         onChange={(e) => setGuildId(e.target.value)}
         aria-label="Select server"
+        disabled={guilds.length === 0}
         className="appearance-none bg-surface-2 hover:bg-surface-3 border border-border rounded-sm text-sm font-medium text-ink pl-3 pr-8 py-1.5 cursor-pointer transition-colors focus:outline-none focus:border-primary max-w-[220px] truncate"
       >
-        {guilds.length === 0 && <option value="">No servers</option>}
+        {guilds.length === 0 && <option value="">{loading ? 'Loading servers…' : 'No servers'}</option>}
         {guilds.map((g) => (
           <option key={g.id} value={g.id}>{g.name}</option>
         ))}

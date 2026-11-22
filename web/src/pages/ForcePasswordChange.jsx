@@ -17,7 +17,6 @@ export default function ForcePasswordChange() {
     e.preventDefault();
     setErr(null);
     if (next !== confirm) { setErr('Passwords do not match.'); return; }
-    if (next.length < 8) { setErr('Password must be at least 8 characters.'); return; }
     setBusy(true);
     try {
       // mustChangePassword accounts don't need the current password.
@@ -46,12 +45,12 @@ export default function ForcePasswordChange() {
             <div>
               <label htmlFor="fpc-new" className="block text-[13px] font-medium text-ink mb-1.5">New password</label>
               <input id="fpc-new" className="input" type="password" value={next} autoFocus autoComplete="new-password"
-                onChange={(e) => setNext(e.target.value)} placeholder="At least 8 characters" />
+                onChange={(e) => setNext(e.target.value)} required />
             </div>
             <div>
               <label htmlFor="fpc-confirm" className="block text-[13px] font-medium text-ink mb-1.5">Confirm password</label>
               <input id="fpc-confirm" className="input" type="password" value={confirm} autoComplete="new-password"
-                onChange={(e) => setConfirm(e.target.value)} placeholder="••••••••" />
+                onChange={(e) => setConfirm(e.target.value)} required />
             </div>
             {err && <p className="text-sm text-error bg-error-soft rounded-sm px-3 py-2">{err}</p>}
             <button type="submit" disabled={busy || next.length < 8}

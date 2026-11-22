@@ -20,39 +20,19 @@ Verified: `npm test` 270/270 pass. `npm --prefix web run build` 64 modules, 282 
 
 ---
 
-## Open — backend / pipeline
+## Implemented in the fork
 
-### High
-
-- [ ] **`src/pipeline/orchestrator.js:91-102` — persist `delivered`/`deliveryError` to the meetings table (audit #14, half-closed).** Returned but never stored; `/meetings/:id` can't surface "notes saved but not posted" or offer a re-post. Fix: schema migration adds `delivered`/`delivery_error` columns; orchestrator writes them; expose via `/meetings/:id`; add `POST /meetings/:id/repost` reusing `postNotes`. ~3 files: `db.js`, `orchestrator.js`, `api.js`; 1 UI line in `Reading.jsx`.
-- [ ] **`src/pipeline/retry.js:75` — log delivery failures on the dashboard retry's resummarize path.** Today `deliver(...).catch(() => {})` swallows with no log, while the orchestrator logs the same class (orchestrator.js:99). Pick one behavior.
-- [ ] **`src/store/db.js` — retention + VACUUM + scheduled sweep (audit #17).** `meetings`/`utterances`/FTS grow unbounded for done meetings. `reconcileOnBoot` runs once at process start only. Add `pruneOlderThan(days)` callable from a `setInterval` in `index.js` + a `POST /system/prune` admin route.
-
-### Medium
-
-- [ ] **`src/web/auth.js:141` — `requirePasswordChanged` fails open when `req.user` is undefined.** Mirrors pre-fix shape of `requireAdmin` (audit #22). Safe today because `server.js:26` always mounts `attachUser` first, but a future bare-mount on the standalone server reintroduces the default-cred takeover surface. Fix: same `req.authResolved` gating as `requireAdmin`.
-- [ ] **`src/store/db.js:53` — `todos_dedup` UNIQUE INDEX lets duplicates in when `meeting_id` is NULL (SQLite NULLs are distinct in UNIQUE indexes).** Every `seedTodos` call today sets `meeting_id`, so it never fires; add an explicit comment for future maintainers noting the invariant.
-- [ ] **`src/pipeline/transcribe.js:30` — round-robin worker assignment stalls on a hung `convert`/`stt`.** Minor at default concurrency (2/4); skip unless you scale up.
-
----
-
-## Open — scripts / project hygiene
-
-- [ ] **Drop one of the duplicated reprocessing script pairs.** `scripts/reprocess-meeting.mjs` ≡ `scripts/resummarize.js`; `scripts/retranscribe-meeting.mjs` ≡ `scripts/retranscribe.js`. `bot.js:77` failure message points at `reprocess-meeting.mjs`; the dashboard Retry button (`api.js:167`) covers the same path. Pick one set, delete the other, update `bot.js` message to point at the dashboard primarily.
-
----
-
-## Open — UI (audit, intentionally not fixed this round)
-
-### Low / polish
-
-- [ ] **`web/src/pages/Reading.jsx:205` — delete-then-navigate to `/meetings` leaves a stale list.** `Meetings.jsx` `useEffect` only fires on `guildId` change. Fix requires a global meetings cache or a manual refresh signal — bigger refactor.
-- [ ] **`web/src/GuildContext.jsx:11-15` — fetches guilds once at mount.** New guilds added in Discord after page load never appear until refresh (bot-controller emits no SSE). Audit #36 category.
-- [ ] **`web/src/components/Markdown.jsx` — single-pass line parser, no nested formatting** (e.g. bold link inside a list item). LLM answers are simple; dependency-free intent preserved. `react-markdown` migration optional.
-- [ ] **`web/src/components/Layout.jsx` GuildSwitcher — no loading vs empty distinction.** Shows "No servers" both while loading and when truly empty. Minor cosmetic.
-- [ ] **`web/src/pages/ForcePasswordChange.jsx:20` — client-side min length hardcoded at 8.** Matches server `PASSWORD_MIN` today; drift risk if server bumps the threshold. Tolerable for self-hosted.
-- [ ] **`web/src/pages/Analytics.jsx` — top-N hardcoded at 8.** Could expose a "show all" toggle. Polish only.
-- [ ] **`web/src/components/ui.jsx:117` `StatusPill` — only knows 5 statuses.** Unknown states (e.g. `'empty'`) fall through to a generic "Unknown" pill. Today `'empty'` meetings get deleted by `bot.js:65` before they reach the UI, so this is theoretical.
+- [x] Persist Discord delivery status and errors. Admins can post saved notes from the meeting page.
+- [x] Report delivery failures for dashboard retries and the delivery script.
+- [x] Offer daily, opt-in retention and an admin preview over completed non-campaign meetings. SQLite reuses freed pages. Full scheduled VACUUM is deferred because it rewrites the database and requires extra disk space.
+- [x] Reject missing sessions in the password-change guard and use server-side password length validation in onboarding.
+- [x] Document the meeting ID invariant for action-item deduplication.
+- [x] Let each free transcription worker take the next queued track without waiting for a specific worker.
+- [x] Keep one pair of CLI recovery scripts. Direct users to the meeting page for recovery.
+- [x] Reload meetings on route navigation and refresh the server list periodically and on window focus.
+- [x] Distinguish loading and empty server lists, show an explicit empty meeting status, and add a show-everyone view in Analytics.
+- [x] Render nested Markdown formatting in notes and answers.
+- [x] Save new retained recordings as MP3 after transcription and preserve raw tracks when recovery may need them.
 
 ---
 

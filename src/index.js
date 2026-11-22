@@ -9,6 +9,7 @@ import { reconcileOnBoot, sweepAudio } from './store/reconcile.js';
 import { BotController } from './bot-controller.js';
 import { SidecarController } from './sidecar-controller.js';
 import { startWebServer } from './web/server.js';
+import { pruneMeetings } from './store/meeting-retention.js';
 
 const db = openDb(join(config.dataDir, 'meetings.db'));
 const audioRoot = join(config.dataDir, 'audio');
@@ -18,8 +19,17 @@ const audioRoot = join(config.dataDir, 'audio');
 // and stale audio dirs are swept. Best-effort — never block startup on it.
 const audioOptions = { retentionDays: config.audioRetentionDays };
 await reconcileOnBoot(db, audioRoot, audioOptions).catch((e) => console.warn('[reconcile] skipped:', e.message));
+function runMeetingRetention() {
+  if (config.meetingRetentionDays > 0) {
+    return pruneMeetings(db, config.meetingRetentionDays, { dryRun: false })
+      .then(({ deleted }) => { if (deleted) console.log(`[retention] Removed ${deleted} expired meetings.`); })
+      .catch((e) => console.warn('[retention] meeting sweep skipped:', e.message));
+  }
+}
+await runMeetingRetention();
 setInterval(() => {
   sweepAudio(db, audioRoot, audioOptions).catch((e) => console.warn('[reconcile] audio sweep skipped:', e.message));
+  void runMeetingRetention();
 }, 86_400_000).unref();
 
 const bot = new BotController({ db, audioRoot });

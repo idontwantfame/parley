@@ -22,6 +22,8 @@ import { processMeeting } from './orchestrator.js';
 import { autoExportMeeting } from '../delivery/meeting-export.js';
 import { campaignContextFor, foldMeetingIntoJournal } from '../campaign/journal.js';
 import { withMeetingProgress } from './progress.js';
+import { deliverSavedNotes } from '../delivery/status.js';
+import { retainRecording } from '../voice/recording-archive.js';
 
 // Statuses the UI should offer a retry for.
 export const RETRYABLE_STATUSES = new Set(['transcription_failed', 'summary_failed', 'processing', 'recording']);
@@ -72,7 +74,11 @@ export function regeneratePlan(db, meetingId) {
  * existing summary and status untouched — the old notes stay until a new set
  * is actually in hand. Does not re-post to Discord.
  */
-export async function regenerateSummary(db, meetingId) {
+export function regenerateSummary(db, meetingId) {
+  return withMeetingProgress(meetingId, null, () => regenerateSavedSummary(db, meetingId));
+}
+
+async function regenerateSavedSummary(db, meetingId) {
   const plan = regeneratePlan(db, meetingId);
   if (!plan.ok) return { ok: false, reason: plan.reason };
   const meeting = plan.meeting;
@@ -134,14 +140,14 @@ export async function retryMeeting(db, meetingId, { dataDir, deliver = null } = 
     const audioDir = join(dataDir, 'audio', String(meetingId));
     let hasAudio = false;
     if (cfg.keepAudio) {
-      try { hasAudio = readdirSync(audioDir).some((file) => file.endsWith('.pcm')); }
-      catch { /* No recording available to retain. */ }
+      progress.stage = 'archiving';
+      hasAudio = await retainRecording(audioDir, meeting.transcription_complete === 1, meetingId);
     }
     db.setAudioRetained(meetingId, hasAudio);
     db.setMeetingStatus(meetingId, 'done', new Date().toISOString());
     if (!hasAudio) await rm(audioDir, { recursive: true, force: true }).catch(() => {});
     const exportResult = await autoExportMeeting(db, meetingId);
-    if (deliver) await deliver(notes, talktime, meta).catch(() => {});
+    if (deliver) await deliverSavedNotes(db, meetingId, (savedNotes, savedTalktime) => deliver(savedNotes, savedTalktime, meta));
     // A session that failed earlier never reached its campaign journal.
     if (meeting.campaign_id) progress.stage = 'journal';
     await foldMeetingIntoJournal(db, meetingId, { cfg })

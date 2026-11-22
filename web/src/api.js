@@ -42,6 +42,7 @@ export const api = {
   exportMeetingUrl: (id, format = 'md') => `/api/meetings/${id}/export?format=${format}`,
   meetingAudioUrl: (id) => `/api/meetings/${id}/audio`,
   deleteMeetingAudio: (id) => fetch(`/api/meetings/${id}/audio`, { method: 'DELETE' }).then(json),
+  postMeetingNotes: (id) => fetch(`/api/meetings/${id}/repost`, { method: 'POST' }).then(json),
   meetingProgress: (id) => fetch(`/api/meetings/${id}/progress`).then(json),
   todos: (g, { open, assignee } = {}) => {
     const p = new URLSearchParams();

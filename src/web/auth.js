@@ -136,11 +136,10 @@ export function requireAdmin(req, res, next) {
 // are mounted *before* this, so the user can still authenticate and set a real
 // password — they just can't touch anything else until they do. Without this, a
 // reachable instance with the default admin/admin is fully operable by anyone.
-// Permissive when no user is attached (standalone/test server), mirroring
-// requireAdmin.
 export function requirePasswordChanged(_users) {
   return (req, res, next) => {
-    if (req.user && req.user.mustChangePassword) {
+    if (!req.user) return res.status(401).json({ error: 'Not authenticated.' });
+    if (req.user.mustChangePassword) {
       return res.status(403).json({
         error: 'Set a new password before using the dashboard.',
         code: 'PASSWORD_CHANGE_REQUIRED',

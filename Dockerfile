@@ -26,7 +26,9 @@ RUN node scripts/patch-discord-voice.mjs
 FROM node:24-bookworm-slim AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
-# WAV headers are written in pure JS (src/voice/audio.js); no ffmpeg needed.
+# Encode retained recordings as MP3 after transcription.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
 COPY src ./src

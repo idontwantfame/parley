@@ -24,6 +24,9 @@ export async function postNotes({ client, meeting, cfg, notes, talktime }) {
   // a delivery failure (the meeting is still 'done' with notes in the dashboard)
   // instead of pretending the post succeeded with no trace.
   if (!channel) throw new Error(`Notes channel ${channelId} is unreachable (deleted or missing access).`);
+  if (meeting.guild_id && channel.guildId !== meeting.guild_id) {
+    throw new Error('The configured notes channel belongs to a different Discord server.');
+  }
 
   const language = resolveSummaryLanguage(cfg);
   const link = meetingLink(config.notesBaseUrl, meeting.id);
@@ -42,9 +45,18 @@ export async function postNotes({ client, meeting, cfg, notes, talktime }) {
       .create({ name: `Notes — ${meeting.channel_name} ${meeting.started_at.slice(0, 10)}` })
       .catch(() => channel);
   }
-  for (const part of parts) await target.send({ content: part, allowedMentions: { parse: [] } });
   if (link) {
     const label = language === 'pl' ? 'Pełne notatki w Parley' : 'Full notes in Parley';
-    await target.send({ content: `[${label}](<${link}>)`, allowedMentions: { parse: [] } });
+    parts.push(`[${label}](<${link}>)`);
+  }
+  let sent = 0;
+  try {
+    for (const content of parts) {
+      await target.send({ content, allowedMentions: { parse: [] } });
+      sent++;
+    }
+  } catch (error) {
+    if (!sent) throw error;
+    throw new Error(`Discord received ${sent} of ${parts.length} messages. Check the channel before posting again. ${error.message}`, { cause: error });
   }
 }

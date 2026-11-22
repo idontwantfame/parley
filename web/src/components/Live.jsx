@@ -63,6 +63,7 @@ export function LiveCard({ session }) {
 export function ProgressText({ progress }) {
   if (!progress) return 'Preparing transcription…';
   if (progress.stage === 'summarizing') return 'Generating notes…';
+  if (progress.stage === 'archiving') return 'Saving the recording…';
   if (progress.stage === 'journal') return 'Updating the campaign journal…';
   const { completed, total, failed, etaSeconds } = progress;
   return `${completed} of ${total} audio tracks processed${failed ? ` · ${failed} failed` : ''}${etaSeconds ? ` · about ${Math.max(1, Math.round(etaSeconds / 60))} min remaining` : ''}`;

@@ -20,6 +20,7 @@ export default function Analytics() {
   const { guildId } = useGuild();
   const [agg, setAgg] = useState(null);
   const [error, setError] = useState(null);
+  const [showAll, setShowAll] = useState(false);
 
   useEffect(() => {
     if (!guildId) return;
@@ -33,10 +34,11 @@ export default function Analytics() {
 
   const wordRows = useMemo(() => {
     if (!agg) return [];
-    return agg.leaderboard.slice(0, 8).map((p) => ({
+    const byWords = [...agg.leaderboard].sort((a, b) => b.words - a.words);
+    return (showAll ? byWords : byWords.slice(0, 8)).map((p) => ({
       label: p.displayName, value: p.words, display: `${fmtCompact(p.words)} words`, color: colorOf(p.displayName),
     }));
-  }, [agg]);
+  }, [agg, showAll]);
 
   if (!guildId) return <Page><Empty icon={Icon.Chart} title="No server selected" /></Page>;
   if (error) return <Page><Empty icon={Icon.Chart} title="Couldn't load analytics" body={error} /></Page>;
@@ -51,7 +53,7 @@ export default function Analytics() {
   const { stats, leaderboard, timeline } = agg;
   const totalDays = timeline.filter((t) => t.count > 0).length;
   const avgPerActiveDay = totalDays ? (stats.totalMeetings / totalDays) : 0;
-  const talkRows = leaderboard.slice(0, 8).map((p) => ({
+  const talkRows = (showAll ? leaderboard : leaderboard.slice(0, 8)).map((p) => ({
     label: p.displayName, value: p.ms, display: fmtMs(p.ms), color: colorOf(p.displayName),
   }));
 
@@ -73,7 +75,10 @@ export default function Analytics() {
 
       <div className="grid lg:grid-cols-2 gap-6">
         <div className="card p-5">
-          <SectionHead title="Talk time by person" />
+          <SectionHead title="Talk time by person" action={leaderboard.length > 8 &&
+            <button type="button" className="btn btn-ghost" aria-pressed={showAll} onClick={() => setShowAll((value) => !value)}>
+              {showAll ? 'Show top 8' : 'Show everyone'}
+            </button>} />
           {talkRows.length === 0 ? <p className="text-sm text-muted py-4">No data yet.</p> : <RankBars rows={talkRows} />}
         </div>
         <div className="card p-5">
