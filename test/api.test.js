@@ -96,12 +96,29 @@ test('GET config returns providers + PATCH validates', async () => {
     // valid no-key-required change (whisper model) accepted
     const ok = await fetch(`${base}/api/guilds/g1/config`, {
       method: 'PATCH', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ whisperModel: 'base', autoJoinMinPeople: 3 }),
+      body: JSON.stringify({
+        whisperModel: 'base', autoJoinMinPeople: 3,
+        autoJoinChannelIds: ['123456789012345678', '123456789012345678'],
+      }),
     });
     assert.equal(ok.status, 200);
     const saved = (await ok.json()).config;
     assert.equal(saved.whisperModel, 'base');
     assert.equal(saved.autoJoinMinPeople, 3);
+    assert.deepEqual(saved.autoJoinChannelIds, ['123456789012345678']);
+
+    for (const autoJoinChannelIds of [[], null, ['invalid-id']]) {
+      const response = await fetch(`${base}/api/guilds/g1/config`, {
+        method: 'PATCH', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ autoJoinChannelIds }),
+      });
+      if (autoJoinChannelIds?.includes('invalid-id')) {
+        assert.equal(response.status, 400);
+      } else {
+        assert.equal(response.status, 200);
+        assert.deepEqual((await response.json()).config.autoJoinChannelIds, autoJoinChannelIds);
+      }
+    }
 
     const prompt = await fetch(`${base}/api/guilds/g1/config`, {
       method: 'PATCH', headers: { 'content-type': 'application/json' },

@@ -1,7 +1,11 @@
 export const DEFAULT_AUTO_JOIN_MIN_PEOPLE = 2;
 
-export function shouldAutoJoin({ humanCount, autoJoin, connected, minPeople = DEFAULT_AUTO_JOIN_MIN_PEOPLE }) {
-  return !!autoJoin && !connected && humanCount >= minPeople;
+export function shouldAutoJoin({
+  humanCount, autoJoin, connected, minPeople = DEFAULT_AUTO_JOIN_MIN_PEOPLE,
+  channelId, allowedChannelIds = null,
+}) {
+  return !!autoJoin && !connected && humanCount >= minPeople
+    && (allowedChannelIds === null || allowedChannelIds.includes(channelId));
 }
 
 export function shouldAutoLeave({ humanCount, connected, minPeople = DEFAULT_AUTO_JOIN_MIN_PEOPLE }) {

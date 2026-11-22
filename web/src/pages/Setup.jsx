@@ -344,7 +344,7 @@ export default function Setup() {
     </Page>
   );
 
-  const { config: c, providers, sttProviders, channels, secrets = {}, defaultModels = {}, defaultSummaryPrompt, defaultOverviewPrompt } = data;
+  const { config: c, providers, sttProviders, channels, voiceChannels, secrets = {}, defaultModels = {}, defaultSummaryPrompt, defaultOverviewPrompt } = data;
   const save = async (patch) => {
     try {
       const r = await api.saveConfig(guildId, patch);
@@ -565,8 +565,54 @@ export default function Setup() {
               <button className="btn btn-primary" type="submit">Save minimum</button>
             </form>
           </Field>
+          <AutoJoinChannels key={JSON.stringify([guildId, c.autoJoinChannelIds])}
+            channels={voiceChannels} selected={c.autoJoinChannelIds} save={save} />
         </Card>
       </div>
     </Page>
+  );
+}
+
+function AutoJoinChannels({ channels = [], selected = null, save }) {
+  const [restricted, setRestricted] = useState(selected !== null);
+  const [saving, setSaving] = useState(false);
+  const unavailable = (selected ?? []).filter((id) => !channels.some((channel) => channel.id === id));
+  const choices = [...channels, ...unavailable.map((id) => ({ id, name: `Unavailable channel (${id})` }))];
+
+  async function submit(event) {
+    event.preventDefault();
+    const ids = new FormData(event.currentTarget).getAll('channel');
+    setSaving(true);
+    try {
+      await save({ autoJoinChannelIds: restricted ? ids : null });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Field label="Auto-join channels" hint="Choose where automatic recording can start. Manual /join still works in other channels.">
+      <form onSubmit={submit}>
+        <select className="input" aria-label="Auto-join channel scope" value={restricted ? 'selected' : 'all'}
+          onChange={(event) => setRestricted(event.target.value === 'selected')}>
+          <option value="all">All voice channels</option>
+          <option value="selected">Only selected voice channels</option>
+        </select>
+        <div hidden={!restricted}>
+          {choices.length ? (
+            <fieldset aria-label="Select voice channels" className="my-2 max-h-48 overflow-y-auto">
+              {choices.map(({ id, name, category }) => (
+                <label key={id} className="flex items-center gap-2 py-1 text-sm">
+                  <input type="checkbox" className="pcheck" name="channel" value={id} defaultChecked={selected?.includes(id)} />
+                  <span>{category ? `${category} / ${name}` : name}</span>
+                </label>
+              ))}
+            </fieldset>
+          ) : <p className="mt-2 text-sm text-muted">No voice channels are available.</p>}
+          <p className="my-2 text-xs text-muted">With none selected, automatic recording will stay off.</p>
+        </div>
+        <button className="btn btn-primary mt-2" type="submit" disabled={saving}>Save channels</button>
+      </form>
+    </Field>
   );
 }

@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS guild_config (
   summarizer_fallback_provider TEXT, summarizer_fallback_model TEXT,
   stt_provider TEXT, stt_model TEXT,
   whisper_model TEXT, notes_channel_id TEXT,
-  use_thread INTEGER, auto_join INTEGER, auto_join_min_people INTEGER, language TEXT, summary_language TEXT,
+  use_thread INTEGER, auto_join INTEGER, auto_join_min_people INTEGER, auto_join_channel_ids TEXT,
+  language TEXT, summary_language TEXT,
   summary_prompt TEXT, overview_prompt TEXT
 );
 CREATE TABLE IF NOT EXISTS guilds (
@@ -91,6 +92,9 @@ export function openDb(path) {
   }
   if (!cols.some((c) => c.name === 'auto_join_min_people')) {
     sql.exec(`ALTER TABLE guild_config ADD COLUMN auto_join_min_people INTEGER`);
+  }
+  if (!cols.some((c) => c.name === 'auto_join_channel_ids')) {
+    sql.exec(`ALTER TABLE guild_config ADD COLUMN auto_join_channel_ids TEXT`);
   }
   // Migration: add cloud STT columns to dbs created before they existed.
   if (!cols.some((c) => c.name === 'stt_provider')) {

@@ -14,6 +14,7 @@ export const DEFAULTS = {
   useThread: true,
   autoJoin: true,
   autoJoinMinPeople: DEFAULT_AUTO_JOIN_MIN_PEOPLE,
+  autoJoinChannelIds: null,
   language: 'auto',
   summaryLanguage: 'en',
   // null = the built-in SUMMARY_PROMPT (notes.js), resolved at summarize time so
@@ -34,11 +35,22 @@ const COLS = {
   useThread: 'use_thread',
   autoJoin: 'auto_join',
   autoJoinMinPeople: 'auto_join_min_people',
+  autoJoinChannelIds: 'auto_join_channel_ids',
   language: 'language',
   summaryLanguage: 'summary_language',
   summaryPrompt: 'summary_prompt',
   overviewPrompt: 'overview_prompt',
 };
+
+function parseAutoJoinChannels(value) {
+  if (value == null) return null;
+  try {
+    const ids = JSON.parse(value);
+    return Array.isArray(ids) ? ids : [];
+  } catch {
+    return [];
+  }
+}
 
 function fromRow(row) {
   return {
@@ -53,6 +65,7 @@ function fromRow(row) {
     useThread: row.use_thread == null ? DEFAULTS.useThread : !!row.use_thread,
     autoJoin: row.auto_join == null ? DEFAULTS.autoJoin : !!row.auto_join,
     autoJoinMinPeople: row.auto_join_min_people ?? DEFAULTS.autoJoinMinPeople,
+    autoJoinChannelIds: parseAutoJoinChannels(row.auto_join_channel_ids),
     language: row.language ?? DEFAULTS.language,
     summaryLanguage: row.summary_language ?? DEFAULTS.summaryLanguage,
     summaryPrompt: row.summary_prompt ?? DEFAULTS.summaryPrompt,
@@ -73,8 +86,8 @@ export function setGuildConfig(db, guildId, patch) {
   const merged = { ...current, ...safePatch, guildId };
   db.sql.prepare(
     `INSERT OR REPLACE INTO guild_config
-       (guild_id, summarizer_provider, summarizer_model, summarizer_fallback_provider, summarizer_fallback_model, stt_provider, stt_model, whisper_model, notes_channel_id, use_thread, auto_join, auto_join_min_people, language, summary_language, summary_prompt, overview_prompt)
-     VALUES (@guildId, @summarizerProvider, @summarizerModel, @summarizerFallbackProvider, @summarizerFallbackModel, @sttProvider, @sttModel, @whisperModel, @notesChannelId, @useThread, @autoJoin, @autoJoinMinPeople, @language, @summaryLanguage, @summaryPrompt, @overviewPrompt)`
+       (guild_id, summarizer_provider, summarizer_model, summarizer_fallback_provider, summarizer_fallback_model, stt_provider, stt_model, whisper_model, notes_channel_id, use_thread, auto_join, auto_join_min_people, auto_join_channel_ids, language, summary_language, summary_prompt, overview_prompt)
+     VALUES (@guildId, @summarizerProvider, @summarizerModel, @summarizerFallbackProvider, @summarizerFallbackModel, @sttProvider, @sttModel, @whisperModel, @notesChannelId, @useThread, @autoJoin, @autoJoinMinPeople, @autoJoinChannelIds, @language, @summaryLanguage, @summaryPrompt, @overviewPrompt)`
   ).run({
     guildId,
     summarizerProvider: merged.summarizerProvider,
@@ -88,6 +101,7 @@ export function setGuildConfig(db, guildId, patch) {
     useThread: merged.useThread ? 1 : 0,
     autoJoin: merged.autoJoin ? 1 : 0,
     autoJoinMinPeople: merged.autoJoinMinPeople,
+    autoJoinChannelIds: merged.autoJoinChannelIds === null ? null : JSON.stringify(merged.autoJoinChannelIds),
     language: merged.language,
     summaryLanguage: merged.summaryLanguage,
     summaryPrompt: merged.summaryPrompt,

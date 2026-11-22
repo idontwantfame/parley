@@ -310,6 +310,8 @@ pm2 save
 
 **Auto join/leave:** the bot joins automatically when a voice channel reaches its minimum number of people (default: two). Change it with `/setup autojoin_min_people:3` or in **Settings → Behavior**. Use `/setup autojoin` to toggle automatic recording. The bot leaves when one or zero people remain, or when the channel empties if you set the minimum to one and enable auto-join.
 
+Use **Settings → Behavior → Auto-join channels** to limit automatic recording to selected voice channels. Existing servers start with **All voice channels**. An empty selection under **Only selected voice channels** disables automatic starts. Manual `/join` remains available.
+
 ## 🎛️ Configuration
 
 In **Settings → Summarizer**, the **Summary prompt** instructs the model to extract structured JSON notes from the transcript. For long Ollama summaries, the **Overview prompt** controls the final recap from the chunk overviews. Ask for plain text in that field. The prompts are saved per server, and **Restore default** restores the built-in wording.

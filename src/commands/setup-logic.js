@@ -90,6 +90,13 @@ export function validateSetup(input, env) {
     }
     patch.autoJoinMinPeople = input.autoJoinMinPeople;
   }
+  if (input.autoJoinChannelIds !== undefined) {
+    const ids = input.autoJoinChannelIds;
+    if (ids !== null && (!Array.isArray(ids) || ids.some((id) => typeof id !== 'string' || !/^[1-9]\d{16,19}$/.test(id)))) {
+      return { ok: false, error: 'Auto-join channels must be Discord voice channel IDs.' };
+    }
+    patch.autoJoinChannelIds = ids === null ? null : [...new Set(ids)];
+  }
   if (input.language !== undefined) {
     if (!LANGUAGE_CODES.has(input.language)) {
       return { ok: false, error: `Invalid language. Use one of: ${[...LANGUAGE_CODES].join(', ')}.` };

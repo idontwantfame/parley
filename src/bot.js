@@ -294,7 +294,10 @@ export function startBot({ db, audioRoot }) {
       if (shouldAutoLeave(occupancy)) {
         debugLog(`[vSU] auto-leave triggered for ${voiceChannel.id}`);
         await stopAndLeave(guild.id, voiceChannel.id).catch((e) => console.error('auto-leave failed:', e.message));
-      } else if (voiceChannel === channel && shouldAutoJoin({ ...occupancy, autoJoin: cfg.autoJoin })) {
+      } else if (voiceChannel === channel && shouldAutoJoin({
+        ...occupancy, autoJoin: cfg.autoJoin, channelId: voiceChannel.id,
+        allowedChannelIds: cfg.autoJoinChannelIds,
+      })) {
         debugLog(`[vSU] auto-join triggered for ${voiceChannel.id}`);
         await joinAndStart(voiceChannel).catch((e) => console.error('auto-join failed:', e.message));
       }

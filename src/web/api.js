@@ -268,6 +268,10 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
       ? [...guild.channels.cache.filter((c) => c.type === ChannelType.GuildText).values()]
           .map((c) => ({ id: c.id, name: c.name }))
       : [];
+    const voiceChannels = guild
+      ? [...guild.channels.cache.filter((c) => c.type === ChannelType.GuildVoice).values()]
+          .map((c) => ({ id: c.id, name: c.name, category: c.parent?.name ?? null }))
+      : [];
     res.json({
       config: getGuildConfig(db, req.params.g),
       defaultSummaryPrompt: SUMMARY_PROMPT,
@@ -275,6 +279,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
       providers: availableProviders(env),
       sttProviders: availableSttProviders(env),
       channels,
+      voiceChannels,
       defaultModels: DEFAULT_MODELS,
       secrets: secretStatus(env),
     });

@@ -24,6 +24,14 @@ test('shouldAutoJoin uses the configured number of humans', () => {
   assert.equal(shouldAutoJoin({ ...options, humanCount: 4 }), true);
 });
 
+test('shouldAutoJoin honors the selected channels, including an empty selection', () => {
+  const options = { autoJoin: true, connected: false, humanCount: 2, allowedChannelIds: ['a'] };
+  assert.equal(shouldAutoJoin({ ...options, channelId: 'a' }), true);
+  assert.equal(shouldAutoJoin({ ...options, channelId: 'b' }), false);
+  assert.equal(shouldAutoJoin({ ...options, channelId: 'a', allowedChannelIds: [] }), false);
+  assert.equal(shouldAutoJoin({ ...options, channelId: 'b', allowedChannelIds: null }), true);
+});
+
 test('a threshold of one permits recording until the voice channel empties', () => {
   const options = { autoJoin: true, connected: false, minPeople: 1 };
   assert.equal(shouldAutoJoin({ ...options, humanCount: 0 }), false);
