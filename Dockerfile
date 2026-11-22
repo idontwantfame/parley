@@ -19,6 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
+COPY scripts/patch-discord-voice.mjs ./scripts/
+RUN node scripts/patch-discord-voice.mjs
 
 # 3) Runtime
 FROM node:24-bookworm-slim AS runtime

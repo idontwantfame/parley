@@ -19,7 +19,10 @@ import { renderNotes, chunk } from './delivery/discord-notes.js';
 import { postNotes } from './delivery/post.js';
 
 export function startBot({ db, audioRoot }) {
-  validateEnv(); // throws with a clear message if token/client id are missing
+  validateEnv({
+    DISCORD_TOKEN: config.discordToken,
+    DISCORD_CLIENT_ID: config.discordClientId,
+  });
 
   // Verbose voice-lifecycle logging (gateway raw packets, [vSU]/[voice]/[join]
   // traces) is noisy in production; gate it behind DEBUG_VOICE=1. Errors,
@@ -133,13 +136,46 @@ export function startBot({ db, audioRoot }) {
         throw new Error('Bot lacks **Speak** permission in this voice channel. Check server roles / channel overrides.');
       }
       debugLog(`[voice] joinVoiceChannel guild=${channel.guild.id} channel=${channel.id}`);
+      const handshake = {
+        sent: 0, stateUpdates: 0, serverUpdates: 0, hasEndpoint: false,
+        transitions: [], closeCodes: [],
+      };
+      const observedNetworking = new WeakSet();
+      const createAdapter = channel.guild.voiceAdapterCreator;
       const connection = joinVoiceChannel({
         channelId: channel.id, guildId: channel.guild.id,
-        adapterCreator: channel.guild.voiceAdapterCreator, selfDeaf: false, selfMute: true,
+        adapterCreator(callbacks) {
+          const adapter = createAdapter({
+            ...callbacks,
+            onVoiceServerUpdate(packet) {
+              handshake.serverUpdates++;
+              handshake.hasEndpoint = Boolean(packet.endpoint);
+              callbacks.onVoiceServerUpdate(packet);
+            },
+            onVoiceStateUpdate(packet) {
+              handshake.stateUpdates++;
+              callbacks.onVoiceStateUpdate(packet);
+            },
+          });
+          return {
+            ...adapter,
+            sendPayload(payload) {
+              const sent = adapter.sendPayload(payload);
+              if (sent && payload.d.channel_id) handshake.sent++;
+              return sent;
+            },
+          };
+        },
+        selfDeaf: false, selfMute: true,
       });
       debugLog(`[voice] connection initial state: ${connection.state.status}`);
       connection.on('stateChange', (oldState, newState) => {
         debugLog(`[voice] stateChange: ${oldState.status} -> ${newState.status}`);
+        if (newState.status !== oldState.status) handshake.transitions.push(newState.status);
+        if (newState.networking && !observedNetworking.has(newState.networking)) {
+          observedNetworking.add(newState.networking);
+          newState.networking.once('close', (code) => handshake.closeCodes.push(code));
+        }
       });
       connection.on('error', (err) => {
         console.error(`[voice] connection error:`, err.message);
@@ -148,13 +184,14 @@ export function startBot({ db, audioRoot }) {
         await entersState(connection, VoiceConnectionStatus.Ready, 25_000);
         debugLog(`[voice] connection reached Ready`);
       } catch (err) {
-        console.error(`[voice] entersState failed after 25s. Final state: ${connection.state.status}`);
-        connection.destroy();
-        throw new Error(
-          `Voice connection failed: ${err.message}. Final state was ${connection.state.status}. ` +
-          `Common causes: missing Connect/Speak permission, bot role below channel restrictions, ` +
-          `or Discord voice region issues. Try moving the bot role higher in Server Settings → Roles.`
-        );
+        const status = connection.state.status;
+        console.error(`[voice] entersState failed after 25s. Final state: ${status}`);
+        console.error('[voice] handshake:', JSON.stringify({
+          ...handshake, channelLimit: channel.userLimit, channelFull: channel.full,
+          canMoveMembers: channel.permissionsFor(client.user)?.has('MoveMembers') ?? false,
+        }));
+        if (status !== VoiceConnectionStatus.Destroyed) connection.destroy();
+        throw new Error(`Voice connection failed while ${status}: ${err.message}`);
       }
       if (manager.isActive(channel.guild.id, channel.id)) {
         connection.destroy();
