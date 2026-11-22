@@ -84,6 +84,12 @@ export function validateSetup(input, env) {
   if (input.notesChannelId !== undefined) patch.notesChannelId = input.notesChannelId;
   if (input.useThread !== undefined) patch.useThread = !!input.useThread;
   if (input.autoJoin !== undefined) patch.autoJoin = !!input.autoJoin;
+  if (input.autoJoinMinPeople !== undefined) {
+    if (!Number.isSafeInteger(input.autoJoinMinPeople) || input.autoJoinMinPeople < 1) {
+      return { ok: false, error: 'Auto-join minimum must be a whole number of at least 1.' };
+    }
+    patch.autoJoinMinPeople = input.autoJoinMinPeople;
+  }
   if (input.language !== undefined) {
     if (!LANGUAGE_CODES.has(input.language)) {
       return { ok: false, error: `Invalid language. Use one of: ${[...LANGUAGE_CODES].join(', ')}.` };

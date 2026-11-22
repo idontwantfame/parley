@@ -34,6 +34,15 @@ test('setGuildConfig round-trips boolean false', () => {
   assert.equal(c.autoJoin, false);
 });
 
+test('the auto-join minimum defaults to two for old rows and persists independently of the toggle', () => {
+  const db = openDb(':memory:');
+  db.sql.prepare('INSERT INTO guild_config (guild_id, auto_join) VALUES (?, 1)').run('g');
+  assert.equal(getGuildConfig(db, 'g').autoJoinMinPeople, 2);
+  setGuildConfig(db, 'g', { autoJoinMinPeople: 4 });
+  setGuildConfig(db, 'g', { autoJoin: false });
+  assert.equal(getGuildConfig(db, 'g').autoJoinMinPeople, 4);
+});
+
 test('setGuildConfig ignores undefined patch values and pins guildId', () => {
   const db = openDb(':memory:');
   assert.doesNotThrow(() => setGuildConfig(db, 'g', { summarizerModel: undefined, language: 'es', guildId: 'evil' }));

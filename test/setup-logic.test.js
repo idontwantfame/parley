@@ -48,6 +48,14 @@ test('rejects unknown provider', () => {
   assert.match(r.error, /provider/i);
 });
 
+test('validates the auto-join minimum as a positive integer', () => {
+  assert.deepEqual(validateSetup({ autoJoinMinPeople: 1 }, env), { ok: true, patch: { autoJoinMinPeople: 1 } });
+  assert.deepEqual(validateSetup({ autoJoinMinPeople: 4 }, env), { ok: true, patch: { autoJoinMinPeople: 4 } });
+  for (const minimum of [0, -1, 1.5, '3', null]) {
+    assert.equal(validateSetup({ autoJoinMinPeople: minimum }, env).ok, false);
+  }
+});
+
 test('accepts whisper model + thread + autojoin booleans', () => {
   const r = validateSetup({ whisperModel: 'medium', useThread: false, autoJoin: true }, env);
   assert.equal(r.ok, true);

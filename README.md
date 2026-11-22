@@ -308,7 +308,7 @@ pm2 save
 | `/search <keyword>` | Full-text search across all meeting transcripts |
 | `/setup` | Configure the bot for this server (admin only) |
 
-**Auto join/leave:** the bot joins automatically when more than one human is in a voice channel and leaves when one or zero remain. Toggle with `/setup autojoin`.
+**Auto join/leave:** the bot joins automatically when a voice channel reaches its minimum number of people (default: two). Change it with `/setup autojoin_min_people:3` or in **Settings → Behavior**. Use `/setup autojoin` to toggle automatic recording. The bot leaves when one or zero people remain, or when the channel empties if you set the minimum to one and enable auto-join.
 
 ## 🎛️ Configuration
 
@@ -327,7 +327,8 @@ Set `DISCORD_RECORDING_NICKNAME` in your environment to customize the bot's nick
 | `whisper_model` | Local sidecar size: `tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turbo` |
 | `notes_channel` | Text channel where notes are posted (defaults to the meeting's channel) |
 | `thread` | Post notes in a thread (default: on) |
-| `autojoin` | Auto-join when 2+ people are in voice |
+| `autojoin` | Enable automatic voice recording |
+| `autojoin_min_people` | Minimum people in voice to start recording automatically (default: 2) |
 | `language` | Spoken language (German, English, …) or `auto`-detect |
 | `summary_language` | Language for the notes/summary (default English), or `Match transcription` |
 

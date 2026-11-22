@@ -96,10 +96,12 @@ test('GET config returns providers + PATCH validates', async () => {
     // valid no-key-required change (whisper model) accepted
     const ok = await fetch(`${base}/api/guilds/g1/config`, {
       method: 'PATCH', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ whisperModel: 'base' }),
+      body: JSON.stringify({ whisperModel: 'base', autoJoinMinPeople: 3 }),
     });
     assert.equal(ok.status, 200);
-    assert.equal((await ok.json()).config.whisperModel, 'base');
+    const saved = (await ok.json()).config;
+    assert.equal(saved.whisperModel, 'base');
+    assert.equal(saved.autoJoinMinPeople, 3);
 
     const prompt = await fetch(`${base}/api/guilds/g1/config`, {
       method: 'PATCH', headers: { 'content-type': 'application/json' },

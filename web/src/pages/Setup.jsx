@@ -553,7 +553,18 @@ export default function Setup() {
 
         <Card title="Behavior">
           <Switch checked={c.autoJoin} onChange={(e) => save({ autoJoin: e.target.checked })}
-            label="Auto-join voice" desc="Join automatically when two or more people are in a voice channel." />
+            label="Auto-join voice" desc="Start recording automatically when a voice channel reaches the minimum below." />
+          <Field label="Minimum people to auto-join" hint="Counts people only. Set to 1 to record solo sessions automatically.">
+            <form key={`${guildId}:${c.autoJoinMinPeople}`} className="flex items-center gap-2" onSubmit={(e) => {
+              e.preventDefault();
+              const minimum = Number(new FormData(e.currentTarget).get('minimum'));
+              if (minimum !== c.autoJoinMinPeople) save({ autoJoinMinPeople: minimum });
+            }}>
+              <input className="input w-24" aria-label="Minimum people to auto-join" name="minimum"
+                type="number" min={1} step={1} required defaultValue={c.autoJoinMinPeople} />
+              <button className="btn btn-primary" type="submit">Save minimum</button>
+            </form>
+          </Field>
         </Card>
       </div>
     </Page>

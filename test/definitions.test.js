@@ -13,10 +13,11 @@ test('search command has a required keyword option', () => {
   assert.equal(opt.required, true);
 });
 
-test('setup command exposes provider/model/fallback/stt/whisper/thread/autojoin/channel/language/summary_language options', () => {
+test('setup command exposes the available options, including the auto-join minimum', () => {
   const setup = commandsJSON().find((c) => c.name === 'setup');
   const names = setup.options.map((o) => o.name).sort();
-  assert.deepEqual(names, ['autojoin', 'fallback_model', 'fallback_provider', 'language', 'model', 'notes_channel', 'provider', 'stt_model', 'stt_provider', 'summary_language', 'thread', 'whisper_model']);
+  assert.deepEqual(names, ['autojoin', 'autojoin_min_people', 'fallback_model', 'fallback_provider', 'language', 'model', 'notes_channel', 'provider', 'stt_model', 'stt_provider', 'summary_language', 'thread', 'whisper_model']);
+  assert.equal(setup.options.find((o) => o.name === 'autojoin_min_people').min_value, 1);
 });
 
 test('setup provider option includes openrouter', () => {

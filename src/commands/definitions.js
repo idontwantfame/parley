@@ -38,7 +38,8 @@ export function buildCommands() {
         .addChoices(...WHISPER_MODELS.map((m) => ({ name: m, value: m }))))
       .addChannelOption((o) => o.setName('notes_channel').setDescription('Where to post notes').addChannelTypes(ChannelType.GuildText))
       .addBooleanOption((o) => o.setName('thread').setDescription('Post notes in a thread'))
-      .addBooleanOption((o) => o.setName('autojoin').setDescription('Auto-join when 2+ people are in voice'))
+      .addBooleanOption((o) => o.setName('autojoin').setDescription('Enable automatic voice recording'))
+      .addIntegerOption((o) => o.setName('autojoin_min_people').setDescription('Minimum people in voice to auto-start recording').setMinValue(1))
       .addStringOption((o) => o.setName('language').setDescription('Spoken language (pick German to fix DE/EN mixing)')
         .addChoices(...LANGUAGES.map((l) => ({ name: l.name, value: l.code })), { name: 'Auto-detect', value: 'auto' }))
       .addStringOption((o) => o.setName('summary_language').setDescription('Language for the notes/summary')
@@ -77,7 +78,7 @@ export const COMMAND_CATALOG = [
   { name: 'search', category: 'Notes', admin: false, args: '<keyword>',
     summary: 'Full-text search across every past meeting transcript.' },
   { name: 'setup', category: 'Configuration', admin: true,
-    args: '[provider] [model] [fallback_provider] [fallback_model] [stt_provider] [stt_model] [whisper_model] [notes_channel] [thread] [autojoin] [language] [summary_language]',
+    args: '[provider] [model] [fallback_provider] [fallback_model] [stt_provider] [stt_model] [whisper_model] [notes_channel] [thread] [autojoin] [autojoin_min_people] [language] [summary_language]',
     summary: 'Configure the bot for this server (admin only).',
     detail: 'Set the summarizer provider/model, an optional fallback summarizer used only when the primary fails (set fallback_provider to "none" to disable), the speech-to-text provider (local sidecar or OpenAI) and model, notes channel, threading, auto-join, and languages. You can also do all of this from this dashboard under Settings.' },
 ];

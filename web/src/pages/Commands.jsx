@@ -75,10 +75,10 @@ export default function Commands() {
             <div>
               <p className="text-[14px] font-medium text-ink">Tip: auto-record</p>
               <p className="text-[13px] text-muted leading-relaxed mt-1">
-                With auto-join on, the bot records automatically when two or more people are in a voice channel,
-                so nobody has to run <code className="text-ink-2">/join</code>. Toggle it in{' '}
+                With auto-join enabled, recording starts when a voice channel reaches the configured number of people.
+                Set the minimum in{' '}
                 <Link to="/setup" className="text-primary hover:underline">Settings</Link> or with{' '}
-                <code className="text-ink-2">/setup autojoin</code>.
+                <code className="text-ink-2">/setup autojoin_min_people</code>.
               </p>
             </div>
           </div>

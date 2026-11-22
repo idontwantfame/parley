@@ -246,17 +246,21 @@ export function startBot({ db, audioRoot }) {
   client.on('voiceStateUpdate', async (oldState, newState) => {
     const guild = newState.guild;
     const channel = newState.channel || oldState.channel;
-    if (!channel || channel.type !== ChannelType.GuildVoice) return;
+    if (!channel) return;
     const cfg = getGuildConfig(db, guild.id);
-    const connected = manager.isActive(guild.id, channel.id);
-    const count = humanCount(channel);
-    debugLog(`[vSU] guild=${guild.id} channel=${channel.id} user=${newState.id} old=${oldState.channelId} new=${newState.channelId} humans=${count} connected=${connected} autoJoin=${cfg.autoJoin}`);
-    if (shouldAutoJoin({ humanCount: count, autoJoin: cfg.autoJoin, connected })) {
-      debugLog(`[vSU] auto-join triggered for ${channel.id}`);
-      await joinAndStart(channel).catch((e) => console.error('auto-join failed:', e.message));
-    } else if (shouldAutoLeave({ humanCount: count, connected })) {
-      debugLog(`[vSU] auto-leave triggered for ${channel.id}`);
-      await stopAndLeave(guild.id, channel.id).catch((e) => console.error('auto-leave failed:', e.message));
+    for (const voiceChannel of new Set([oldState.channel, channel])) {
+      if (voiceChannel?.type !== ChannelType.GuildVoice) continue;
+      const connected = manager.isActive(guild.id, voiceChannel.id);
+      const count = humanCount(voiceChannel);
+      const occupancy = { humanCount: count, connected, minPeople: cfg.autoJoin ? cfg.autoJoinMinPeople : undefined };
+      debugLog(`[vSU] guild=${guild.id} channel=${voiceChannel.id} user=${newState.id} old=${oldState.channelId} new=${newState.channelId} humans=${count} connected=${connected} autoJoin=${cfg.autoJoin}`);
+      if (shouldAutoLeave(occupancy)) {
+        debugLog(`[vSU] auto-leave triggered for ${voiceChannel.id}`);
+        await stopAndLeave(guild.id, voiceChannel.id).catch((e) => console.error('auto-leave failed:', e.message));
+      } else if (voiceChannel === channel && shouldAutoJoin({ ...occupancy, autoJoin: cfg.autoJoin })) {
+        debugLog(`[vSU] auto-join triggered for ${voiceChannel.id}`);
+        await joinAndStart(voiceChannel).catch((e) => console.error('auto-join failed:', e.message));
+      }
     }
   });
 
@@ -370,6 +374,7 @@ export function startBot({ db, audioRoot }) {
           notesChannelId: interaction.options.getChannel('notes_channel')?.id,
           useThread: interaction.options.getBoolean('thread') ?? undefined,
           autoJoin: interaction.options.getBoolean('autojoin') ?? undefined,
+          autoJoinMinPeople: interaction.options.getInteger('autojoin_min_people') ?? undefined,
           language: interaction.options.getString('language') ?? undefined,
           summary_language: interaction.options.getString('summary_language') ?? undefined,
         };
