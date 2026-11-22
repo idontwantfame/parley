@@ -1,0 +1,48 @@
+name: Publish container images
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-parley-images
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: github.repository == 'idontwantfame/parley' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: parley
+            dockerfile: Dockerfile
+          - package: parley-sidecar
+            dockerfile: stt_sidecar/Dockerfile
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Sign in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Build and publish
+        env:
+          PACKAGE: ${{ matrix.package }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/idontwantfame/$PACKAGE"
+          docker build --file "$DOCKERFILE" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$image:sha-$GITHUB_SHA" --tag "$image:latest" .
+          docker push "$image:sha-$GITHUB_SHA"
+          docker push "$image:latest"
