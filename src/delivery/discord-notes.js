@@ -36,6 +36,11 @@ const LABELS = {
     decisions: 'Decisões', questions: 'Perguntas em aberto', actions: 'Ações pendentes',
     talktime: 'Tempo de fala', words: 'palavras', unassigned: 'Não atribuído', none: 'Nenhum item', continued: 'continuação',
   },
+  pl: {
+    title: 'Notatki z sesji', meeting: 'sesja', summary: 'Podsumowanie', topics: 'Tematy',
+    decisions: 'Decyzje', questions: 'Otwarte pytania', actions: 'Zadania',
+    talktime: 'Czas wypowiedzi', words: 'słów', unassigned: 'Bez przypisania', none: 'Brak', continued: 'ciąg dalszy',
+  },
   ru: {
     title: 'Протокол встречи', meeting: 'встреча', summary: 'Краткое содержание', topics: 'Темы',
     decisions: 'Решения', questions: 'Открытые вопросы', actions: 'Задачи',
@@ -60,6 +65,7 @@ const STATS_LABELS = {
   fr: ['Durée de la réunion', 'Intervenants', 'Nombre total de mots'],
   it: ['Durata della riunione', 'Oratori', 'Parole totali'],
   nl: ['Vergaderduur', 'Sprekers', 'Totaal woorden'],
+  pl: ['Czas trwania sesji', 'Liczba rozmówców', 'Łączna liczba słów'],
   pt: ['Duração da reunião', 'Oradores', 'Total de palavras'],
   ru: ['Длительность встречи', 'Выступающие', 'Всего слов'],
   ja: ['会議時間', '発言者数', '総語数'],

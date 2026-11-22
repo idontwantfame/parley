@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { api } from '../api.js';
 import { useGuild } from '../GuildContext.jsx';
+import { useAuth } from '../AuthContext.jsx';
+import { ProgressText } from '../components/Live.jsx';
 import { Avatar, AvatarStack, Icon, Empty, TalkBar } from '../components/ui.jsx';
 import { fmtDateLong, fmtTime, fmtDuration, fmtClock, fmtMs, colorOf } from '../lib/format.js';
 import { useDismissable } from '../hooks/useDismissable.js';
@@ -189,7 +191,8 @@ function AskBox({ guildId, meetingId }) {
 }
 
 /* ── meeting actions (export / regenerate / merge / delete) ────────────── */
-function MeetingActions({ meeting, meetings, regenerate, regenerating, onRegenerate, hasAudio }) {
+function MeetingActions({ meeting, meetings, regenerate, regenerating, onRegenerate, hasAudio, onReload }) {
+  const { user, authEnabled } = useAuth();
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState(false); // false | 'pick' | 'busy'
@@ -231,6 +234,16 @@ function MeetingActions({ meeting, meetings, regenerate, regenerating, onRegener
               className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-ink hover:bg-surface-2 no-underline">
               <Icon.Download width={15} height={15} /> Download recording (WAV)
             </a>
+          )}
+          {hasAudio && (!authEnabled || user?.isAdmin) && (
+            <button role="menuitem" onClick={async () => {
+              setOpen(false);
+              if (!window.confirm('Delete this recording? The transcript and notes will stay.')) return;
+              try { await api.deleteMeetingAudio(meeting.id); onReload?.(); }
+              catch (error) { setErr(error.message); }
+            }} className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-error hover:bg-error-soft">
+              <Icon.Trash width={15} height={15} /> Delete recording
+            </button>
           )}
           <button role="menuitem" onClick={() => { setOpen(false); onRegenerate?.(); }}
             disabled={!regenerate?.eligible || regenerating}
@@ -303,11 +316,33 @@ function Note({ data, todos, guildId, meetings, refetchTodos, onReload }) {
   const notes = summary?.notes;
   const duration = fmtDuration(meeting.started_at, meeting.ended_at);
   const meetingTodos = todos.filter((t) => String(t.meeting_id) === String(meeting.id));
-  const isFailed = ['transcription_failed', 'summary_failed', 'processing'].includes(meeting.status);
+  const [progress, setProgress] = useState(data.progress);
+  const running = !!progress;
+  const isFailed = !running && ['transcription_failed', 'summary_failed', 'processing'].includes(meeting.status);
   const [regen, setRegen] = useState(() => ({
     busy: data.regenerate?.state === 'running', err: data.regenerate?.error ?? null,
   }));
   const [starting, setStarting] = useState(false);
+
+  useEffect(() => {
+    if (!running && meeting.status !== 'processing') return;
+    let stop = false;
+    let timer;
+    async function poll() {
+      try {
+        const current = await api.meetingProgress(meeting.id);
+        if (stop) return;
+        setProgress(current.progress);
+        if (!current.progress && current.status !== meeting.status) {
+          onReload?.();
+          return;
+        }
+      } catch { /* Retry after a temporary connection failure. */ }
+      if (!stop) timer = setTimeout(poll, 2500);
+    }
+    void poll();
+    return () => { stop = true; clearTimeout(timer); };
+  }, [running, meeting.id, meeting.status, onReload]);
 
   useEffect(() => {
     if (!regen.busy) return;
@@ -361,7 +396,7 @@ function Note({ data, todos, guildId, meetings, refetchTodos, onReload }) {
             </p>
           </div>
           <MeetingActions meeting={meeting} meetings={meetings} regenerate={data.regenerate}
-            regenerating={starting || regen.busy} onRegenerate={regenerateSummary} hasAudio={data.hasAudio} />
+            regenerating={starting || regen.busy} onRegenerate={regenerateSummary} hasAudio={data.hasAudio} onReload={onReload} />
         </div>
 
         {attendees?.length > 0 && (
@@ -372,6 +407,7 @@ function Note({ data, todos, guildId, meetings, refetchTodos, onReload }) {
       </header>
 
       {isFailed && <RetryBanner meeting={meeting} retry={retry} onDone={onReload} />}
+      {running && <p className="card p-4 mt-8 text-sm text-muted" role="status"><ProgressText progress={progress} /></p>}
 
       {regen.busy && (
         <div className="card p-4 mt-8 flex items-center gap-3" role="status">

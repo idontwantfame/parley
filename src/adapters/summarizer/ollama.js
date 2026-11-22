@@ -162,7 +162,8 @@ export class OllamaSummarizer {
   }
 
   async ask(prompt) {
-    const body = await this.chat(prompt);
+    const body = await this.chat(prompt, { options: { num_ctx: CONTEXT_TOKENS, num_predict: 1800 } });
+    if (body.done_reason === 'length') throw new Error('Ollama reached its output limit.');
     return body.message?.content ?? '';
   }
 }

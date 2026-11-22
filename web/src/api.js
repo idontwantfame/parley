@@ -41,6 +41,8 @@ export const api = {
   // Export URL for a download link/button (md or json). Not fetched via json().
   exportMeetingUrl: (id, format = 'md') => `/api/meetings/${id}/export?format=${format}`,
   meetingAudioUrl: (id) => `/api/meetings/${id}/audio`,
+  deleteMeetingAudio: (id) => fetch(`/api/meetings/${id}/audio`, { method: 'DELETE' }).then(json),
+  meetingProgress: (id) => fetch(`/api/meetings/${id}/progress`).then(json),
   todos: (g, { open, assignee } = {}) => {
     const p = new URLSearchParams();
     if (open) p.set('open', '1');

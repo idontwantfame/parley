@@ -31,6 +31,7 @@ export async function transcribeTracks(tracks, cfg = {}, deps = {}) {
     for (let i = start; i < tracks.length; i += concurrency) {
       const t = tracks[i];
       const wavPath = t.pcmPath.replace(/\.pcm$/, '.wav');
+      let failed = false;
       try {
         await convert(t.pcmPath, wavPath);
         const { text, words } = await stt(wavPath, cfg);
@@ -45,9 +46,11 @@ export async function transcribeTracks(tracks, cfg = {}, deps = {}) {
           text: clean,
         };
       } catch (err) {
+        failed = true;
         failures.push({ userId: t.userId, displayName: t.displayName, error: err.message || String(err) });
       } finally {
         await cleanup(wavPath);
+        deps.onTrackDone?.({ failed });
       }
     }
   }

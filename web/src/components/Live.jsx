@@ -60,6 +60,14 @@ export function LiveCard({ session }) {
   return <RecordingCard session={session} />;
 }
 
+export function ProgressText({ progress }) {
+  if (!progress) return 'Preparing transcription…';
+  if (progress.stage === 'summarizing') return 'Generating notes…';
+  if (progress.stage === 'journal') return 'Updating the campaign journal…';
+  const { completed, total, failed, etaSeconds } = progress;
+  return `${completed} of ${total} audio tracks processed${failed ? ` · ${failed} failed` : ''}${etaSeconds ? ` · about ${Math.max(1, Math.round(etaSeconds / 60))} min remaining` : ''}`;
+}
+
 function RecordingCard({ session }) {
   const elapsed = useElapsed(session.startedAt);
   const names = (session.attendees || []).map((a) => a.displayName);
@@ -102,7 +110,7 @@ function ProcessingCard({ session }) {
           <div className="font-display text-[26px] font-extrabold tabular-nums text-ink leading-none mt-2">
             {fmtClock(elapsed)}
           </div>
-          <p className="text-xs text-muted mt-1.5">Meeting #{session.meetingId} · Transcribing and summarizing — notes will post when done.</p>
+          <p className="text-xs text-muted mt-1.5">Meeting #{session.meetingId} · <ProgressText progress={session.progress} /></p>
         </div>
         <div className="flex flex-col items-end gap-3">
           <AvatarStack names={names} size={26} max={6} />

@@ -28,7 +28,7 @@ test('global vocabulary persists on reopen and is used by meetings from differen
     assert.equal(getVocabulary(db), 'AWP\nconnector');
     for (const guildId of ['server-one', 'server-two']) {
       const id = db.createMeeting({ guildId, channelId: 'c', channelName: 'Match', startedAt: new Date().toISOString() });
-      await processMeeting(db, id, { tracks: [], cfg: { summarizerProvider: 'none' },
+      await processMeeting(db, id, { tracks: [], cfg: { summarizerProvider: 'fake' },
         transcribe: async (_tracks, cfg) => { assert.equal(cfg.transcriptionVocabulary, 'AWP\nconnector'); return []; } });
     }
     setVocabulary(db, '');

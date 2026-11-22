@@ -24,6 +24,7 @@ import { requireAdmin } from './auth.js';
 import { readMeetingExport, meetingExportBasename, renderMeetingMarkdown } from '../delivery/meeting-export.js';
 import { campaignContextFor, catchUpJournal, JOURNAL_SECTIONS } from '../campaign/journal.js';
 import { askCampaign, recapCampaign } from '../campaign/ask.js';
+import { meetingProgress } from '../pipeline/progress.js';
 
 function audioDir(id) {
   return join(env.dataDir, 'audio', String(id));
@@ -75,7 +76,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
           if (live.length) attendees = live;
         }
       }
-      return { ...s, attendees };
+      return { ...s, attendees, progress: meetingProgress(s.meetingId) };
     });
   }
 
@@ -129,15 +130,24 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     if (!meeting) return res.status(404).json({ error: 'meeting not found' });
     const plan = retryPlan(db, id, { dataDir: env.dataDir });
     const regen = regeneratePlan(db, id);
+    const progress = meetingProgress(id);
     res.json({
       meeting,
       summary: db.getSummary(id),
       attendees: db.listAttendees(id),
       utterances: db.listUtterances(id),
-      retry: { eligible: RETRYABLE_STATUSES.has(meeting.status) && plan.ok, action: plan.action, reason: plan.reason || null },
+      retry: { eligible: !progress && RETRYABLE_STATUSES.has(meeting.status) && plan.ok, action: plan.action, reason: plan.reason || null },
+      progress,
       regenerate: { eligible: regen.ok, reason: regen.reason || null, ...regeneration.get(id) },
       hasAudio: meeting.status === 'done' && !!meeting.audio_retained && existsSync(audioDir(id)),
     });
+  });
+
+  r.get('/meetings/:id/progress', (req, res) => {
+    const id = Number(req.params.id);
+    const meeting = db.getMeeting(id);
+    if (!meeting) return res.status(404).json({ error: 'meeting not found' });
+    res.json({ progress: meetingProgress(id), status: meeting.status });
   });
 
   r.get('/meetings/:id/audio', async (req, res) => {
@@ -150,6 +160,18 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     if (!wav) return res.status(404).json({ error: 'No recording is available for this meeting.' });
     res.setHeader('Cache-Control', 'private, no-store');
     res.download(wav, `${meetingExportBasename(meeting)}.wav`);
+  });
+
+  r.delete('/meetings/:id/audio', requireAdmin, async (req, res) => {
+    const id = Number(req.params.id);
+    const meeting = db.getMeeting(id);
+    if (meeting?.status !== 'done') return res.status(404).json({ error: 'Completed meeting not found.' });
+    if (meetingProgress(id)) return res.status(409).json({ error: 'Wait for processing to finish.' });
+    if (meeting.audio_retained) {
+      await rm(audioDir(id), { recursive: true, force: true });
+      db.setAudioRetained(id, false);
+    }
+    res.json({ ok: true });
   });
 
   // Shared snapshot and renderer for downloads and automatic local archives.
@@ -173,6 +195,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
   // is attached. Returns the new status so the UI can refresh.
   r.post('/meetings/:id/retry', async (req, res) => {
     const id = Number(req.params.id);
+    if (meetingProgress(id)) return res.status(409).json({ error: 'This meeting is already being processed.' });
     const meeting = db.getMeeting(id);
     if (!meeting) return res.status(404).json({ error: 'meeting not found' });
     const c = liveClient();

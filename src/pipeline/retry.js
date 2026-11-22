@@ -21,6 +21,7 @@ import { parsePcmName } from '../voice/audio.js';
 import { processMeeting } from './orchestrator.js';
 import { autoExportMeeting } from '../delivery/meeting-export.js';
 import { campaignContextFor, foldMeetingIntoJournal } from '../campaign/journal.js';
+import { withMeetingProgress } from './progress.js';
 
 // Statuses the UI should offer a retry for.
 export const RETRYABLE_STATUSES = new Set(['transcription_failed', 'summary_failed', 'processing', 'recording']);
@@ -117,7 +118,7 @@ export async function retryMeeting(db, meetingId, { dataDir, deliver = null } = 
   const meeting = plan.meeting;
   const cfg = getGuildConfig(db, meeting.guild_id);
 
-  if (plan.action === 'resummarize') {
+  if (plan.action === 'resummarize') return withMeetingProgress(meetingId, null, async (progress) => {
     db.setMeetingStatus(meetingId, 'processing');
     let result;
     try {
@@ -142,10 +143,11 @@ export async function retryMeeting(db, meetingId, { dataDir, deliver = null } = 
     const exportResult = await autoExportMeeting(db, meetingId);
     if (deliver) await deliver(notes, talktime, meta).catch(() => {});
     // A session that failed earlier never reached its campaign journal.
+    if (meeting.campaign_id) progress.stage = 'journal';
     await foldMeetingIntoJournal(db, meetingId, { cfg })
       .catch((err) => console.error(`[retry] meeting ${meetingId}: campaign journal update failed: ${err.message}`));
     return { ok: true, action: 'resummarize', status: 'done', ...exportResult };
-  }
+  });
 
   // retranscribe: rebuild tracks from the PCM filenames and run the full pipeline.
   const audioDir = join(dataDir, 'audio', String(meetingId));

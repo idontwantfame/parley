@@ -47,6 +47,7 @@ export const config = {
   discordToken: process.env.DISCORD_TOKEN,
   discordClientId: process.env.DISCORD_CLIENT_ID,
   recordingNickname: resolveRecordingNickname(),
+  notesBaseUrl: process.env.WEB_PUBLIC_URL?.trim(),
   sttUrl: process.env.STT_URL || 'http://127.0.0.1:8000',
   gemini: { apiKey: process.env.GEMINI_API_KEY },
   openai: { apiKey: process.env.OPENAI_API_KEY, baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1' },

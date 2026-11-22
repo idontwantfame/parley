@@ -7,6 +7,7 @@
 //   3. transcript passages matching the question's keywords (full-text search),
 //      with a little surrounding conversation for each hit.
 import { getSummarizer } from '../adapters/summarizer/index.js';
+import { resolveSummaryLanguage, summaryLanguageInstruction } from '../adapters/summarizer/languages.js';
 import { getGuildConfig } from '../store/config.js';
 import { formatMs } from '../pipeline/summarize.js';
 
@@ -159,36 +160,38 @@ function setup(db, campaignId, { cfg, summarizer, env }) {
   const s = summarizer || getSummarizer(c, env);
   if (typeof s.ask !== 'function') throw new Error(`Provider ${c.summarizerProvider} does not support Q&A`);
   const sessions = db.listCampaignSessions(campaignId);
-  return { campaign, summarizer: s, sessions };
+  return { campaign, summarizer: s, sessions, language: resolveSummaryLanguage(c) };
 }
 
 export async function askCampaign(db, campaignId, question, opts = {}) {
-  const { campaign, summarizer, sessions } = setup(db, campaignId, opts);
+  const { campaign, summarizer, sessions, language } = setup(db, campaignId, opts);
   const prompt = buildCampaignAskPrompt({
     campaignName: campaign.name,
-    question,
-    journal: campaign.journal,
-    notes: sessionNotesBlock(sessions),
-    excerpts: transcriptExcerpts(db, campaignId, question, sessions),
+    question: question.slice(0, 1500),
+    journal: campaign.journal?.slice(0, 4000),
+    notes: sessionNotesBlock(sessions, 5000).slice(-5000),
+    excerpts: transcriptExcerpts(db, campaignId, question, sessions, 4000),
   });
-  return summarizer.ask(prompt);
+  return summarizer.ask(prompt + summaryLanguageInstruction(language).replace('summary', 'answer'));
 }
 
 export async function recapCampaign(db, campaignId, { sessions: count = 1, ...opts } = {}) {
-  const { campaign, summarizer, sessions } = setup(db, campaignId, opts);
+  const { campaign, summarizer, sessions, language } = setup(db, campaignId, opts);
   const done = sessions.filter((s) => s.notes);
   if (!done.length) throw new Error('This campaign has no summarized sessions yet.');
   const n = Math.max(1, Math.min(5, Number(count) || 1));
   const recent = done.slice(-n);
   const last = recent[recent.length - 1];
-  const tail = db.listUtterances(last.id).slice(-60).map((u) => `${u.display_name}: ${u.text}`).join('\n').slice(-6000);
-  return summarizer.ask(buildRecapPrompt({
+  const tail = db.listUtterances(last.id).slice(-60).map((u) => `${u.display_name}: ${u.text}`).join('\n').slice(-3500);
+  const budget = Math.floor(6500 / recent.length);
+  const prompt = buildRecapPrompt({
     campaignName: campaign.name,
-    journal: campaign.journal,
-    notes: recent.map((s) => notesBlock(s, true)).join('\n\n'),
+    journal: campaign.journal?.slice(0, 4000),
+    notes: recent.map((s) => notesBlock(s, true).slice(0, budget)).join('\n\n'),
     lastTranscriptTail: tail,
     sessionCount: recent.length,
-  }));
+  });
+  return summarizer.ask(prompt + summaryLanguageInstruction(language).replace('summary', 'recap'));
 }
 
 /**

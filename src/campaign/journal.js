@@ -23,10 +23,10 @@ export const JOURNAL_SECTIONS = [
 export const EMPTY_JOURNAL = JOURNAL_SECTIONS.map((s) => `## ${s}\n- (nothing yet)`).join('\n\n');
 
 export function buildJournalUpdatePrompt({
-  campaignName, journal, transcript, sessionNumber, date, attendees = [], tldr, summaryLanguage,
+  campaignName, journal, transcript, sessionNumber, date, attendees = [], tldr, summaryLanguage, sessionNotesOnly = false,
 }) {
   const sections = JOURNAL_SECTIONS.map((s) => `## ${s}`).join('\n');
-  return `You keep the campaign journal for a tabletop role-playing campaign called "${campaignName}". Below are the CURRENT JOURNAL and the TRANSCRIPT of session ${sessionNumber}${date ? ` (${date.slice(0, 10)})` : ''}.
+  return `You keep the campaign journal for a tabletop role-playing campaign called "${campaignName}". Below are the CURRENT JOURNAL and the ${sessionNotesOnly ? 'STRUCTURED NOTES' : 'TRANSCRIPT'} of session ${sessionNumber}${date ? ` (${date.slice(0, 10)})` : ''}.
 
 Speakers are labelled with the players' Discord names. One of them is usually the Game Master, who narrates the world and voices the NPCs. Players: ${attendees.join(', ') || 'unknown'}.
 
@@ -40,6 +40,7 @@ Rules:
 - Mark finished quests "(completed, session N)" and dead characters "(deceased, session N)" instead of deleting them.
 - Out-of-character table talk (rules lookups, snacks, scheduling, jokes) does not belong in the journal.
 - Speech-to-text garbles fantasy names. When a name in the transcript is clearly an entity already in the journal, use the journal's spelling.
+- Preserve uncertainty. Keep disputed or unclear details under Open Mysteries and leave an attribution unknown when several people share one microphone. Never promote a guess from the session notes to a confirmed fact.
 - Do not add a session-by-session log; that is kept separately.
 - Output only the journal Markdown: no preamble, no closing remarks, no code fences.${summaryLanguageInstruction(summaryLanguage).replace('summary', 'journal')}
 ${tldr ? `\nThis session's summary, for orientation: ${tldr}\n` : ''}
@@ -47,9 +48,9 @@ ${tldr ? `\nThis session's summary, for orientation: ${tldr}\n` : ''}
 ${journal?.trim() || EMPTY_JOURNAL}
 </current_journal>
 
-<session_transcript>
+<session_material>
 ${transcript}
-</session_transcript>`;
+</session_material>`;
 }
 
 // Models sometimes wrap the document in a fence or add a sentence before it.
@@ -90,7 +91,7 @@ export function withCampaignLock(campaignId, fn) {
 export function campaignContextFor(db, meeting) {
   if (!meeting?.campaign_id) return undefined;
   const journal = db.getCampaign(meeting.campaign_id)?.journal?.trim();
-  return journal || undefined;
+  return journal?.slice(0, 3500) || undefined;
 }
 
 function toPipelineUtterances(rows) {
@@ -99,22 +100,36 @@ function toPipelineUtterances(rows) {
   }));
 }
 
+function boundedSessionMaterial(utterances, notes) {
+  const transcript = buildTranscript(toPipelineUtterances(utterances));
+  if (transcript.length <= 6500) return { transcript };
+  const topics = notes?.topics ?? [];
+  if (!topics.length) throw new Error('This long session needs structured notes before it can be added to the journal.');
+  const maxPerTopic = Math.max(1, Math.floor(5600 / topics.length));
+  return {
+    sessionNotesOnly: true,
+    transcript: topics.map(({ title, points }) => `- ${title}: ${(points ?? []).join(' ')}`.slice(0, maxPerTopic)).join('\n'),
+  };
+}
+
 // Fold one finished session into its campaign's journal. A no-op (returns
 // { skipped }) for meetings outside a campaign or already folded in.
-async function foldUnlocked(db, meetingId, { cfg, summarizer }) {
+async function foldUnlocked(db, meetingId, { cfg, summarizer, draft }) {
   const meeting = db.getMeeting(meetingId);
   if (!meeting?.campaign_id) return { skipped: 'not in a campaign' };
-  if (meeting.journaled_at) return { skipped: 'already in the journal' };
+  if (!draft && meeting.journaled_at) return { skipped: 'already in the journal' };
   const campaign = db.getCampaign(meeting.campaign_id);
   if (!campaign) return { skipped: 'campaign not found' };
   const utterances = db.listUtterances(meetingId);
   if (utterances.length === 0) return { skipped: 'no transcript' };
 
   const session = db.listCampaignSessions(campaign.id).find((s) => s.id === meeting.id);
+  const previous = draft ? draft.journal : campaign.journal;
+  if (previous?.length > 8500) throw new Error('The journal is too long for an automatic update. Shorten it in Campaigns and retry.');
   const prompt = buildJournalUpdatePrompt({
     campaignName: campaign.name,
-    journal: campaign.journal,
-    transcript: buildTranscript(toPipelineUtterances(utterances)),
+    journal: previous,
+    ...boundedSessionMaterial(utterances, session?.notes),
     sessionNumber: session?.number ?? '?',
     date: meeting.started_at,
     attendees: db.listAttendees(meetingId).map((a) => a.display_name),
@@ -122,9 +137,17 @@ async function foldUnlocked(db, meetingId, { cfg, summarizer }) {
     summaryLanguage: resolveSummaryLanguage(cfg),
   });
   const next = cleanJournal(await summarizer.ask(prompt));
-  checkJournalUpdate(campaign.journal, next);
-  db.setCampaignJournal(campaign.id, next);
-  db.markJournaled(meetingId);
+  checkJournalUpdate(previous, next);
+  if (db.getCampaign(campaign.id)?.journal !== campaign.journal || db.getMeeting(meetingId)?.campaign_id !== campaign.id) {
+    throw new Error('The journal or session changed during the update. Run Update journal again.');
+  }
+  if (draft) {
+    draft.journal = next;
+    draft.meetingIds.push(meetingId);
+  } else {
+    db.setCampaignJournal(campaign.id, next);
+    db.markJournaled(meetingId);
+  }
   return { updated: true, campaignId: campaign.id };
 }
 
@@ -149,16 +172,25 @@ export function catchUpJournal(db, campaignId, { rebuild = false, cfg, summarize
   db.setJournalStatus(campaignId, 'updating');
   return withCampaignLock(campaignId, async () => {
     try {
-      if (rebuild) {
-        db.setCampaignJournal(campaignId, null);
-        db.clearJournaled(campaignId);
-      }
+      const draft = rebuild ? { journal: null, meetingIds: [] } : null;
       let folded = 0;
       const pending = db.listCampaignSessions(campaignId)
-        .filter((m) => m.status === 'done' && !m.journaled_at);
+        .filter((m) => m.status === 'done' && (rebuild || !m.journaled_at));
       for (const m of pending) {
-        const r = await foldUnlocked(db, m.id, { cfg: c, summarizer: s });
+        const r = await foldUnlocked(db, m.id, { cfg: c, summarizer: s, draft });
         if (r.updated) folded++;
+      }
+      if (draft?.meetingIds.length) {
+        db.sql.exec('BEGIN');
+        try {
+          db.setCampaignJournal(campaignId, draft.journal);
+          db.clearJournaled(campaignId);
+          for (const id of draft.meetingIds) db.markJournaled(id);
+          db.sql.exec('COMMIT');
+        } catch (error) {
+          db.sql.exec('ROLLBACK');
+          throw error;
+        }
       }
       db.setJournalStatus(campaignId, 'idle');
       return { folded };

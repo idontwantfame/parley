@@ -51,8 +51,8 @@ test('Discord delivery passes the recorded end time to the rendered messages', a
     meeting: { channel_id: 'voice', channel_name: 'Crew', started_at: '2026-10-01T10:00:00Z', ended_at: '2026-10-01T10:45:00Z' },
     cfg: { summaryLanguage: 'nl' }, notes, talktime,
   });
-  assert.match(sent.join('\n'), /\*\*Vergaderduur:\*\* 45 min/);
-  assert.ok(sent.every((part) => part.length <= 1900));
+  assert.match(sent.map((part) => part.content).join('\n'), /\*\*Vergaderduur:\*\* 45 min/);
+  assert.ok(sent.every((part) => part.content.length <= 1900 && part.allowedMentions.parse.length === 0));
 });
 
 test('groupActionItems groups by assignee with Unassigned bucket', () => {
@@ -95,6 +95,7 @@ test('every supported summary language has localized Discord labels and continua
     it: ['Verbale della riunione', 'Argomenti', 'Azioni da svolgere', 'Non assegnato', 'continuazione'],
     pt: ['Ata da reunião', 'Tópicos', 'Ações pendentes', 'Não atribuído', 'continuação'],
     nl: ['Notulen', 'Onderwerpen', 'Actiepunten', 'Niet toegewezen', 'vervolg'],
+    pl: ['Notatki z sesji', 'Tematy', 'Zadania', 'Bez przypisania', 'ciąg dalszy'],
     ru: ['Протокол встречи', 'Темы', 'Задачи', 'Не назначено', 'продолжение'],
     ja: ['会議メモ', '議題', 'アクション項目', '担当者未定', '続き'],
     zh: ['会议纪要', '议题', '待办事项', '未分配', '续'],

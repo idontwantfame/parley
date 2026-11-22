@@ -6,10 +6,20 @@ import { resolveSummaryLanguage } from '../adapters/summarizer/languages.js';
 import { autoExportMeeting } from '../delivery/meeting-export.js';
 import { getVocabulary } from '../store/vocabulary.js';
 import { campaignContextFor, foldMeetingIntoJournal } from '../campaign/journal.js';
+import { withMeetingProgress } from './progress.js';
 
-export async function processMeeting(db, meetingId, opts) {
+export function processMeeting(db, meetingId, opts) {
+  return withMeetingProgress(meetingId, opts.tracks.length, (progress) => runMeeting(db, meetingId, opts, progress));
+}
+
+async function runMeeting(db, meetingId, opts, progress) {
   const meeting = db.getMeeting(meetingId);
-  const transcribe = opts.transcribe || ((tracks, cfg) => transcribeTracks(tracks, cfg));
+  const transcribe = opts.transcribe || ((tracks, cfg) => transcribeTracks(tracks, cfg, {
+    onTrackDone: ({ failed }) => {
+      progress.completed++;
+      if (failed) progress.failed++;
+    },
+  }));
   const summarizer = opts.summarizer || getSummarizer(opts.cfg);
 
   db.setMeetingStatus(meetingId, 'processing');
@@ -81,6 +91,7 @@ export async function processMeeting(db, meetingId, opts) {
   };
 
   let notes;
+  progress.stage = 'summarizing';
   const summarizeStart = Date.now();
   try {
     notes = await summarizer.summarize(transcript, meta);
@@ -135,6 +146,7 @@ export async function processMeeting(db, meetingId, opts) {
   // retried from the Campaigns page ("Update journal").
   let journal = null;
   if (meeting.campaign_id) {
+    progress.stage = 'journal';
     try {
       journal = await foldMeetingIntoJournal(db, meetingId, { cfg: opts.cfg, summarizer });
     } catch (err) {

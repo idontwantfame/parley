@@ -324,6 +324,10 @@ Use **Settings → Transcription vocabulary** to import a UTF-8 text or Markdown
 
 Enable **Settings → Behavior → Keep recordings** for future meetings. Find the WAV download in a completed meeting’s action menu. Recordings expire after 30 days by default. Set `AUDIO_RETENTION_DAYS` to configure that period.
 
+**Live** shows processed audio tracks, an estimate when there is enough data, and the current summarization stage. The meeting action menu can also delete a retained WAV and its source tracks while keeping the transcript and notes.
+
+Discord delivery uses the summary language for its headings. Set **`WEB_PUBLIC_URL`** to a dashboard URL reachable by recipients to post a recap with a link to the full meeting.
+
 Edit speaker labels in **Settings → Speaker display names**. Overrides apply by Discord user ID to transcripts and new summaries. Use **Regenerate summary** in a completed meeting’s action menu to apply new names or prompt/model settings to existing notes. The background job uses the saved transcript, and regenerated notes stay in Parley.
 
 ## 🎛️ Configuration
