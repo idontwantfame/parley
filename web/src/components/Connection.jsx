@@ -50,14 +50,12 @@ function SecretField({ label, hint, present, value, onChange, placeholder }) {
 }
 
 /**
- * Editable Discord token + client id + STT url. `conn` is the system status
+ * Editable Discord token and client ID. `conn` is the system status
  * `connection` object. Calls onSaved(result) after a successful save.
- * `compact` drops the in-card heading (Settings supplies its own).
  */
 export function ConnectionForm({ conn, onSaved, submitLabel = 'Save & connect' }) {
   const [token, setToken] = useState('');
   const [clientId, setClientId] = useState(conn?.discordClientId?.value || '');
-  const [sttUrl, setSttUrl] = useState(conn?.sttUrl?.value || '');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
 
@@ -69,7 +67,6 @@ export function ConnectionForm({ conn, onSaved, submitLabel = 'Save & connect' }
     const patch = {};
     if (token.trim()) patch.discordToken = token.trim();
     if (clientId.trim() !== (conn?.discordClientId?.value || '')) patch.discordClientId = clientId.trim();
-    if (sttUrl.trim() !== (conn?.sttUrl?.value || '')) patch.sttUrl = sttUrl.trim();
     if (Object.keys(patch).length === 0) { setErr('Nothing changed.'); setBusy(false); return; }
     try {
       const r = await api.setConnection(patch);
@@ -95,10 +92,6 @@ export function ConnectionForm({ conn, onSaved, submitLabel = 'Save & connect' }
       <Labeled label="Application (client) ID" hint="Developer Portal → your app → General Information → Application ID.">
         <input className="input" value={clientId} onChange={(e) => setClientId(e.target.value)}
           placeholder="e.g. 1362914118918602893" inputMode="numeric" autoComplete="off" />
-      </Labeled>
-      <Labeled label="STT sidecar URL" hint="Where the local faster-whisper sidecar listens. In Docker this is set for you.">
-        <input className="input" value={sttUrl} onChange={(e) => setSttUrl(e.target.value)}
-          placeholder="http://127.0.0.1:8000" autoComplete="off" />
       </Labeled>
       {err && <p className="text-sm text-error">{err}</p>}
       <button type="submit" disabled={busy} className="btn btn-primary !py-2.5 w-full justify-center">

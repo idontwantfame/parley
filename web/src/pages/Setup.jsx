@@ -367,6 +367,7 @@ function ConnectionCard({ sys, onChanged }) {
 }
 
 export default function Setup() {
+  const { user, authEnabled } = useAuth();
   const { guildId } = useGuild();
   const { status: sys, refresh: refreshSys } = useSystem();
   const [data, setData] = useState(null);
@@ -384,11 +385,17 @@ export default function Setup() {
   // One catalog per model field: the primary provider's and the fallback's.
   const models = useCatalog(data?.config?.summarizerProvider);
   const fbModels = useCatalog(data?.config?.summarizerFallbackProvider);
+  const sidecarUrlSetting = (!authEnabled || user?.isAdmin) && (
+    <ServiceUrlSetting setting="sttUrl" label="Whisper sidecar URL" onSaved={refreshSys}
+      url={sys?.connection?.sttUrl?.value} placeholder="http://sidecar:8000"
+      hint="Use an address reachable from Parley. An empty value restores http://127.0.0.1:8000." />
+  );
 
   if (!guildId) return (
     <Page max="720px">
       <PageHead title="Settings" subtitle="Discord connection and per-server configuration." />
       <ConnectionCard sys={sys} onChanged={refreshSys} />
+      {sidecarUrlSetting && <div className="mt-5"><Card title="Transcription">{sidecarUrlSetting}</Card></div>}
       <div className="mt-5"><Empty icon={Icon.Settings} title="No server selected" body="Pick a server from the top bar to configure summarizer, transcription, and delivery." /></div>
     </Page>
   );
@@ -470,11 +477,13 @@ export default function Setup() {
         <ConnectionCard sys={sys} onChanged={refreshSys} />
         <VocabularyUpload />
         <Card title="Summarizer" desc="Which AI turns transcripts into structured notes.">
-          <OllamaConnection url={sys?.connection?.ollamaUrl?.value} onSaved={async () => {
-            await refreshSys?.();
-            if (c.summarizerProvider === 'ollama') models.reload();
-            if (c.summarizerFallbackProvider === 'ollama') fbModels.reload();
-          }} />
+          <ServiceUrlSetting setting="ollamaUrl" label="Ollama URL" url={sys?.connection?.ollamaUrl?.value}
+            placeholder="http://ollama:11434" hint="Use a URL reachable from Parley. An empty value restores http://127.0.0.1:11434."
+            onSaved={async () => {
+              await refreshSys?.();
+              if (c.summarizerProvider === 'ollama') models.reload();
+              if (c.summarizerFallbackProvider === 'ollama') fbModels.reload();
+            }} />
           <Field label="Provider" hint={sumDraft ? 'Add the API key below to switch to this provider.' : undefined}>
             <div className="relative">
               <select className={sel} value={sumProvider}
@@ -562,6 +571,7 @@ export default function Setup() {
                   <Chevron />
                 </div>
               </Field>
+              {sidecarUrlSetting}
               <SidecarControl sys={sys} onChanged={refreshSys} />
             </>
           ) : (
@@ -680,7 +690,7 @@ function AutoJoinChannels({ channels = [], selected = null, save }) {
   );
 }
 
-function OllamaConnection({ url, onSaved }) {
+function ServiceUrlSetting({ setting, label, url, placeholder, hint, onSaved }) {
   const { user, authEnabled } = useAuth();
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState(null);
@@ -688,12 +698,12 @@ function OllamaConnection({ url, onSaved }) {
 
   async function save(event) {
     event.preventDefault();
-    const { value } = event.currentTarget.elements.ollamaUrl;
+    const { value } = event.currentTarget.elements.serviceUrl;
     setSaving(true);
     try {
-      await api.setConnection({ ollamaUrl: value });
-      setMessage({ text: 'Ollama URL saved.' });
-      await onSaved();
+      await api.setConnection({ [setting]: value });
+      setMessage({ text: `${label} saved.` });
+      await onSaved?.();
     } catch (error) {
       setMessage({ text: error.message, error: true });
     } finally {
@@ -702,10 +712,10 @@ function OllamaConnection({ url, onSaved }) {
   }
 
   return (
-    <Field label="Ollama URL" hint="Use a URL reachable from Parley. An empty value restores http://127.0.0.1:11434.">
+    <Field label={label} hint={hint}>
       <form className="flex flex-wrap items-center gap-2" onSubmit={save}>
-        <input key={url} className="input min-w-0 flex-1" name="ollamaUrl" aria-label="Ollama URL"
-          type="url" defaultValue={url} placeholder="http://ollama:11434" />
+        <input key={url} className="input min-w-0 flex-1" name="serviceUrl" aria-label={label}
+          type="url" autoComplete="off" defaultValue={url} placeholder={placeholder} />
         <button type="submit" className="btn btn-primary" disabled={saving}>Save URL</button>
       </form>
       {message && <p role={message.error ? 'alert' : 'status'} className={message.error ? 'text-xs text-error' : 'text-xs text-muted'}>{message.text}</p>}
