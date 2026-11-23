@@ -64,3 +64,61 @@ test('transcribeFile surfaces a timeout abort error after retries', async () => 
     /timed out/
   );
 });
+
+test('transcribeFile does NOT retry after a timeout (the sidecar may still be working on it)', async () => {
+  let calls = 0;
+  const fetchImpl = async () => { calls++; throw new DOMException('The operation was aborted due to timeout', 'TimeoutError'); };
+  await assert.rejects(
+    transcribeFile('/tmp/a.wav', {}, { baseUrl: 'http://x', fetchImpl, readFile: fakeRead, retries: 3, backoffMs: 0, timeoutMs: 1000 }),
+    /timed out after 1s/,
+  );
+  assert.equal(calls, 1, 'a timed-out upload must not be re-sent');
+});
+
+test('transcribeFile reports the sidecar error detail and drains the response body', async () => {
+  let drained = 0;
+  const fetchImpl = async () => ({
+    ok: false, status: 400,
+    text: async () => { drained++; return '{"detail":"Unsupported model: huge"}'; },
+  });
+  await assert.rejects(
+    transcribeFile('/tmp/a.wav', {}, { baseUrl: 'http://x', fetchImpl, readFile: fakeRead, retries: 1, backoffMs: 0 }),
+    /STT sidecar HTTP 400: \{"detail":"Unsupported model: huge"\}/,
+  );
+  assert.equal(drained, 1);
+});
+
+test('transcribeFile streams a real file to a slow sidecar and gives up once at the timeout', async () => {
+  const { createServer } = await import('node:http');
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'parley-stt-'));
+  const path = join(dir, 'a.wav');
+  writeFileSync(path, Buffer.alloc(5000, 1));
+  let requests = 0;
+  const timers = [];
+  const server = createServer((req, res) => {
+    requests++;
+    let bytes = 0;
+    req.on('data', (c) => { bytes += c.length; });
+    req.on('end', () => {
+      const delay = req.url.includes('slow') ? 2500 : 0;
+      timers.push(setTimeout(() => res.end(JSON.stringify({ text: `got ${bytes}`, words: [] })), delay));
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const ok = await transcribeFile(path, {}, { baseUrl: base, backoffMs: 0 });
+    assert.match(ok.text, /^got \d{4,}$/);
+    requests = 0;
+    await assert.rejects(transcribeFile(path, {}, { baseUrl: `${base}/slow`, retries: 2, backoffMs: 0, timeoutMs: 300 }), /timed out/);
+    assert.equal(requests, 1);
+  } finally {
+    timers.forEach(clearTimeout);
+    server.closeAllConnections();
+    await new Promise((r) => server.close(r));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

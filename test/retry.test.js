@@ -9,7 +9,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDb } from '../src/store/db.js';
-import { retryPlan, retryMeeting, RETRYABLE_STATUSES } from '../src/pipeline/retry.js';
+import { retryPlan, retryMeeting, retryEligible, RETRYABLE_STATUSES } from '../src/pipeline/retry.js';
 import { apiRouter } from '../src/web/api.js';
 
 function tmp() {
@@ -126,7 +126,7 @@ async function listen(app) {
   return { base: `http://127.0.0.1:${port}`, close: () => server.close() };
 }
 
-test('POST /api/meetings/:id/retry re-summarizes and returns done', async () => {
+test('POST /api/meetings/:id/retry re-summarizes in the background (202) and ends done', async () => {
   const db = openDb(':memory:');
   const id = db.createMeeting({ guildId: 'g1', channelId: 'c', channelName: 'gen', startedAt: 'now' });
   db.addUtterance({ meetingId: id, userId: 'u', displayName: 'Al', startMs: 0, endMs: 5, text: 'ship on friday' });
@@ -144,11 +144,16 @@ test('POST /api/meetings/:id/retry re-summarizes and returns done', async () => 
     assert.equal(bundle.retry.action, 'resummarize');
 
     const r = await fetch(`${base}/api/meetings/${id}/retry`, { method: 'POST' });
-    assert.equal(r.status, 200);
-    const body = await r.json();
-    assert.equal(body.ok, true);
-    assert.equal(body.status, 'done');
-    assert.equal(body.meeting.status, 'done');
+    assert.equal(r.status, 202);
+    assert.deepEqual(await r.json(), { ok: true, started: true });
+    let polled;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      polled = await (await fetch(`${base}/api/meetings/${id}/progress`)).json();
+      if (!polled.progress && polled.status === 'done') break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(polled.status, 'done');
+    assert.equal(db.getMeeting(id).status, 'done');
   } finally { close(); }
 });
 
@@ -171,4 +176,39 @@ test('RETRYABLE_STATUSES covers the failure states', () => {
   assert.ok(RETRYABLE_STATUSES.has('transcription_failed'));
   assert.ok(RETRYABLE_STATUSES.has('summary_failed'));
   assert.ok(!RETRYABLE_STATUSES.has('done'));
+});
+
+test('RETRYABLE_STATUSES never offers a retry for a live recording', () => {
+  // Retrying a 'recording' meeting retranscribed partial PCM, marked it done
+  // and deleted the audio directory the capture was still writing to.
+  assert.ok(!RETRYABLE_STATUSES.has('recording'));
+  assert.ok(RETRYABLE_STATUSES.has('processing'));
+});
+
+test('retryEligible allows re-transcribing a done meeting whose transcript is known to be partial', () => {
+  const { dir, cleanup } = tmp();
+  try {
+    const db = openDb(':memory:');
+    const id = db.createMeeting({ guildId: 'g1', channelId: 'c', channelName: 'gen', startedAt: 'now' });
+    db.addUtterance({ meetingId: id, userId: 'u', displayName: 'Al', startMs: 0, endMs: 5, text: 'partial' });
+    db.setMeetingStatus(id, 'done');
+    const audioDir = join(dir, 'audio', String(id));
+    mkdirSync(audioDir, { recursive: true });
+    writeFileSync(join(audioDir, 'u_0.pcm'), 'x');
+    const eligible = () => retryEligible(db.getMeeting(id), retryPlan(db, id, { dataDir: dir }));
+
+    db.setTranscriptionComplete(id, false);
+    assert.equal(eligible(), true);
+    db.setTranscriptionComplete(id, true);
+    assert.equal(eligible(), false); // complete transcript: regenerate, don't retry
+    db.setTranscriptionComplete(id, null);
+    assert.equal(eligible(), false); // unknown (legacy): not offered on a finished meeting
+    db.setTranscriptionComplete(id, false);
+    rmSync(audioDir, { recursive: true, force: true });
+    assert.equal(eligible(), false); // nothing left to re-transcribe
+    db.setMeetingStatus(id, 'summary_failed');
+    assert.equal(eligible(), true);
+    db.setMeetingStatus(id, 'recording');
+    assert.equal(eligible(), false);
+  } finally { cleanup(); }
 });

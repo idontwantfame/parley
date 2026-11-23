@@ -14,18 +14,47 @@ export function providerKeyPresent(provider, env) {
   return { ok: false, missing: null };
 }
 
-export function validateSetup(input, env) {
-  const patch = {};
+// Model ids are free text backed by each provider's live catalog, so only their
+// shape is checked: one token of printable characters (e.g. "llama3.1:8b",
+// "anthropic/claude-sonnet-4").
+const MODEL_ID_MAX = 200;
+const MODEL_ID = /^\S+$/;
 
-  if (input.provider !== undefined) {
-    if (!SUPPORTED_PROVIDERS.includes(input.provider)) {
-      return { ok: false, error: `Unknown provider "${input.provider}". Use one of: ${SUPPORTED_PROVIDERS.join(', ')}.` };
-    }
-    const key = providerKeyPresent(input.provider, env);
-    if (!key.ok) return { ok: false, error: `Cannot use ${input.provider}: ${key.missing} is not set in .env.` };
-    patch.summarizerProvider = input.provider;
-    if (input.model) patch.summarizerModel = input.model;
+function invalidModel(model) {
+  if (typeof model !== 'string' || !MODEL_ID.test(model) || model.length > MODEL_ID_MAX) {
+    return { ok: false, error: `Model must be a model id (no spaces, at most ${MODEL_ID_MAX} characters).` };
   }
+  return null;
+}
+
+// Primary summarizer provider/model. A provider switch without a model takes
+// that provider's default rather than keeping the old provider's model id
+// (which it can't serve); a model alone applies to the current provider.
+function summarizerPatch(input, env, current) {
+  const model = typeof input.model === 'string' ? input.model.trim() : input.model;
+  if (input.provider === undefined) {
+    if (model === undefined || model === null) return { patch: {} };
+    return invalidModel(model) || { patch: { summarizerModel: model } };
+  }
+  if (!SUPPORTED_PROVIDERS.includes(input.provider)) {
+    return { ok: false, error: `Unknown provider "${input.provider}". Use one of: ${SUPPORTED_PROVIDERS.join(', ')}.` };
+  }
+  const key = providerKeyPresent(input.provider, env);
+  if (!key.ok) return { ok: false, error: `Cannot use ${input.provider}: ${key.missing} is not set in .env.` };
+  if (model) return invalidModel(model) || { patch: { summarizerProvider: input.provider, summarizerModel: model } };
+  if (current?.summarizerProvider === input.provider) return { patch: { summarizerProvider: input.provider } };
+  return { patch: { summarizerProvider: input.provider, summarizerModel: DEFAULT_MODELS[input.provider] || null } };
+}
+
+/**
+ * Validate a /setup (or dashboard) change. `current` is the guild's STORED
+ * config — used to keep provider/model coherent and to validate a bare STT
+ * model against the provider actually configured (never a client-sent value).
+ */
+export function validateSetup(input, env, current = null) {
+  const summarizer = summarizerPatch(input, env, current);
+  if (!summarizer.patch) return summarizer;
+  const patch = { ...summarizer.patch };
 
   // Optional second summarizer, tried only when the primary throws. 'none' (or
   // an empty value) clears it and restores single-provider behaviour.
@@ -73,8 +102,8 @@ export function validateSetup(input, env) {
       patch.sttModel = input.sttModel;
     }
   } else if (input.sttModel !== undefined && input.sttModel !== null) {
-    // Model changed without naming a provider: validate against the current one.
-    const provider = env.sttProvider || (typeof input.currentSttProvider === 'string' ? input.currentSttProvider : 'sidecar');
+    // Model changed without naming a provider: validate against the stored one.
+    const provider = current?.sttProvider || 'sidecar';
     if (provider !== 'sidecar' && !STT_MODELS[provider]?.includes(input.sttModel)) {
       return { ok: false, error: `Invalid ${provider} model. Use one of: ${(STT_MODELS[provider] || []).join(', ')}.` };
     }
@@ -136,6 +165,21 @@ export function validateSetup(input, env) {
 }
 
 export { WHISPER_MODELS };
+
+// Discord rejects messages over 2000 characters; prompts alone can be 20k.
+const DISCORD_MESSAGE_LIMIT = 2000;
+const PROMPT_FIELDS = new Set(['summaryPrompt', 'overviewPrompt']);
+
+/** The /setup confirmation: the merged config with long prompts summarized. */
+export function formatConfigReply(config) {
+  const shown = Object.fromEntries(Object.entries(config).map(([key, value]) => {
+    if (!PROMPT_FIELDS.has(key)) return [key, value];
+    return [key, typeof value === 'string' ? `custom (${value.length} chars)` : 'default'];
+  }));
+  const text = `✅ Config updated:\n\`\`\`json\n${JSON.stringify(shown, null, 2)}\n\`\`\``;
+  if (text.length <= DISCORD_MESSAGE_LIMIT) return text;
+  return "✅ Config updated. The full settings are too long to show here — see the dashboard's Setup page.";
+}
 
 export function availableProviders(env) {
   return SUPPORTED_PROVIDERS.map((provider) => ({ provider, ...providerKeyPresent(provider, env) }));

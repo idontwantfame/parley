@@ -1,11 +1,13 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api.js';
 import { Page, PageHead, SectionHead } from '../components/Page.jsx';
 import { Icon, Empty } from '../components/ui.jsx';
 import Markdown from '../components/Markdown.jsx';
 import { fmtDateShort, fmtRelative } from '../lib/format.js';
-import { useIsAdmin } from './Campaigns.jsx';
+import { useIsAdmin } from '../AuthContext.jsx';
+
+const JOURNAL_POLL_MS = 3000;
 
 const ASK_SUGGESTIONS = [
   'Who are the important NPCs so far?',
@@ -104,6 +106,10 @@ function Recap({ campaignId, sessionCount }) {
 function Journal({ campaign, pending, sessionCount, isAdmin, onChange }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
+  // The journal version the draft started from. The server refuses the save
+  // (409) if a session was folded in meanwhile, instead of silently
+  // overwriting it with this stale draft; the draft stays open to copy.
+  const [base, setBase] = useState(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const updating = campaign.journal_status === 'updating';
@@ -114,7 +120,16 @@ function Journal({ campaign, pending, sessionCount, isAdmin, onChange }) {
     catch (e) { setErr(e.message); }
     finally { setBusy(false); }
   }
-  const save = () => act(async () => { await api.updateCampaign(campaign.id, { journal: draft }); setEditing(false); });
+  const save = () => act(async () => {
+    await api.updateCampaign(campaign.id, { journal: draft, journalBase: base });
+    setEditing(false);
+  });
+  const startEditing = () => {
+    setDraft(campaign.journal || '');
+    setBase(campaign.journal_updated_at ?? null);
+    setErr(null);
+    setEditing(true);
+  };
   const update = () => act(() => api.updateJournal(campaign.id));
   const rebuild = () => {
     if (!window.confirm(`Rebuild the journal from all ${sessionCount} sessions? This replaces the current journal, including any hand edits, and makes one AI call per session.`)) return;
@@ -125,7 +140,7 @@ function Journal({ campaign, pending, sessionCount, isAdmin, onChange }) {
     <section>
       <SectionHead title="Campaign journal" action={isAdmin && !editing && (
         <div className="flex gap-1.5">
-          <button className="btn btn-ghost !py-1.5" disabled={busy || updating} onClick={() => { setDraft(campaign.journal || ''); setEditing(true); }}>
+          <button className="btn btn-ghost !py-1.5" disabled={busy || updating} onClick={startEditing}>
             <Icon.Pencil width={14} height={14} />Edit
           </button>
           <button className="btn btn-ghost !py-1.5" disabled={busy || updating || sessionCount === 0} onClick={rebuild} title="Start over from every session">
@@ -162,7 +177,7 @@ function Journal({ campaign, pending, sessionCount, isAdmin, onChange }) {
           </>
         ) : campaign.journal ? (
           <>
-            <div className="text-[14px] text-ink leading-relaxed journal"><Markdown text={campaign.journal} /></div>
+            <div className="text-[14px] text-ink leading-relaxed"><Markdown text={campaign.journal} /></div>
             {campaign.journal_updated_at && <p className="text-xs text-faint mt-4">Updated {fmtRelative(campaign.journal_updated_at)}</p>}
           </>
         ) : (
@@ -307,19 +322,38 @@ export default function Campaign() {
   const isAdmin = useIsAdmin();
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
+  // Tags each request with the campaign it was for, so a slow response for
+  // the previous campaign can't replace the one now on screen.
+  const current = useRef(id);
+  current.current = id;
 
-  const load = useCallback(() => api.campaign(id).then(setData).catch((e) => setError(e?.message || 'Failed to load')), [id]);
+  const load = useCallback(async () => {
+    const forId = id;
+    try {
+      const d = await api.campaign(forId);
+      if (current.current === forId) { setData(d); setError(null); }
+    } catch (e) {
+      if (current.current === forId) setError(e?.message || 'Failed to load');
+    }
+  }, [id]);
   useEffect(() => { setData(null); setError(null); load(); }, [load]);
 
-  // Poll while a background journal update runs.
+  // Poll while a background journal update runs: one request at a time
+  // (never overlapping a slow one) and paused while the tab is hidden.
   const updating = data?.campaign?.journal_status === 'updating';
   useEffect(() => {
-    if (!updating) return;
-    const t = setInterval(load, 3000);
-    return () => clearInterval(t);
+    if (!updating) return undefined;
+    let stop = false;
+    let timer;
+    async function tick() {
+      if (!document.hidden) await load();
+      if (!stop) timer = setTimeout(tick, JOURNAL_POLL_MS);
+    }
+    timer = setTimeout(tick, JOURNAL_POLL_MS);
+    return () => { stop = true; clearTimeout(timer); };
   }, [updating, load]);
 
-  if (error) return <Page><Empty icon={Icon.Book} title="Couldn't load campaign" body={error} /></Page>;
+  if (!data && error) return <Page><Empty icon={Icon.Book} title="Couldn't load campaign" body={error} /></Page>;
   if (!data) return <Page><div className="h-10 w-64 skeleton rounded-md mb-6" /><div className="h-40 skeleton rounded-[14px]" /></Page>;
 
   const { campaign, channels, sessions, unassigned } = data;
@@ -333,6 +367,8 @@ export default function Campaign() {
       </Link>
       <PageHead title={campaign.name}
         subtitle={`${sessions.length} session${sessions.length === 1 ? '' : 's'}${channels.length ? ` · recorded in ${channels.map((c) => c.channel_name || c.channel_id).join(', ')}` : ''}`} />
+      {/* A failed refresh keeps the last good data on screen. */}
+      {error && <p className="text-xs text-error mb-4" role="alert">Couldn't refresh this campaign: {error}</p>}
 
       <div className="grid lg:grid-cols-[minmax(0,1fr)_360px] gap-6 items-start">
         <div className="space-y-6 min-w-0">

@@ -2,6 +2,24 @@ import { convertPcmToWav } from '../voice/audio.js';
 import { getSTT, resolveSttModel } from '../adapters/stt/index.js';
 import { unlink } from 'node:fs/promises';
 
+// Speech-to-text engines only use a short hint: faster-whisper keeps ~223
+// hotword tokens and OpenAI the last 224 prompt tokens. ~800 characters is
+// about 200 tokens, so the rest of a long vocabulary was uploaded per track
+// for nothing.
+export const VOCABULARY_HINT_MAX_CHARS = 800;
+
+/** The first whole vocabulary terms (one per line) that fit the hint budget. */
+export function vocabularyHint(vocabulary, maxChars = VOCABULARY_HINT_MAX_CHARS) {
+  const terms = String(vocabulary || '').split('\n').map((t) => t.trim()).filter(Boolean);
+  let hint = '';
+  for (const term of terms) {
+    const next = hint ? `${hint}, ${term}` : term;
+    if (next.length > maxChars) break;
+    hint = next;
+  }
+  return hint;
+}
+
 // Transcribes each track through a small worker pool instead of one at a
 // time. Cloud STT (openai) tolerates much higher concurrency than the local
 // sidecar, which is why the default differs by provider (S3 in the speed
@@ -17,7 +35,7 @@ export async function transcribeTracks(tracks, cfg = {}, deps = {}) {
   // meeting. The provider default can be overridden via deps.stt in tests.
   const transcribe = getSTT(cfg, deps.env, deps.sttDeps);
   const model = resolveSttModel(cfg);
-  const vocabulary = (cfg.transcriptionVocabulary || '').split('\n').filter(Boolean).join(', ');
+  const vocabulary = vocabularyHint(cfg.transcriptionVocabulary);
   const stt = deps.stt || ((wav) => transcribe(wav, { model, language: cfg.language, vocabulary }));
   const cleanup = deps.cleanup || (async (p) => { try { await unlink(p); } catch { /* ignore */ } });
   const concurrency = Math.max(1, deps.concurrency ?? (cfg.sttProvider === 'openai' ? 4 : 2));

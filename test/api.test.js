@@ -5,6 +5,7 @@ import express from 'express';
 import { ChannelType } from 'discord.js';
 import { openDb } from '../src/store/db.js';
 import { apiRouter } from '../src/web/api.js';
+import { setGuildConfig } from '../src/store/config.js';
 
 function appWith(db) {
   const app = express();
@@ -127,6 +128,7 @@ test('GET /api/guilds and meetings and todos', async () => {
 
 test('GET config returns providers + PATCH validates', async () => {
   const db = openDb(':memory:');
+  db.upsertGuild('g1', 'Guild One'); // settings are only accepted for known servers
   const { base, close } = await listen(appWith(db));
   try {
     const cfg = await (await fetch(`${base}/api/guilds/g1/config`)).json();
@@ -203,6 +205,7 @@ test('GET config returns providers + PATCH validates', async () => {
 
 test('Overview prompt can be saved, validated and restored per server', async () => {
   const db = openDb(':memory:');
+  db.upsertGuild('g1', 'Guild One'); // settings are only accepted for known servers
   const { base, close } = await listen(appWith(db));
   const url = `${base}/api/guilds/g1/config`;
   const get = async () => (await fetch(url)).json();
@@ -271,6 +274,7 @@ test('POST /system/sidecar start/stop drives the controller', async () => {
 
 test('switching a guild to a cloud STT provider auto-stops the sidecar', async () => {
   const db = openDb(':memory:');
+  db.upsertGuild('g1', 'Guild One'); // settings are only accepted for known servers
   // Make openai usable so validation passes (presence-only check).
   process.env.OPENAI_API_KEY = 'sk_test';
   const { config: env } = await import('../src/config/env.js');
@@ -536,5 +540,21 @@ test('GET /api/meetings/:id/export 404s for a missing meeting', async () => {
   const { base, close } = await listen(appWith(db));
   try {
     assert.equal((await fetch(`${base}/api/meetings/9999/export`)).status, 404);
+  } finally { close(); }
+});
+
+test('PATCH config validates a bare sttModel against the STORED stt provider', async () => {
+  const db = openDb(':memory:');
+  db.upsertGuild('g1', 'Guild One');
+  setGuildConfig(db, 'g1', { sttProvider: 'openai' });
+  const { base, close } = await listen(appWith(db));
+  try {
+    const patch = (body) => fetch(`${base}/api/guilds/g1/config`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    assert.equal((await patch({ sttModel: 'not-a-real-model' })).status, 400);
+    const ok = await patch({ sttModel: 'whisper-1' });
+    assert.equal(ok.status, 200);
+    assert.equal((await ok.json()).config.sttModel, 'whisper-1');
   } finally { close(); }
 });

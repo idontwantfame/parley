@@ -2,14 +2,32 @@ export function emptyNotes() {
   return { tldr: '', topics: [], decisions: [], openQuestions: [], actionItems: [] };
 }
 
+const isText = (value) => typeof value === 'string' && value.trim() !== '';
+const texts = (list) => (Array.isArray(list) ? list.filter(isText) : []);
+
+// Schema-less adapters may return topics/action items as bare strings, or
+// objects missing fields; renderers and todo seeding expect the full shape.
+function normalizeTopic(topic) {
+  if (isText(topic)) return { title: topic, points: [] };
+  if (!isText(topic?.title)) return null;
+  return { title: topic.title, points: texts(topic.points) };
+}
+
+function normalizeActionItem(item) {
+  if (isText(item)) return { assignee: null, task: item };
+  if (!isText(item?.task)) return null;
+  return { assignee: isText(item.assignee) ? item.assignee : null, task: item.task };
+}
+
 export function normalizeNotes(obj = {}) {
-  const base = emptyNotes();
+  const list = (value, normalize) => (Array.isArray(value) ? value.map(normalize).filter(Boolean) : []);
   return {
-    tldr: typeof obj.tldr === 'string' ? obj.tldr : base.tldr,
-    topics: Array.isArray(obj.topics) ? [...obj.topics] : base.topics,
-    decisions: Array.isArray(obj.decisions) ? [...obj.decisions] : base.decisions,
-    openQuestions: Array.isArray(obj.openQuestions) ? [...obj.openQuestions] : base.openQuestions,
-    actionItems: Array.isArray(obj.actionItems) ? [...obj.actionItems] : base.actionItems,
+    ...emptyNotes(),
+    tldr: typeof obj?.tldr === 'string' ? obj.tldr : '',
+    topics: list(obj?.topics, normalizeTopic),
+    decisions: texts(obj?.decisions),
+    openQuestions: texts(obj?.openQuestions),
+    actionItems: list(obj?.actionItems, normalizeActionItem),
   };
 }
 

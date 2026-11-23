@@ -29,9 +29,7 @@ export const Icon = {
   Merge: (p) => <I {...p}><path d="M7 21V9m0 0 3.5 3.5M7 9 3.5 12.5M17 3v6a6 6 0 0 0 6 6" /><circle cx="7" cy="5" r="2" /></I>,
   Hash: (p) => <I {...p}><path d="M5 9h14M5 15h14M9 4 7 20M17 4l-2 16" /></I>,
   Doc: (p) => <I {...p}><path d="M14 3H6.5A1.5 1.5 0 0 0 5 4.5v15A1.5 1.5 0 0 0 6.5 21h11a1.5 1.5 0 0 0 1.5-1.5V8z" /><path d="M14 3v5h5M8.5 13h7M8.5 17h7" /></I>,
-  Calendar: (p) => <I {...p}><rect x="3.5" y="4.5" width="17" height="16" rx="2.5" /><path d="M3.5 9h17M8 2.5v4M16 2.5v4" /></I>,
   Terminal: (p) => <I {...p}><rect x="3" y="4" width="18" height="16" rx="2.5" /><path d="m7 9 3 3-3 3M13 15h4" /></I>,
-  Slash: (p) => <I {...p}><path d="M9 20 15 4" /></I>,
   Refresh: (p) => <I {...p}><path d="M3 12a9 9 0 0 1 15-6.7L21 8M21 3v5h-5M21 12a9 9 0 0 1-15 6.7L3 16M3 21v-5h5" /></I>,
   Alert: (p) => <I {...p}><path d="M12 9v4M12 17h.01M10.3 4l-7.6 13A2 2 0 0 0 4.4 20h15.2a2 2 0 0 0 1.7-3L13.7 4a2 2 0 0 0-3.4 0Z" /></I>,
   Radio: (p) => <I {...p}><circle cx="12" cy="12" r="2.5" /><path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 16.2a6 6 0 0 0 0-8.4M4.9 4.9a10 10 0 0 0 0 14.2M19.1 19.1a10 10 0 0 0 0-14.2" /></I>,
@@ -66,7 +64,7 @@ export function Logo({ size = 32, rounded = true, className = '' }) {
 }
 
 /* ── Avatar ─────────────────────────────────────────────────────────────── */
-export function Avatar({ name, size = 28, ring = false }) {
+export function Avatar({ name, size = 28 }) {
   const c = colorOf(name);
   return (
     <span
@@ -77,7 +75,6 @@ export function Avatar({ name, size = 28, ring = false }) {
         fontSize: Math.round(size * 0.4),
         color: c,
         background: `color-mix(in srgb, ${c} 18%, transparent)`,
-        boxShadow: ring ? `0 0 0 2px var(--surface), 0 0 0 3px color-mix(in srgb, ${c} 40%, transparent)` : 'none',
       }}
     >
       {initials(name)}

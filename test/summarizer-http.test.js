@@ -192,3 +192,27 @@ test('summarizer uses a configured prompt with the language and transcript', asy
   assert.match(prompt, /Write the entire summary in German\./);
   assert.match(prompt, /Transcript:\nhello transcript/);
 });
+
+test('OllamaSummarizer applies its own timeout to the header wait and does not retry it', async () => {
+  const { createServer } = await import('node:http');
+  let requests = 0;
+  const timers = [];
+  const server = createServer((req, res) => {
+    requests++;
+    req.resume();
+    // Ollama with stream:false sends headers only when generation is finished.
+    timers.push(setTimeout(() => res.end('{"message":{"content":"late"}}'), 2500));
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const s = new OllamaSummarizer('qwen', `http://127.0.0.1:${server.address().port}`, undefined, { timeoutMs: 300 });
+    const started = Date.now();
+    await assert.rejects(s.ask('hi'), /Ollama did not answer within/);
+    assert.ok(Date.now() - started < 2400);
+    assert.equal(requests, 1);
+  } finally {
+    timers.forEach(clearTimeout);
+    server.closeAllConnections();
+    await new Promise((r) => server.close(r));
+  }
+});

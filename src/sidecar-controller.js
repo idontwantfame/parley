@@ -22,10 +22,18 @@ function isLocalHost(host) {
   return ['127.0.0.1', 'localhost', '0.0.0.0', '::1', '[::1]'].includes(host);
 }
 
+const DEFAULT_STT_URL = 'http://127.0.0.1:8000';
+const HEALTH_POLL_MS = 500;
+
 export class SidecarController {
+  // `sttUrl` may be a string or a function returning the current URL — pass a
+  // function so a URL changed later in the dashboard reaches this controller.
   constructor({ sttUrl, deps = {} } = {}) {
-    this.sttUrl = sttUrl || 'http://127.0.0.1:8000';
+    this.urlSource = typeof sttUrl === 'function' ? sttUrl : () => sttUrl;
     this.spawnImpl = deps.spawn || spawn;
+    this.pollMs = deps.pollMs ?? HEALTH_POLL_MS;
+    this.starting = null;    // in-flight start() promise (single-flight)
+    this.generation = 0;     // bumped by stop(); a start() from an older generation gives up
     this.fetchImpl = deps.fetch || fetch;
     this.exists = deps.exists || existsSync;
     this.pythonPath = deps.pythonPath || join(ROOT, 'stt_sidecar', '.venv', 'bin', 'python');
@@ -38,6 +46,8 @@ export class SidecarController {
     this.logTail = [];       // last few stdout/stderr lines for the UI
     this.health = null;      // last /health body: { device, compute, model, batch_size }
   }
+
+  get sttUrl() { return this.urlSource() || DEFAULT_STT_URL; }
 
   // Local + venv present => we can manage the process here.
   managed() {
@@ -71,16 +81,40 @@ export class SidecarController {
     }
   }
 
-  // Start the sidecar if it isn't already up. Idempotent. Resolves once the
-  // /health endpoint responds (or the spawn fails / times out).
-  async start({ waitMs = 60_000 } = {}) {
-    if (this.state === 'running' || this.state === 'starting') return { ok: true, state: this.state };
+  // Start the sidecar if it isn't already up. Idempotent and single-flight:
+  // concurrent calls share one attempt. Resolves once /health responds (or the
+  // spawn fails / times out). A health timeout keeps the child tracked — a
+  // first run downloads the model and can outlast it — so a later start() waits
+  // on that same process and stop() can still kill it (no orphan on the port).
+  start({ waitMs = 60_000 } = {}) {
+    if (this.state === 'running') return Promise.resolve({ ok: true, state: this.state });
+    if (!this.starting) {
+      this.starting = this._start(waitMs).finally(() => { this.starting = null; });
+    }
+    return this.starting;
+  }
+
+  async _start(waitMs) {
+    const generation = this.generation;
     // Already serving (started by us earlier, by the user, or another process)?
-    if (await this.healthy()) {
+    const healthy = await this.healthy();
+    // stop() ran during the probe (e.g. SIGTERM right after boot): don't spawn a
+    // process nobody will ever kill.
+    if (generation !== this.generation) return { ok: false, error: 'Sidecar was stopped.' };
+    if (healthy) {
       if (!this.child) this.external = true;
       this.state = 'running'; this.error = null;
       return { ok: true, state: this.state, external: this.external };
     }
+    if (!this.child) {
+      const spawned = this._spawn();
+      if (!spawned.ok) return spawned;
+    }
+    this.state = 'starting'; this.error = null;
+    return this._awaitHealthy(waitMs);
+  }
+
+  _spawn() {
     if (!this.managed()) {
       this.state = 'error';
       this.error = this.exists(this.pythonPath)
@@ -88,7 +122,6 @@ export class SidecarController {
         : 'Local sidecar is not installed (no Python venv). See README "Set up the Python STT sidecar".';
       return { ok: false, error: this.error };
     }
-    this.state = 'starting'; this.error = null;
     const { host, port } = this._bind();
     try {
       const child = this.spawnImpl(this.pythonPath, [this.serverPath], {
@@ -106,25 +139,37 @@ export class SidecarController {
           if (this.state !== 'stopped') { this.state = 'error'; this.error = `Sidecar exited (code ${code}).`; }
         }
       });
-      child.on('error', (e) => { this.error = e.message; this.state = 'error'; });
+      child.on('error', (e) => {
+        // A failed spawn (e.g. ENOENT) may never emit 'exit' — forget it here.
+        if (this.child === child) this.child = null;
+        this.error = e.message; this.state = 'error';
+      });
+      return { ok: true };
     } catch (e) {
       this.state = 'error'; this.error = e.message;
       return { ok: false, error: e.message };
     }
-    // Poll /health until it comes up (model import + boot can take a few seconds).
+  }
+
+  // Poll /health until it comes up (model import + boot can take a while).
+  async _awaitHealthy(waitMs) {
     const deadline = Date.now() + waitMs;
     while (Date.now() < deadline) {
       if (this.state === 'error') return { ok: false, error: this.error };
+      if (this.state === 'stopped') return { ok: false, error: 'Sidecar was stopped.' };
       if (await this.healthy()) { this.state = 'running'; return { ok: true, state: 'running' }; }
-      await new Promise((r) => setTimeout(r, 500));
+      await new Promise((r) => setTimeout(r, this.pollMs));
     }
-    this.state = 'error'; this.error = 'Sidecar did not become healthy in time.';
+    if (this.state !== 'starting') return { ok: false, error: this.error || 'Sidecar was stopped.' };
+    this.state = 'error';
+    this.error = 'Sidecar did not become healthy in time (it may still be downloading the model — Start again to keep waiting).';
     return { ok: false, error: this.error };
   }
 
   // Stop a sidecar WE spawned. An adopted external process is left alone.
   async stop() {
     const child = this.child;
+    this.generation++;
     this.state = 'stopped'; this.error = null;
     if (child) {
       this.child = null;

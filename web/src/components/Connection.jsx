@@ -1,20 +1,12 @@
 import { useState } from 'react';
 import { api } from '../api.js';
+import Field from './Field.jsx';
 import { Icon } from './ui.jsx';
 
 /* Shared building blocks for editing the Discord/STT connection. Used by the
    first-run Onboarding screen and the Connection card in Settings. The Discord
    token is write-only (we only ever learn whether one is set). */
 
-function Labeled({ label, hint, children }) {
-  return (
-    <div>
-      <label className="block text-[13px] font-medium text-ink mb-1.5">{label}</label>
-      {children}
-      {hint && <p className="text-xs text-muted mt-1.5">{hint}</p>}
-    </div>
-  );
-}
 
 /** Secret input: shows a "set / not set" badge until the user chooses to edit. */
 function SecretField({ label, hint, present, value, onChange, placeholder }) {
@@ -22,7 +14,7 @@ function SecretField({ label, hint, present, value, onChange, placeholder }) {
   const [reveal, setReveal] = useState(false);
   if (!editing) {
     return (
-      <Labeled label={label} hint={hint}>
+      <Field label={label} hint={hint}>
         <div className="flex items-center gap-2">
           <span className="inline-flex items-center gap-1.5 text-[13px] font-medium px-2.5 py-1.5 rounded-sm text-accent bg-accent-soft">
             <span style={{ width: 6, height: 6, borderRadius: 6, background: 'currentColor' }} />
@@ -30,11 +22,11 @@ function SecretField({ label, hint, present, value, onChange, placeholder }) {
           </span>
           <button type="button" onClick={() => setEditing(true)} className="btn btn-ghost !py-1.5">Replace</button>
         </div>
-      </Labeled>
+      </Field>
     );
   }
   return (
-    <Labeled label={label} hint={hint}>
+    <Field label={label} hint={hint}>
       <div className="relative">
         <input
           type={reveal ? 'text' : 'password'} value={value} placeholder={placeholder}
@@ -45,7 +37,7 @@ function SecretField({ label, hint, present, value, onChange, placeholder }) {
       {present && (
         <button type="button" onClick={() => { onChange(''); setEditing(false); }} className="text-xs text-muted hover:text-ink mt-1.5">Keep existing key</button>
       )}
-    </Labeled>
+    </Field>
   );
 }
 
@@ -89,10 +81,10 @@ export function ConnectionForm({ conn, onSaved, submitLabel = 'Save & connect' }
         placeholder="Paste your bot token…"
         hint={<>From the <a className="text-primary hover:underline" href="https://discord.com/developers/applications" target="_blank" rel="noreferrer">Developer Portal</a> → your app → Bot → Reset Token. Stored in <code className="text-ink-2">.env</code>, never shown again.</>}
       />
-      <Labeled label="Application (client) ID" hint="Developer Portal → your app → General Information → Application ID.">
+      <Field label="Application (client) ID" hint="Developer Portal → your app → General Information → Application ID.">
         <input className="input" value={clientId} onChange={(e) => setClientId(e.target.value)}
           placeholder="e.g. 1362914118918602893" inputMode="numeric" autoComplete="off" />
-      </Labeled>
+      </Field>
       {err && <p className="text-sm text-error">{err}</p>}
       <button type="submit" disabled={busy} className="btn btn-primary !py-2.5 w-full justify-center">
         {busy ? 'Connecting…' : submitLabel}
@@ -106,6 +98,8 @@ export function BotStatusBadge({ bot }) {
   const map = {
     ready: { label: 'Connected', color: 'var(--accent)', bg: 'var(--accent-soft)' },
     starting: { label: 'Connecting…', color: 'var(--warn)', bg: 'var(--warn-soft)' },
+    // Stop/restart waits for meetings still being processed before disconnecting.
+    stopping: { label: 'Finishing meetings…', color: 'var(--warn)', bg: 'var(--warn-soft)' },
     error: { label: 'Error', color: 'var(--error)', bg: 'var(--error-soft)' },
     stopped: { label: 'Not connected', color: 'var(--muted)', bg: 'var(--surface-3)' },
   };
@@ -118,4 +112,3 @@ export function BotStatusBadge({ bot }) {
   );
 }
 
-export { Icon };

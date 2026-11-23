@@ -130,7 +130,7 @@ def test_batch_size_disabled_uses_sequential(monkeypatch):
     _state["model"] = FakeModel()
     _state["model_name"] = "small"
     import server
-    assert server.get_batched() is None  # disabled
+    assert server.get_batched(_state["model"]) is None  # disabled
     r = TestClient(app).post("/transcribe",
                              files={"file": ("a.wav", make_silent_wav(), "audio/wav")})
     assert r.json()["text"] == "hello world"
@@ -143,7 +143,7 @@ def test_fake_model_falls_back_to_sequential(monkeypatch):
     monkeypatch.setattr("server.STT_BATCH_SIZE", None)  # per-device default (>0)
     _state.update(model=FakeModel(), model_name="small", device="cpu", compute="int8")
     import server
-    assert server.get_batched() is None
+    assert server.get_batched(_state["model"]) is None
 
 
 def test_vocabulary_reaches_sequential_and_batched_transcription(monkeypatch):
@@ -156,7 +156,7 @@ def test_vocabulary_reaches_sequential_and_batched_transcription(monkeypatch):
                 return super().transcribe(path, **kwargs)
         model = CapturingModel()
         monkeypatch.setattr(server, "get_model", lambda name: model)
-        monkeypatch.setattr(server, "get_batched", lambda: model if batched else None)
+        monkeypatch.setattr(server, "get_batched", lambda m: m if batched else None)
         r = TestClient(app).post("/transcribe",
                                 files={"file": ("a.wav", make_silent_wav(), "audio/wav")},
                                 data={"vocabulary": "AWP, connector"})
@@ -166,3 +166,101 @@ def test_vocabulary_reaches_sequential_and_batched_transcription(monkeypatch):
         r = TestClient(app).post("/transcribe", files={"file": ("a.wav", make_silent_wav(), "audio/wav")})
         assert r.status_code == 200
         assert "hotwords" not in calls[0]
+
+
+# ── concurrency, cleanup and input validation ────────────────────────────────
+import threading, time, tempfile, os
+
+
+def test_concurrent_cold_requests_build_the_model_once(monkeypatch):
+    reset_state()
+    built = []
+    def slow_ctor(name, device, compute_type):
+        built.append(name)
+        time.sleep(0.2)  # a real load takes seconds; requests pile up meanwhile
+        return FakeModel()
+    monkeypatch.setattr("server.WhisperModel", slow_ctor)
+    import server
+    models = []
+    threads = [threading.Thread(target=lambda: models.append(server.get_model("small"))) for _ in range(4)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert built == ["small"]
+    assert len({id(m) for m in models}) == 1
+
+
+def test_batched_pipeline_wraps_the_model_this_request_got(monkeypatch):
+    import server
+    class RealishModel(FakeModel):
+        feature_extractor = object()
+    mine, other = RealishModel(), RealishModel()
+    _state.update(model=other, model_name="large", batched=None)  # another guild's model is warm
+    wrapped = []
+    class FakePipeline:
+        def __init__(self, model): wrapped.append(model); self.model = model
+        def transcribe(self, path, **kw): return self.model.transcribe(path, **kw)
+    monkeypatch.setattr(server, "BatchedInferencePipeline", FakePipeline)
+    monkeypatch.setattr(server, "STT_BATCH_SIZE", 4)
+    monkeypatch.setattr(server, "get_model", lambda name: mine)
+    r = TestClient(app).post("/transcribe", files={"file": ("a.wav", make_silent_wav(), "audio/wav")})
+    assert r.status_code == 200
+    assert wrapped == [mine]
+
+
+def test_inference_is_capped_by_the_concurrency_limit(monkeypatch):
+    import server
+    running, peak, lock = [0], [0], threading.Lock()
+    class SlowModel(FakeModel):
+        def transcribe(self, path, **kw):
+            with lock:
+                running[0] += 1; peak[0] = max(peak[0], running[0])
+            time.sleep(0.1)
+            with lock:
+                running[0] -= 1
+            return super().transcribe(path, **kw)
+    model = SlowModel()
+    monkeypatch.setattr(server, "get_model", lambda name: model)
+    monkeypatch.setattr(server, "get_batched", lambda m: None)
+    monkeypatch.setattr(server, "_inference_slots", threading.BoundedSemaphore(1))
+    client = TestClient(app)
+    def call():
+        assert client.post("/transcribe", files={"file": ("a.wav", make_silent_wav(), "audio/wav")}).status_code == 200
+    threads = [threading.Thread(target=call) for _ in range(3)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert peak[0] == 1
+
+
+def stt_temp_files():
+    return {f for f in os.listdir(tempfile.gettempdir()) if f.startswith("stt-")}
+
+
+def test_upload_temp_file_is_removed_when_writing_it_fails(monkeypatch):
+    import server
+    before = stt_temp_files()
+    def boom(src, dst, *a, **kw): raise OSError("disk full")
+    monkeypatch.setattr(server.shutil, "copyfileobj", boom)
+    _state.update(model=FakeModel(), model_name="small")
+    r = TestClient(app, raise_server_exceptions=False).post(
+        "/transcribe", files={"file": ("a.wav", make_silent_wav(), "audio/wav")})
+    assert r.status_code == 500
+    assert stt_temp_files() == before
+
+
+def test_invalid_model_or_language_is_a_client_error(monkeypatch):
+    import server
+    loads = []
+    monkeypatch.setattr(server, "get_model", lambda name: loads.append(name) or FakeModel())
+    client = TestClient(app)
+    wav = lambda: {"file": ("a.wav", make_silent_wav(), "audio/wav")}
+    r = client.post("/transcribe", files=wav(), data={"model": "../../etc/passwd"})
+    assert r.status_code == 400 and "model" in r.json()["detail"].lower()
+    r = client.post("/transcribe", files=wav(), data={"language": "klingon"})
+    assert r.status_code == 400 and "language" in r.json()["detail"].lower()
+    assert loads == []  # rejected before any model is loaded or downloaded
+    class EnglishOnly(FakeModel):
+        supported_languages = ["en"]
+    monkeypatch.setattr(server, "get_model", lambda name: EnglishOnly())
+    r = client.post("/transcribe", files=wav(), data={"model": "small.en", "language": "de"})
+    assert r.status_code == 400
+    assert client.post("/transcribe", files=wav(), data={"model": "small.en", "language": "en"}).status_code == 200

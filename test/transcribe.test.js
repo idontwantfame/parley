@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { transcribeTracks } from '../src/pipeline/transcribe.js';
+import { transcribeTracks, vocabularyHint, VOCABULARY_HINT_MAX_CHARS } from '../src/pipeline/transcribe.js';
 
 test('transcribeTracks maps each track to a labeled utterance', async () => {
   const tracks = [
@@ -162,4 +162,32 @@ test('transcribeTracks returns all failures (and no utterances) when every track
   const { utterances, failures } = await transcribeTracks(tracks, {}, deps);
   assert.equal(utterances.length, 0);
   assert.equal(failures.length, 2);
+});
+
+test('vocabularyHint keeps the first whole terms that fit the hint budget', () => {
+  // faster-whisper keeps ~223 hotword tokens and OpenAI the last 224 prompt
+  // tokens, so a 64 KB list was resent per track for nothing.
+  const terms = Array.from({ length: 5000 }, (_, i) => `Term${i}`);
+  const hint = vocabularyHint(terms.join('\n'));
+  assert.ok(hint.length <= VOCABULARY_HINT_MAX_CHARS);
+  assert.ok(hint.startsWith('Term0, Term1, Term2'));
+  assert.deepEqual(hint.split(', '), terms.slice(0, hint.split(', ').length)); // whole terms, in order
+  assert.equal(vocabularyHint(terms.join('\n')), hint); // deterministic
+  assert.equal(vocabularyHint('AWP\n\nconnector'), 'AWP, connector');
+  assert.equal(vocabularyHint(''), '');
+});
+
+test('transcribeTracks sends the capped vocabulary hint to the STT provider', async () => {
+  const seen = [];
+  const terms = Array.from({ length: 3000 }, (_, i) => `Name${i}`).join('\n');
+  await transcribeTracks([{ userId: 'u1', displayName: 'A', startMs: 0, pcmPath: '/a.pcm' }],
+    { transcriptionVocabulary: terms }, {
+      convert: async (p, w) => w, cleanup: () => {},
+      sttDeps: { fetchImpl: async (_url, init) => { seen.push(init.body.get('vocabulary')); return { ok: true, json: async () => ({ text: 'x', words: [] }) }; },
+        readFile: async () => Buffer.from('RIFF') },
+      env: { sttUrl: 'http://stt' },
+    });
+  assert.equal(seen.length, 1);
+  assert.ok(seen[0].length <= VOCABULARY_HINT_MAX_CHARS);
+  assert.ok(seen[0].startsWith('Name0, Name1'));
 });

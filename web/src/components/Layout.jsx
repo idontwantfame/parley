@@ -1,5 +1,13 @@
-import { useState } from 'react';
+import { Suspense, useState } from 'react';
 import { Link, NavLink, Outlet, useNavigate } from 'react-router-dom';
+
+function RouteFallback() {
+  return (
+    <div className="grid place-items-center py-24" role="status" aria-label="Loading">
+      <div className="h-6 w-6 rounded-full border-2 border-primary border-t-transparent animate-spin" />
+    </div>
+  );
+}
 import { useGuild } from '../GuildContext.jsx';
 import { useTheme } from '../ThemeContext.jsx';
 import { useAuth } from '../AuthContext.jsx';
@@ -183,7 +191,10 @@ export default function Layout() {
         </header>
 
         <main className="flex-1 overflow-y-auto">
-          <Outlet />
+          {/* Route pages are lazy-loaded; keep the shell visible meanwhile. */}
+          <Suspense fallback={<RouteFallback />}>
+            <Outlet />
+          </Suspense>
         </main>
       </div>
     </div>

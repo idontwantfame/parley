@@ -10,7 +10,9 @@
 // The web server binds localhost by default, but auth makes the dashboard safe
 // to expose (e.g. behind a reverse proxy / Docker port map).
 
+import { createHash } from 'node:crypto';
 import { Router } from 'express';
+import { USERNAME_MAX } from '../store/users.js';
 
 const COOKIE = 'parley_session';
 // Minimum password length, enforced on every set/change/reset path. Kept modest
@@ -24,7 +26,9 @@ function readCookie(req, name) {
   for (const part of header.split(';')) {
     const idx = part.indexOf('=');
     if (idx === -1) continue;
-    if (part.slice(0, idx).trim() === name) return decodeURIComponent(part.slice(idx + 1).trim());
+    if (part.slice(0, idx).trim() !== name) continue;
+    // A malformed escape is a bad cookie, not a server error: treat as absent.
+    try { return decodeURIComponent(part.slice(idx + 1).trim()); } catch { return null; }
   }
   return null;
 }
@@ -55,48 +59,60 @@ function clearSessionCookie(res, secure) {
 // consecutive failures the key locks out for `lockoutMs`, doubling on each
 // subsequent lockout up to `maxLockoutMs`. A success (or going quiet for
 // `maxLockoutMs`) clears the slate. `now` is injectable for tests.
+//
+// Memory is bounded: keys are stored as fixed-size digests, the map holds at
+// most `maxEntries` keys, and it is kept in last-failure order so stale keys
+// (and, at capacity, the oldest) are dropped from the front in O(1) amortized.
 export function createLoginLimiter({
   now = () => Date.now(),
   maxFailures = 5,
   lockoutMs = 30_000,
   maxLockoutMs = 15 * 60_000,
+  maxEntries = 10_000,
 } = {}) {
-  const entries = new Map(); // key -> { failures, strikes, lockedUntil, lastFailAt }
+  const entries = new Map(); // digest -> { failures, strikes, lockedUntil, lastFailAt }, oldest failure first
+  const digest = (key) => createHash('sha256').update(String(key)).digest('base64url');
 
-  // Cheap bound on memory: drop keys that have been quiet long enough that
-  // their state would have been forgiven anyway.
-  function prune() {
-    const t = now();
+  // Drop keys quiet long enough to be forgiven anyway, then (at capacity) the
+  // oldest, leaving room for one insert.
+  function evict(t) {
     for (const [key, e] of entries) {
-      if (e.lockedUntil <= t && t - e.lastFailAt > maxLockoutMs) entries.delete(key);
+      if (t - e.lastFailAt <= maxLockoutMs && entries.size < maxEntries) break;
+      entries.delete(key);
     }
+  }
+
+  function nextEntry(prev, t) {
+    // Stale entries (quiet past the max lockout) start fresh — old failures
+    // shouldn't haunt a user forever.
+    const base = !prev || t - prev.lastFailAt > maxLockoutMs ? { failures: 0, strikes: 0, lockedUntil: 0 } : prev;
+    const failures = base.failures + 1;
+    if (failures < maxFailures) return { ...base, failures, lastFailAt: t };
+    const strikes = base.strikes + 1; // exponential backoff per completed lockout cycle
+    return { failures: 0, strikes, lastFailAt: t,
+      lockedUntil: t + Math.min(lockoutMs * 2 ** (strikes - 1), maxLockoutMs) };
   }
 
   return {
     // null when allowed, otherwise seconds until the lockout lifts.
     retryAfterSec(key) {
-      const e = entries.get(key);
+      const e = entries.get(digest(key));
       if (!e || e.lockedUntil <= now()) return null;
       return Math.ceil((e.lockedUntil - now()) / 1000);
     },
     fail(key) {
-      if (entries.size > 1000) prune();
+      const k = digest(key);
       const t = now();
-      let e = entries.get(key);
-      // Stale entries (quiet past the max lockout) start fresh — old failures
-      // shouldn't haunt a user forever.
-      if (!e || t - e.lastFailAt > maxLockoutMs) e = { failures: 0, strikes: 0, lockedUntil: 0 };
-      e.failures += 1;
-      e.lastFailAt = t;
-      if (e.failures >= maxFailures) {
-        e.failures = 0;
-        e.strikes += 1; // exponential backoff per completed lockout cycle
-        e.lockedUntil = t + Math.min(lockoutMs * 2 ** (e.strikes - 1), maxLockoutMs);
-      }
-      entries.set(key, e);
+      const prev = entries.get(k);
+      entries.delete(k); // re-inserted at the back: the map stays in failure order
+      evict(t);
+      entries.set(k, nextEntry(prev, t));
     },
     reset(key) {
-      entries.delete(key);
+      entries.delete(digest(key));
+    },
+    size() {
+      return entries.size;
     },
   };
 }
@@ -124,10 +140,12 @@ export function requireAuth(_users) {
 // req.authResolved) a missing or non-admin user is rejected — fail closed. Only
 // when auth was never wired in front (the standalone/test server that mounts
 // apiRouter bare) is it permissive, since there's no auth to enforce there.
+export function isAdminRequest(req) {
+  return !req.authResolved || !!req.user?.isAdmin;
+}
+
 export function requireAdmin(req, res, next) {
-  if (req.authResolved && (!req.user || !req.user.isAdmin)) {
-    return res.status(403).json({ error: 'Admin access required.' });
-  }
+  if (!isAdminRequest(req)) return res.status(403).json({ error: 'Admin access required.' });
   next();
 }
 
@@ -153,6 +171,9 @@ export function requirePasswordChanged(_users) {
 // Origin header on cross-site POST/PUT/PATCH/DELETE, so rejecting a mismatched
 // Origin blocks CSRF without tokens. Requests with no Origin (same-origin GETs,
 // non-browser API clients, tests) are allowed — they can't be CSRF vectors.
+// The comparison uses req.host, which honours X-Forwarded-Host only when the
+// `trust proxy` setting trusts the hop (TRUSTED_PROXY), so a reverse proxy that
+// rewrites Host still passes while a direct client cannot spoof it.
 export function sameOrigin(req, res, next) {
   const method = req.method.toUpperCase();
   if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return next();
@@ -160,7 +181,7 @@ export function sameOrigin(req, res, next) {
   if (!origin) return next();
   let originHost;
   try { originHost = new URL(origin).host; } catch { return res.status(403).json({ error: 'Bad Origin.' }); }
-  if (originHost !== req.headers.host) {
+  if (originHost !== req.host) {
     return res.status(403).json({ error: 'Cross-origin request refused.' });
   }
   next();
@@ -170,10 +191,12 @@ export function authRouter({ users, now = () => Date.now(), loginLimiter = creat
   const r = Router();
 
   // ── Session ────────────────────────────────────────────────────────────────
-  r.post('/auth/login', (req, res) => {
+  r.post('/auth/login', async (req, res) => {
     const username = String(req.body?.username ?? '').trim();
     const password = String(req.body?.password ?? '');
     if (!username || !password) return res.status(400).json({ error: 'Username and password are required.' });
+    // No account can have a longer name; refuse before it reaches the limiter.
+    if (username.length > USERNAME_MAX) return res.status(400).json({ error: 'Invalid username or password.' });
     // Rate-limit per (ip, username) so one attacker can't lock everyone out and
     // a distributed guess against one account still trips per-IP keys.
     const limitKey = `${req.ip ?? ''}|${username.toLowerCase()}`;
@@ -182,11 +205,11 @@ export function authRouter({ users, now = () => Date.now(), loginLimiter = creat
       res.set('Retry-After', String(retryAfter));
       return res.status(429).json({ error: `Too many failed login attempts. Try again in ${retryAfter}s.` });
     }
-    const user = users.authenticate(username, password);
-    if (!user) {
-      loginLimiter.fail(limitKey);
-      return res.status(401).json({ error: 'Invalid username or password.' });
-    }
+    // Count the attempt before the (async) password check so parallel guesses
+    // can't all pass the check above; a correct password clears it again.
+    loginLimiter.fail(limitKey);
+    const user = await users.authenticate(username, password);
+    if (!user) return res.status(401).json({ error: 'Invalid username or password.' });
     loginLimiter.reset(limitKey);
     const { token, expiresAt } = users.createSession(user.id);
     setSessionCookie(res, token, expiresAt, req.secure);
@@ -217,7 +240,7 @@ export function authRouter({ users, now = () => Date.now(), loginLimiter = creat
   // On success every other session for this user is revoked (a password change
   // is the response to a suspected compromise) and the current request gets a
   // fresh session cookie so the user stays logged in here.
-  r.post('/auth/password', requireAuth(users), (req, res) => {
+  r.post('/auth/password', requireAuth(users), async (req, res) => {
     const current = String(req.body?.currentPassword ?? '');
     const next = String(req.body?.newPassword ?? '');
     if (next.length < PASSWORD_MIN) {
@@ -226,7 +249,7 @@ export function authRouter({ users, now = () => Date.now(), loginLimiter = creat
     const row = users.getUserByUsername(req.user.username);
     const mustChange = !!row?.must_change_password;
     if (!mustChange) {
-      if (!users.authenticate(req.user.username, current)) {
+      if (!(await users.authenticate(req.user.username, current))) {
         return res.status(400).json({ error: 'Current password is incorrect.' });
       }
     }
@@ -238,16 +261,23 @@ export function authRouter({ users, now = () => Date.now(), loginLimiter = creat
   });
 
   // ── User management (admin) ─────────────────────────────────────────────────
-  r.get('/users', requireAuth(users), requireAdmin, (_req, res) => {
+  // Gated like the rest of the API: an account still on the seeded default
+  // password must change it before it can create or promote anyone.
+  const adminOnly = [requireAuth(users), requirePasswordChanged(users), requireAdmin];
+  const badIsAdmin = (value) => value !== undefined && typeof value !== 'boolean';
+
+  r.get('/users', ...adminOnly, (_req, res) => {
     res.json({ users: users.listUsers() });
   });
 
-  r.post('/users', requireAuth(users), requireAdmin, (req, res) => {
+  r.post('/users', ...adminOnly, (req, res) => {
     const username = String(req.body?.username ?? '').trim();
     const email = req.body?.email ? String(req.body.email).trim() : null;
     const password = String(req.body?.password ?? '');
-    const isAdmin = !!req.body?.isAdmin;
+    if (badIsAdmin(req.body?.isAdmin)) return res.status(400).json({ error: 'isAdmin must be true or false.' });
+    const isAdmin = req.body?.isAdmin === true;
     if (!username || !password) return res.status(400).json({ error: 'Username and password are required.' });
+    if (username.length > USERNAME_MAX) return res.status(400).json({ error: `Usernames are at most ${USERNAME_MAX} characters.` });
     if (password.length < PASSWORD_MIN) return res.status(400).json({ error: `Password must be at least ${PASSWORD_MIN} characters.` });
     try {
       const user = users.createUser({ username, email, password, isAdmin });
@@ -258,7 +288,7 @@ export function authRouter({ users, now = () => Date.now(), loginLimiter = creat
   });
 
   // Admin reset of another user's password.
-  r.post('/users/:id/password', requireAuth(users), requireAdmin, (req, res) => {
+  r.post('/users/:id/password', ...adminOnly, (req, res) => {
     const id = Number(req.params.id);
     if (!users.getUser(id)) return res.status(404).json({ error: 'User not found.' });
     const password = String(req.body?.password ?? '');
@@ -268,20 +298,26 @@ export function authRouter({ users, now = () => Date.now(), loginLimiter = creat
     res.json({ ok: true });
   });
 
-  r.patch('/users/:id', requireAuth(users), requireAdmin, (req, res) => {
+  r.patch('/users/:id', ...adminOnly, (req, res) => {
     const id = Number(req.params.id);
-    if (!users.getUser(id)) return res.status(404).json({ error: 'User not found.' });
+    const target = users.getUser(id);
+    if (!target) return res.status(404).json({ error: 'User not found.' });
+    const { email, isAdmin } = req.body ?? {};
+    // Only a real boolean is accepted, so the guard below sees exactly the
+    // value that gets applied (0/null/"" can't slip past as "not false").
+    if (badIsAdmin(isAdmin)) return res.status(400).json({ error: 'isAdmin must be true or false.' });
     // Guard against demoting the last admin into an admin-less instance.
-    if (req.body?.isAdmin === false && users.getUser(id).isAdmin && users.countAdmins() <= 1) {
+    if (isAdmin === false && target.isAdmin && users.countAdmins() <= 1) {
       return res.status(400).json({ error: 'Cannot remove the last admin.' });
     }
-    const patch = {};
-    if (req.body?.email !== undefined) patch.email = req.body.email ? String(req.body.email).trim() : null;
-    if (req.body?.isAdmin !== undefined) patch.isAdmin = !!req.body.isAdmin;
+    const patch = {
+      ...(email !== undefined ? { email: email ? String(email).trim() : null } : {}),
+      ...(isAdmin !== undefined ? { isAdmin } : {}),
+    };
     res.json({ ok: true, user: users.updateUser(id, patch) });
   });
 
-  r.delete('/users/:id', requireAuth(users), requireAdmin, (req, res) => {
+  r.delete('/users/:id', ...adminOnly, (req, res) => {
     const id = Number(req.params.id);
     const target = users.getUser(id);
     if (!target) return res.status(404).json({ error: 'User not found.' });
@@ -295,5 +331,3 @@ export function authRouter({ users, now = () => Date.now(), loginLimiter = creat
 
   return r;
 }
-
-export { COOKIE };

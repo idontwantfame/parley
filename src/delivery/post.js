@@ -17,6 +17,25 @@ function meetingLink(base, id) {
   }
 }
 
+// Discord rejects thread names over 100 characters (and the post would then
+// silently land in the channel instead). Trim the channel name, never the date,
+// and never split a surrogate pair.
+export const THREAD_NAME_LIMIT = 100;
+const THREAD_PREFIX = 'Notes — ';
+
+export function notesThreadName(channelName, startedAt) {
+  const suffix = /^\d{4}-\d{2}-\d{2}/.test(startedAt || '') ? ` ${startedAt.slice(0, 10)}` : '';
+  const room = THREAD_NAME_LIMIT - THREAD_PREFIX.length - suffix.length;
+  const name = channelName || 'meeting';
+  if (name.length <= room) return `${THREAD_PREFIX}${name}${suffix}`;
+  let trimmed = '';
+  for (const char of name) {
+    if (trimmed.length + char.length > room - 1) break;
+    trimmed += char;
+  }
+  return `${THREAD_PREFIX}${trimmed}…${suffix}`;
+}
+
 export async function postNotes({ client, meeting, cfg, notes, talktime }) {
   const channelId = cfg.notesChannelId || meeting.channel_id;
   const channel = await client.channels.fetch(channelId).catch(() => null);
@@ -42,7 +61,7 @@ export async function postNotes({ client, meeting, cfg, notes, talktime }) {
     // Fall back to the channel itself if thread creation fails (e.g. missing perms)
     // so the notes are never silently lost.
     target = await channel.threads
-      .create({ name: `Notes — ${meeting.channel_name} ${meeting.started_at.slice(0, 10)}` })
+      .create({ name: notesThreadName(meeting.channel_name, meeting.started_at) })
       .catch(() => channel);
   }
   if (link) {

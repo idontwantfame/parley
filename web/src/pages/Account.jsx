@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api.js';
+import Field from '../components/Field.jsx';
 import { useAuth } from '../AuthContext.jsx';
 import { Page, PageHead } from '../components/Page.jsx';
 import { Avatar, Icon, Empty } from '../components/ui.jsx';
@@ -19,15 +20,6 @@ function Card({ title, desc, children, action }) {
   );
 }
 
-function Field({ label, children, hint }) {
-  return (
-    <div>
-      <label className="block text-[13px] font-medium text-ink mb-1.5">{label}</label>
-      {children}
-      {hint && <p className="text-xs text-muted mt-1.5">{hint}</p>}
-    </div>
-  );
-}
 
 /* ── Change your own password ─────────────────────────────────────────────── */
 function PasswordCard({ user, onChanged }) {
@@ -124,7 +116,7 @@ function AddUserForm({ onCreated }) {
     <form onSubmit={submit} className="w-full mt-4 pt-4 border-t border-border grid sm:grid-cols-2 gap-3">
       <Field label="Username"><input className="input" value={username} onChange={(e) => setUsername(e.target.value)} placeholder="jane" autoComplete="off" /></Field>
       <Field label="Email (optional)"><input className="input" type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="jane@example.com" autoComplete="off" /></Field>
-      <Field label="Password"><input className="input" type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="At least 4 characters" autoComplete="new-password" /></Field>
+      <Field label="Password"><input className="input" type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="At least 8 characters" autoComplete="new-password" /></Field>
       <div className="flex items-end">
         <label className="flex items-center gap-2 text-[13px] text-ink cursor-pointer select-none pb-2.5">
           <input type="checkbox" className="pcheck" checked={isAdmin} onChange={(e) => setIsAdmin(e.target.checked)} />

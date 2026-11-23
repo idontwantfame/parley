@@ -8,8 +8,33 @@ import { installUsers } from '../store/users.js';
 import { authRouter, attachUser, requireAuth, requirePasswordChanged, sameOrigin } from './auth.js';
 
 const DIST = join(dirname(fileURLToPath(import.meta.url)), '../../web/dist');
+// Expired login sessions are also purged on every login; this catches idle instances.
+const SESSION_PURGE_INTERVAL_MS = 60 * 60 * 1000;
 
-export function createWebServer({ db, bot = null, client = null, sidecar = null }) {
+// Messages for client errors raised by Express itself (body parsing, limits).
+const CLIENT_ERRORS = {
+  400: 'The request body is not valid JSON.',
+  413: 'The request body is too large.',
+  415: 'Unsupported request body encoding.',
+};
+
+/**
+ * Final error handler: log the details server-side, send the client only a
+ * generic JSON message (never a stack trace, whatever NODE_ENV says).
+ */
+export function jsonErrorHandler(log = console) {
+  return (err, req, res, _next) => { // 4 params: Express error middleware
+    const status = Number(err?.status ?? err?.statusCode);
+    if (status >= 400 && status < 500 && !res.headersSent) {
+      return res.status(status).json({ error: CLIENT_ERRORS[status] ?? 'The request could not be processed.' });
+    }
+    log.error(`[web] ${req.method} ${req.originalUrl} failed:`, err);
+    if (res.headersSent) return res.end();
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  };
+}
+
+export function createWebServer({ db, bot = null, client = null, sidecar = null, users = installUsers(db) }) {
   const app = express();
   // Trust only the loopback proxy so req.secure / req.ip reflect a *local*
   // reverse proxy's X-Forwarded-* headers. Trusting every hop (`true`) let any
@@ -23,7 +48,7 @@ export function createWebServer({ db, bot = null, client = null, sidecar = null 
   // cookie for every request. Login/logout/me/password are public (or self-only)
   // and mounted first; everything else under /api needs a session, a same-origin
   // request (CSRF guard), and an account that has moved off the default password.
-  const users = installUsers(db);
+  // The /users admin routes inside authRouter apply the password gate themselves.
   app.use(attachUser(users));
   app.use('/api', sameOrigin);
   app.use('/api', authRouter({ users }));
@@ -34,15 +59,22 @@ export function createWebServer({ db, bot = null, client = null, sidecar = null 
     // SPA fallback for client-side routes (but never /api)
     app.get(/^\/(?!api).*/, (_req, res) => res.sendFile(join(DIST, 'index.html')));
   }
+  app.use(jsonErrorHandler());
   return app;
 }
 
 const FALLBACK_ATTEMPTS = 10;
 
-export function startWebServer({ db, bot = null, client = null, sidecar = null, port = 3000, host = process.env.WEB_UI_HOST || '127.0.0.1', maxAttempts = FALLBACK_ATTEMPTS }) {
+export async function startWebServer({ db, bot = null, client = null, sidecar = null, port = 3000, host = process.env.WEB_UI_HOST || '127.0.0.1', maxAttempts = FALLBACK_ATTEMPTS }) {
   db.backfillTodos();
-  const app = createWebServer({ db, bot, client, sidecar });
-  return listenWithFallback(app, port, host, maxAttempts);
+  const users = installUsers(db);
+  const app = createWebServer({ db, bot, client, sidecar, users });
+  const server = await listenWithFallback(app, port, host, maxAttempts);
+  const purge = setInterval(() => {
+    try { users.purgeExpiredSessions(); } catch (e) { console.warn('[web] session purge failed:', e.message); }
+  }, SESSION_PURGE_INTERVAL_MS).unref();
+  server.once('close', () => clearInterval(purge));
+  return server;
 }
 
 // Bind preferred port; on EADDRINUSE walk +1 up to maxAttempts. Port 0

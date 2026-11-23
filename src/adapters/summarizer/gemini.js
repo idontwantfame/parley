@@ -1,5 +1,6 @@
 import { GoogleGenerativeAI, SchemaType } from '@google/generative-ai';
-import { normalizeNotes, summaryPrompt } from './notes.js';
+import { summaryPrompt } from './notes.js';
+import { parseNotes } from './parse.js';
 import { summaryLanguageInstruction } from './languages.js';
 import { withRetry } from './errors.js';
 import { config } from '../../config/env.js';
@@ -36,19 +37,8 @@ export const NOTES_SCHEMA = {
   required: ['tldr', 'topics', 'decisions', 'openQuestions', 'actionItems'],
 };
 
-export function parseGeminiNotes(raw = '') {
-  const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = fence ? fence[1] : raw;
-  try {
-    return normalizeNotes(JSON.parse(candidate.trim()));
-  } catch {
-    const brace = candidate.match(/\{[\s\S]*\}/);
-    if (brace) {
-      try { return normalizeNotes(JSON.parse(brace[0])); } catch { /* fall through */ }
-    }
-    return normalizeNotes({ tldr: raw.trim() });
-  }
-}
+// Kept under its original name for existing callers/tests.
+export const parseGeminiNotes = parseNotes;
 
 export class GeminiSummarizer {
   constructor(model, apiKey = config.gemini.apiKey) {
@@ -59,7 +49,7 @@ export class GeminiSummarizer {
       model,
       // Force valid JSON in the StructuredNotes shape; free-text mode let
       // gemini-2.5-flash emit truncated/malformed JSON that dumped the whole
-      // blob into tldr (see parseGeminiNotes fallback).
+      // blob into tldr (parseNotes now rejects such replies).
       generationConfig: { responseMimeType: 'application/json', responseSchema: NOTES_SCHEMA },
     });
   }
@@ -68,7 +58,10 @@ export class GeminiSummarizer {
     // GoogleGenerativeAIFetchError carries .status, so withRetry backs off on
     // transient 5xx (e.g. 503 "high demand") and surfaces 401/429 immediately.
     const result = await withRetry(() => this.model.generateContent(prompt));
-    return parseGeminiNotes(result.response.text());
+    if (result.response.candidates?.[0]?.finishReason === 'MAX_TOKENS') {
+      throw new Error('Gemini stopped at its output limit before finishing the meeting notes. Try a model with a larger output limit.');
+    }
+    return parseNotes(result.response.text(), { provider: 'Gemini', allowProse: meta.summaryPrompt != null });
   }
   async ask(prompt) {
     const model = this.genAI.getGenerativeModel({ model: this.modelName }); // no responseSchema → free text

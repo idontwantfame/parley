@@ -41,3 +41,14 @@ export async function retainRecording(audioDir, transcriptionComplete, meetingId
     return true;
   }
 }
+
+/**
+ * May finalize delete the meeting's audio dir (keepAudio off)? Only when the
+ * pipeline finished, nothing was archived, and the transcript is complete — a
+ * partial transcript keeps the PCM so a retry can re-transcribe the speakers
+ * that failed. `meeting` is the row after the pipeline ran.
+ */
+export function canDiscardAudio(result, meeting) {
+  if (!result || result.audioRetained) return false;
+  return meeting?.transcription_complete === 1;
+}

@@ -51,6 +51,17 @@ services:
       WEB_UI: "1"
       WEB_UI_PORT: "3000"
       WEB_UI_HOST: 0.0.0.0
+      # Behind a reverse proxy (nginx, Caddy, Traefik) on another host or
+      # container, set TRUSTED_PROXY to that proxy's address or subnet (an
+      # Express "trust proxy" value, e.g. 172.16.0.0/12 or "uniquelocal") and
+      # have it forward the public host, e.g. for nginx:
+      #   proxy_set_header Host $host;   (or X-Forwarded-Host $host)
+      #   proxy_set_header X-Forwarded-Proto $scheme;
+      #   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      # Parley then sees the real client IP (login rate limit), https (Secure
+      # cookie) and public host (same-origin check). Only loopback is trusted
+      # by default; never trust addresses that clients can reach directly.
+      # TRUSTED_PROXY: uniquelocal
     volumes:
       # SQLite db + per-meeting audio + automatic Markdown/JSON exports.
       - parley-data:/data

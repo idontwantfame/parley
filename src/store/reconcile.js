@@ -1,6 +1,7 @@
 // src/store/reconcile.js
 // Boot-time housekeeping that must run whether or not the Discord bot starts
-// (web-only mode still needs it). Two jobs:
+// (web-only mode still needs it). It also clears interrupted Discord deliveries
+// and campaign-journal updates left 'updating' by a restart. Two main jobs:
 //
 //   1. Orphaned meetings — rows left in 'recording'/'processing' by a crash mid-
 //      pipeline. Mark them 'transcription_failed' so the dashboard offers a retry
@@ -20,6 +21,8 @@ const KEEP_AUDIO_STATUSES = new Set(['recording', 'processing', 'transcription_f
 export async function reconcileOnBoot(db, audioRoot, { readdir = readdirSync, remove = rm, log = console, retentionDays = 30 } = {}) {
   let orphanMeetings = 0;
   db.interruptDeliveries();
+  // Journal updates run in-process, so none can still be running at boot.
+  db.resetInterruptedJournals();
 
   // 1) Orphaned meetings from a crash mid-pipeline.
   for (const m of db.findOrphanedMeetings()) {
@@ -43,8 +46,12 @@ export async function sweepAudio(db, audioRoot, { readdir = readdirSync, remove 
     const id = Number(name);
     if (!Number.isInteger(id)) continue; // ignore non-numeric dirs we didn't create
     const meeting = db.getMeeting(id);
-    if (meeting?.status === 'done' && meeting.audio_retained
-      && (retentionDays === 0 || !(Date.parse(meeting.ended_at) <= cutoff))) continue;
+    // A finished meeting's audio still has a use while within the audio
+    // retention window: a retained recording, or raw tracks that a retry can
+    // re-transcribe because the transcript is known to be incomplete.
+    const stillUseful = meeting?.status === 'done'
+      && (meeting.audio_retained || meeting.transcription_complete === 0);
+    if (stillUseful && (retentionDays === 0 || !(Date.parse(meeting.ended_at) <= cutoff))) continue;
     // Remove when the meeting is gone (deleted) or in a terminal state that no
     // longer needs the PCM. Keep dirs for meetings that might still be retried.
     if (!meeting || !KEEP_AUDIO_STATUSES.has(meeting.status)) {

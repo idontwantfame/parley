@@ -172,3 +172,59 @@ test('fallback model alone updates only the model', () => {
   assert.equal(r.patch.summarizerFallbackModel, 'glm-5.3');
   assert.equal('summarizerFallbackProvider' in r.patch, false);
 });
+
+// ── provider/model coherence + stored-config validation ──────────────────────
+import { formatConfigReply } from '../src/commands/setup-logic.js';
+const withOpenai = { ...env, openai: { apiKey: 'k' } };
+
+test('switching provider without a model uses that provider\'s default, not the old model id', () => {
+  const r = validateSetup({ provider: 'openai' }, withOpenai, { summarizerProvider: 'gemini', summarizerModel: 'gemini-2.5-flash' });
+  assert.equal(r.ok, true);
+  assert.equal(r.patch.summarizerProvider, 'openai');
+  assert.equal(r.patch.summarizerModel, 'gpt-4o-mini');
+});
+
+test('switching provider without a model defaults even when the stored config is unknown', () => {
+  const r = validateSetup({ provider: 'openai' }, withOpenai);
+  assert.equal(r.patch.summarizerModel, 'gpt-4o-mini');
+});
+
+test('re-selecting the current provider without a model keeps the chosen model', () => {
+  const r = validateSetup({ provider: 'gemini' }, env, { summarizerProvider: 'gemini', summarizerModel: 'gemini-2.5-pro' });
+  assert.equal(r.ok, true);
+  assert.equal('summarizerModel' in r.patch, false);
+});
+
+test('a model without a provider applies to the current provider instead of being dropped', () => {
+  const r = validateSetup({ model: 'gemini-2.5-pro' }, env, { summarizerProvider: 'gemini' });
+  assert.equal(r.ok, true);
+  assert.equal(r.patch.summarizerModel, 'gemini-2.5-pro');
+  assert.equal('summarizerProvider' in r.patch, false);
+});
+
+test('a model id must be a plausible identifier', () => {
+  for (const model of ['', '   ', 'has space', 'x'.repeat(201)]) {
+    assert.equal(validateSetup({ model }, env, { summarizerProvider: 'gemini' }).ok, false, JSON.stringify(model));
+  }
+});
+
+test('an STT model alone is validated against the STORED provider, not client input', () => {
+  const stored = { sttProvider: 'openai' };
+  assert.equal(validateSetup({ sttModel: 'whisper-1' }, withOpenai, stored).ok, true);
+  const r = validateSetup({ sttModel: 'bogus', currentSttProvider: 'sidecar' }, withOpenai, stored);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /openai model/i);
+});
+
+test('the /setup reply summarizes long prompts and fits a Discord message', () => {
+  const text = formatConfigReply({ summarizerProvider: 'gemini', summaryPrompt: 'p'.repeat(20_000), overviewPrompt: null });
+  assert.ok(text.length <= 2000);
+  assert.match(text, /custom \(20000 chars\)/);
+  assert.match(text, /"overviewPrompt": "default"/);
+  assert.match(text, /gemini/);
+});
+
+test('the /setup reply still fits when the config itself is huge', () => {
+  const big = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`k${i}`, 'v'.repeat(50)]));
+  assert.ok(formatConfigReply(big).length <= 2000);
+});

@@ -25,8 +25,25 @@ import { withMeetingProgress } from './progress.js';
 import { deliverSavedNotes } from '../delivery/status.js';
 import { retainRecording } from '../voice/recording-archive.js';
 
-// Statuses the UI should offer a retry for.
-export const RETRYABLE_STATUSES = new Set(['transcription_failed', 'summary_failed', 'processing', 'recording']);
+// Statuses the UI should offer a retry for. Never 'recording': that would
+// transcribe partial PCM while capture is still writing it, mark the meeting
+// done and delete the live audio directory. 'processing' stays: boot reconcile
+// only fixes rows stranded by a crash, and a row left 'processing' by an error
+// that escaped the pipeline needs a way out. A pipeline that is really running
+// holds the meeting's progress entry, so withMeetingProgress refuses a second
+// run (and the API hides Retry while progress exists).
+export const RETRYABLE_STATUSES = new Set(['transcription_failed', 'summary_failed', 'processing']);
+
+/**
+ * Whether to offer Retry for a meeting, given its retryPlan. Besides failed
+ * meetings, a finished one whose transcript is known to be partial (some
+ * tracks failed STT) can be re-transcribed while its PCM is still on disk.
+ */
+export function retryEligible(meeting, plan) {
+  if (!meeting || !plan?.ok) return false;
+  if (RETRYABLE_STATUSES.has(meeting.status)) return true;
+  return meeting.status === 'done' && meeting.transcription_complete === 0 && plan.action === 'retranscribe';
+}
 
 
 // Summarize a meeting's stored utterances with the guild's current summarizer

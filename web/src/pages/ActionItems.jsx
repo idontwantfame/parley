@@ -66,7 +66,6 @@ export default function ActionItems() {
   const [error, setError] = useState(null);
   const [person, setPerson] = useState(ALL); // ALL | null(unassigned) | name
   const [showDone, setShowDone] = useState(false);
-  const [version, setVersion] = useState(0);
   const [toggleErr, setToggleErr] = useState(null);
 
   useEffect(() => { setPerson(ALL); setShowDone(false); }, [guildId]);
@@ -79,11 +78,21 @@ export default function ActionItems() {
       .then((rows) => { if (!stale) { setTodos(Array.isArray(rows) ? rows : []); setLoading(false); } })
       .catch((e) => { if (!stale) { setError(e?.message || 'Failed to load'); setLoading(false); } });
     return () => { stale = true; };
-  }, [guildId, showDone, version]);
+  }, [guildId, showDone]);
 
+  // Update the row in place instead of refetching the whole list, so the
+  // list doesn't flash to a skeleton and lose its scroll position per click.
   async function toggle(t) {
-    try { await api.setTodoDone(t.id, !t.done); setVersion((v) => v + 1); setToggleErr(null); }
-    catch (e) { setToggleErr(e?.status === 403 ? 'Only admins can edit action items.' : (e?.message || 'Could not update')); }
+    const done = t.done ? 0 : 1;
+    try {
+      await api.setTodoDone(t.id, Boolean(done));
+      setToggleErr(null);
+      setTodos((prev) => (done && !showDone
+        ? prev.filter((x) => x.id !== t.id)
+        : prev.map((x) => (x.id === t.id ? { ...x, done } : x))));
+    } catch (e) {
+      setToggleErr(e?.status === 403 ? 'Only admins can edit action items.' : (e?.message || 'Could not update'));
+    }
   }
 
   const { canon, people, hasUnassigned } = useMemo(() => {

@@ -137,3 +137,97 @@ test('status() leaves health fields null when /health returns no JSON', async ()
   assert.equal(st.device, null);
   assert.equal(st.batchSize, null);
 });
+
+// ── single-flight start, health timeout, live URL ────────────────────────────
+function makeSlow({ healthy = () => false } = {}) {
+  const spawned = [];
+  const fetch = async () => { if (!healthy()) throw new Error('ECONNREFUSED'); return { ok: true }; };
+  const spawn = () => { const child = fakeChild(); spawned.push(child); return child; };
+  const sc = new SidecarController({ sttUrl: 'http://127.0.0.1:8000', deps: { spawn, fetch, exists: () => true, pollMs: 5 } });
+  return { sc, spawned };
+}
+
+test('a health timeout keeps tracking the child so stop() can still kill it', async () => {
+  const { sc, spawned } = makeSlow();
+  const r = await sc.start({ waitMs: 20 });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /healthy in time/);
+  assert.equal(spawned.length, 1);
+  assert.equal(spawned[0].killed, false, 'a first-run model download keeps going');
+  await sc.stop();
+  assert.equal(spawned[0].killed, true, 'not orphaned');
+});
+
+test('starting again after a health timeout waits on the same child instead of spawning another', async () => {
+  let up = false;
+  const { sc, spawned } = makeSlow({ healthy: () => up });
+  await sc.start({ waitMs: 20 });
+  // Still downloading the model when the user clicks Start again.
+  const again = sc.start({ waitMs: 500 });
+  setTimeout(() => { up = true; }, 30);
+  const r = await again;
+  assert.equal(r.ok, true);
+  assert.equal(spawned.length, 1, 'no second process fighting over the port');
+  assert.equal(spawned[0].killed, false);
+  assert.equal(sc.state, 'running');
+});
+
+test('concurrent start() calls share one spawn', async () => {
+  let up = false;
+  const { sc, spawned } = makeSlow({ healthy: () => up });
+  const a = sc.start({ waitMs: 500 });
+  const b = sc.start({ waitMs: 500 });
+  setTimeout(() => { up = true; }, 30);
+  const [ra, rb] = await Promise.all([a, b]);
+  assert.equal(ra.ok, true);
+  assert.equal(rb.ok, true);
+  assert.equal(spawned.length, 1);
+});
+
+test('the STT URL is read live, so a changed connection setting reaches the controller', () => {
+  let url = 'http://127.0.0.1:8000';
+  const sc = new SidecarController({ sttUrl: () => url, deps: { exists: () => true } });
+  assert.equal(sc.managed(), true);
+  assert.equal(sc.status().url, 'http://127.0.0.1:8000');
+  url = 'http://stt:9000';
+  assert.equal(sc.managed(), false);
+  assert.equal(sc.status().url, 'http://stt:9000');
+});
+
+test('a spawn error forgets the dead child so the next start spawns again', async () => {
+  const { sc, spawned } = makeSlow();
+  const first = sc.start({ waitMs: 200 });
+  while (!spawned.length) await new Promise((r) => setTimeout(r, 1));
+  spawned[0].emit('error', new Error('spawn ENOENT'));
+  assert.equal((await first).ok, false);
+  await sc.start({ waitMs: 20 });
+  assert.equal(spawned.length, 2);
+});
+
+test('stop() during the health wait is not overwritten by the timeout', async () => {
+  const { sc } = makeSlow();
+  const pending = sc.start({ waitMs: 60 });
+  await new Promise((r) => setTimeout(r, 10));
+  await sc.stop();
+  const r = await pending;
+  assert.equal(r.ok, false);
+  assert.equal(sc.state, 'stopped');
+});
+
+test('stop() during the initial health probe prevents the spawn (no orphan)', async () => {
+  let releaseProbe;
+  const spawned = [];
+  let probes = 0;
+  const fetch = () => (probes++ === 0
+    ? new Promise((_, reject) => { releaseProbe = () => reject(new Error('ECONNREFUSED')); })
+    : Promise.reject(new Error('ECONNREFUSED')));
+  const spawn = () => { const c = fakeChild(); spawned.push(c); return c; };
+  const sc = new SidecarController({ sttUrl: 'http://127.0.0.1:8000', deps: { spawn, fetch, exists: () => true, pollMs: 5 } });
+  const starting = sc.start({ waitMs: 50 });
+  await sc.stop();
+  releaseProbe();
+  const r = await starting;
+  assert.equal(r.ok, false);
+  assert.equal(spawned.length, 0);
+  assert.equal(sc.state, 'stopped');
+});

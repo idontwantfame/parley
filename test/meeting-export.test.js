@@ -203,3 +203,14 @@ test('CLI regenerates both files from persistent SQLite without STT or a summari
   assert.equal(data.utterances[0].text, 'Saved text');
   assert.ok((await readdir(config.exportDir)).some((n) => n.endsWith('.md')));
 });
+
+import { renderMeetingMarkdown } from '../src/delivery/meeting-export.js';
+
+test('the Markdown export includes the meeting duration', () => {
+  const md = renderMeetingMarkdown({
+    meeting: { id: 1, channel_name: 'Planning', started_at: '2026-10-01T10:00:00Z', ended_at: '2026-10-01T10:45:00Z', status: 'done' },
+    summary: { notes: { tldr: 't', topics: [], decisions: [], openQuestions: [], actionItems: [] }, talktime: [] },
+    attendees: [], utterances: [],
+  });
+  assert.match(md, /Meeting duration:\*\* 45 min/);
+});

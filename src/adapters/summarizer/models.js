@@ -80,10 +80,18 @@ const OPENAI_NON_TEXT = /transcribe|tts|audio|realtime|whisper|embedding|moderat
 const CACHE_TTL_MS = 10 * 60 * 1000; // live catalogs barely change
 const ERROR_TTL_MS = 30 * 1000;      // don't hammer a dead endpoint per keystroke
 const cache = new Map(); // provider -> { until, payload }
+// provider -> Promise<payload> while a catalog fetch is running, so a cold
+// cache hit by every autocomplete keystroke triggers one request, not dozens.
+const inFlight = new Map();
 
 export function clearModelCache(provider) {
-  if (provider) cache.delete(provider);
-  else cache.clear();
+  if (provider) {
+    cache.delete(provider);
+    inFlight.delete(provider);
+  } else {
+    cache.clear();
+    inFlight.clear();
+  }
 }
 
 /** "1M" / "128K" / "8192" — compact context-window label. */
@@ -245,14 +253,29 @@ export async function listModels(provider, {
 
   const hit = cache.get(provider);
   if (!refresh && hit && hit.until > now()) return hit.payload;
+  if (!refresh && inFlight.has(provider)) return inFlight.get(provider);
 
-  let payload;
+  const request = fetchCatalog(fetcher, base, curated, { env, fetchImpl, timeoutMs, now })
+    .then((payload) => {
+      // A cleared cache or a newer refresh supersedes this answer.
+      if (inFlight.get(provider) === request) {
+        cache.set(provider, { until: now() + (payload.source === 'live' ? CACHE_TTL_MS : ERROR_TTL_MS), payload });
+      }
+      return payload;
+    })
+    .finally(() => { if (inFlight.get(provider) === request) inFlight.delete(provider); });
+  inFlight.set(provider, request);
+  return request;
+}
+
+// One catalog fetch; never throws (falls back to the curated shortlist).
+async function fetchCatalog(fetcher, base, curated, { env, fetchImpl, timeoutMs, now }) {
   try {
     const models = dedupe(await fetcher({ env, fetchImpl, timeoutMs }));
     if (!models.length) throw new Error('provider returned no models');
-    payload = { ...base, models: order(models, curated), source: 'live', error: null, fetchedAt: now() };
+    return { ...base, models: order(models, curated), source: 'live', error: null, fetchedAt: now() };
   } catch (err) {
-    payload = {
+    return {
       ...base,
       models: curated.map((id) => entry(id)),
       source: 'curated',
@@ -260,8 +283,6 @@ export async function listModels(provider, {
       fetchedAt: now(),
     };
   }
-  cache.set(provider, { until: now() + (payload.source === 'live' ? CACHE_TTL_MS : ERROR_TTL_MS), payload });
-  return payload;
 }
 
 /**

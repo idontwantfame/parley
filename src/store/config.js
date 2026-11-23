@@ -24,26 +24,6 @@ export const DEFAULTS = {
   overviewPrompt: null,
 };
 
-const COLS = {
-  summarizerProvider: 'summarizer_provider',
-  summarizerModel: 'summarizer_model',
-  summarizerFallbackProvider: 'summarizer_fallback_provider',
-  summarizerFallbackModel: 'summarizer_fallback_model',
-  sttProvider: 'stt_provider',
-  sttModel: 'stt_model',
-  whisperModel: 'whisper_model',
-  notesChannelId: 'notes_channel_id',
-  useThread: 'use_thread',
-  autoJoin: 'auto_join',
-  autoJoinMinPeople: 'auto_join_min_people',
-  autoJoinChannelIds: 'auto_join_channel_ids',
-  keepAudio: 'keep_audio',
-  language: 'language',
-  summaryLanguage: 'summary_language',
-  summaryPrompt: 'summary_prompt',
-  overviewPrompt: 'overview_prompt',
-};
-
 function parseAutoJoinChannels(value) {
   if (value == null) return null;
   try {
@@ -113,5 +93,3 @@ export function setGuildConfig(db, guildId, patch) {
   });
   return merged;
 }
-
-export const CONFIG_COLS = COLS;

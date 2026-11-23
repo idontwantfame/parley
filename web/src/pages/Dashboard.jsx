@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api.js';
 import { useGuild } from '../GuildContext.jsx';
@@ -9,6 +9,10 @@ import { LiveCard } from '../components/Live.jsx';
 import { Sparkline, RankBars } from '../components/charts.jsx';
 import { Avatar, Icon, Empty } from '../components/ui.jsx';
 import { fmtHours, fmtCompact, fmtMs, colorOf } from '../lib/format.js';
+
+const RECENT_SHOWN = 4;
+// Fetch a few extra: meetings with no transcript are filtered out client-side.
+const RECENT_FETCH = 12;
 
 function StatCard({ icon: IconC, label, value, sub, tint = 'var(--primary)' }) {
   return (
@@ -51,12 +55,20 @@ export default function Dashboard() {
   const [todos, setTodos] = useState([]);
   const [error, setError] = useState(null);
 
+  // Refetch when a live session ends (its notes become a new recent meeting),
+  // without flashing the skeleton; only a server switch resets the page.
+  const liveCount = live.length;
+  const shownGuild = useRef(null);
   useEffect(() => {
     if (!guildId) return;
     let stale = false;
-    setMeetings(null); setAgg(null); setError(null);
+    if (shownGuild.current !== guildId) {
+      shownGuild.current = guildId;
+      setMeetings(null); setAgg(null);
+    }
+    setError(null);
     Promise.all([
-      api.meetings(guildId),
+      api.meetings(guildId, { limit: RECENT_FETCH }),
       api.stats(guildId),
       api.todos(guildId, { open: true }),
     ]).then(([m, a, t]) => {
@@ -66,14 +78,14 @@ export default function Dashboard() {
       setTodos(Array.isArray(t) ? t : []);
     }).catch((e) => { if (!stale) setError(e?.message || 'Failed to load'); });
     return () => { stale = true; };
-  }, [guildId]);
+  }, [guildId, liveCount]);
 
   if (!guildId) return <Page><Empty icon={Icon.Home} title="No server selected" body="Pick a Discord server from the switcher to see its dashboard." /></Page>;
   if (error) return <Page><Empty icon={Icon.Home} title="Couldn't load dashboard" body={error} /></Page>;
   if (!meetings || !agg) return <StatSkeleton />;
 
   const { stats, leaderboard, timeline } = agg;
-  const recent = meetings.slice(0, 4);
+  const recent = meetings.slice(0, RECENT_SHOWN);
   const lbRows = leaderboard.slice(0, 5).map((p) => ({
     label: p.displayName, value: p.ms, display: fmtMs(p.ms), color: colorOf(p.displayName),
   }));

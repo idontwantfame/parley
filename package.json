@@ -6,6 +6,7 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node --env-file=.env src/index.js",
+    "postinstall": "node -e \"import('./scripts/patch-discord-voice.mjs').catch((e) => { if (e.code !== 'ERR_MODULE_NOT_FOUND') throw e; })\"",
     "test": "node --env-file-if-exists=.env --test",
     "sidecar": "stt_sidecar/.venv/bin/python stt_sidecar/server.py",
     "make:art": "node scripts/make-brand-art.mjs",
@@ -27,9 +28,10 @@
     "express": "^5.2.1",
     "libsodium-wrappers": "^0.7.15",
     "opusscript": "^0.0.8",
-    "prism-media": "^1.3.5"
+    "prism-media": "^1.3.5",
+    "undici": "^6.29.1"
   },
   "devDependencies": {
-    "sharp": "^0.34.5"
+    "sharp": "^0.35.5"
   }
 }

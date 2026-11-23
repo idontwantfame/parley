@@ -2,9 +2,14 @@ import { NOTES_SCHEMA } from './gemini.js';
 import { normalizeNotes, summaryPrompt } from './notes.js';
 import { summaryLanguageInstruction } from './languages.js';
 import { httpError, withRetry } from './errors.js';
+import { fetchWithTimeouts, withTimeoutMessage } from '../http.js';
+import { stripThinking } from './parse.js';
 import { config } from '../../config/env.js';
 
 const CONTEXT_TOKENS = 8192;
+// Local CPU inference of a full chunk (num_predict up to 3000) can take many
+// minutes, and with stream:false Ollama sends no headers until it is done.
+const DEFAULT_TIMEOUT_MS = 900_000;
 const TRANSCRIPT_CHUNK_SIZE = 6500;
 const OVERVIEW_GROUP_SIZE = 8;
 export const DEFAULT_OVERVIEW_PROMPT = 'Write a 2–4 sentence overview using only the chronological summaries below.';
@@ -64,21 +69,24 @@ function combineNotes(parts, tldr) {
 }
 
 export class OllamaSummarizer {
-  constructor(model, url = config.ollama.url, fetchImpl = fetch, { overviewPrompt } = {}) {
-    this.model = model; this.url = url; this.fetchImpl = fetchImpl;
+  constructor(model, url = config.ollama.url, fetchImpl, { overviewPrompt, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+    this.model = model; this.url = url;
+    this.timeoutMs = timeoutMs;
+    this.fetchImpl = fetchImpl ?? fetchWithTimeouts(timeoutMs);
     this.overviewPrompt = overviewPrompt ?? DEFAULT_OVERVIEW_PROMPT;
   }
 
-  async chat(prompt, settings = {}) {
-    return withRetry(async () => {
+  chat(prompt, settings = {}) {
+    return withTimeoutMessage(() => withRetry(async () => {
       const res = await this.fetchImpl(`${this.url}/api/chat`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ model: this.model, stream: false, messages: [{ role: 'user', content: prompt }], ...settings }),
+        signal: AbortSignal.timeout(this.timeoutMs),
       });
       if (!res.ok) throw httpError('Ollama', res.status, await res.text().catch(() => ''));
       return res.json();
-    });
+    }), 'Ollama', this.timeoutMs);
   }
 
   async structuredResponse(prompt, format, numPredict) {
@@ -164,6 +172,6 @@ export class OllamaSummarizer {
   async ask(prompt) {
     const body = await this.chat(prompt, { options: { num_ctx: CONTEXT_TOKENS, num_predict: 1800 } });
     if (body.done_reason === 'length') throw new Error('Ollama reached its output limit.');
-    return body.message?.content ?? '';
+    return stripThinking(body.message?.content ?? '');
   }
 }

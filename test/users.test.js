@@ -4,24 +4,24 @@ import assert from 'node:assert/strict';
 import { openDb } from '../src/store/db.js';
 import { installUsers, hashPassword, verifyPassword } from '../src/store/users.js';
 
-test('hashPassword + verifyPassword round-trips and rejects wrong passwords', () => {
+test('hashPassword + verifyPassword round-trips and rejects wrong passwords', async () => {
   const h = hashPassword('hunter2');
   assert.ok(h.startsWith('scrypt$'));
-  assert.equal(verifyPassword('hunter2', h), true);
-  assert.equal(verifyPassword('nope', h), false);
-  assert.equal(verifyPassword('hunter2', 'garbage'), false);
+  assert.equal(await verifyPassword('hunter2', h), true);
+  assert.equal(await verifyPassword('nope', h), false);
+  assert.equal(await verifyPassword('hunter2', 'garbage'), false);
 });
 
-test('installUsers seeds a default admin / admin on first run', () => {
+test('installUsers seeds a default admin / admin on first run', async () => {
   const db = openDb(':memory:');
   const users = installUsers(db);
   assert.equal(users.countUsers(), 1);
-  const admin = users.authenticate('admin', 'admin');
+  const admin = await users.authenticate('admin', 'admin');
   assert.ok(admin);
   assert.equal(admin.isAdmin, true);
   assert.equal(admin.mustChangePassword, true);
   // Wrong password fails.
-  assert.equal(users.authenticate('admin', 'wrong'), null);
+  assert.equal(await users.authenticate('admin', 'wrong'), null);
 });
 
 test('installUsers does not duplicate the admin on re-install', () => {
@@ -32,10 +32,10 @@ test('installUsers does not duplicate the admin on re-install', () => {
   assert.equal(users.countUsers(), 1);
 });
 
-test('username lookup is case-insensitive', () => {
+test('username lookup is case-insensitive', async () => {
   const db = openDb(':memory:');
   const users = installUsers(db);
-  assert.ok(users.authenticate('ADMIN', 'admin'));
+  assert.ok(await users.authenticate('ADMIN', 'admin'));
 });
 
 test('createUser enforces unique usernames', () => {
@@ -45,13 +45,13 @@ test('createUser enforces unique usernames', () => {
   assert.throws(() => users.createUser({ username: 'Jane', password: 'other' }), /taken/i);
 });
 
-test('setPassword clears must_change_password and changes the credential', () => {
+test('setPassword clears must_change_password and changes the credential', async () => {
   const db = openDb(':memory:');
   const users = installUsers(db);
   const admin = users.getUserByUsername('admin');
   users.setPassword(admin.id, 'newsecret');
-  assert.equal(users.authenticate('admin', 'admin'), null);
-  const after = users.authenticate('admin', 'newsecret');
+  assert.equal(await users.authenticate('admin', 'admin'), null);
+  const after = await users.authenticate('admin', 'newsecret');
   assert.ok(after);
   assert.equal(after.mustChangePassword, false);
 });

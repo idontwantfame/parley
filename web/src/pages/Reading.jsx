@@ -1,8 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { api } from '../api.js';
-import { useGuild } from '../GuildContext.jsx';
-import { useAuth } from '../AuthContext.jsx';
+import { useIsAdmin } from '../AuthContext.jsx';
 import { ProgressText } from '../components/Live.jsx';
 import { Avatar, AvatarStack, Icon, Empty, TalkBar } from '../components/ui.jsx';
 import { fmtDateLong, fmtTime, fmtDuration, fmtClock, fmtMs, colorOf } from '../lib/format.js';
@@ -25,18 +24,20 @@ const STATUS_COPY = {
   },
 };
 
-function RetryBanner({ meeting, retry, onDone }) {
+function RetryBanner({ meeting, retry, outcome, onStarted }) {
+  const isAdmin = useIsAdmin();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const copy = STATUS_COPY[meeting.status] || { title: 'Needs attention', body: `Status: ${meeting.status}.` };
-  const canRetry = retry?.eligible;
+  const canRetry = retry?.eligible && isAdmin;
 
+  // The server answers 202 as soon as the retry is queued; progress is then
+  // followed by the note's poller rather than one long blocking request.
   async function run() {
     setBusy(true); setErr(null);
     try {
-      const r = await api.retryMeeting(meeting.id);
-      if (!r.ok) { setErr(r.error || r.reason || 'Retry failed.'); }
-      else { onDone?.(); }
+      await api.retryMeeting(meeting.id);
+      onStarted?.();
     } catch (e) {
       setErr(e?.message || 'Retry failed.');
     } finally {
@@ -51,9 +52,11 @@ function RetryBanner({ meeting, retry, onDone }) {
         <div className="min-w-0 flex-1">
           <p className="text-[15px] font-semibold text-ink">{copy.title}</p>
           <p className="text-[13.5px] text-muted leading-relaxed mt-1">{copy.body}</p>
-          {!canRetry && retry?.reason && <p className="text-[13px] text-error mt-2">{retry.reason}</p>}
-          {err && <p className="text-[13px] text-error mt-2">{err}</p>}
-          <div className="mt-3.5 flex items-center gap-2">
+          {!retry?.eligible && retry?.reason && <p className="text-[13px] text-error mt-2">{retry.reason}</p>}
+          {retry?.eligible && !isAdmin && <p className="text-[13px] text-muted mt-2">Ask an admin to retry this meeting.</p>}
+          {outcome && <p className="text-[13px] text-error mt-2" role="alert">{outcome}</p>}
+          {err && <p className="text-[13px] text-error mt-2" role="alert">{err}</p>}
+          {isAdmin && <div className="mt-3.5 flex items-center gap-2">
             <button onClick={run} disabled={!canRetry || busy} className="btn btn-primary !py-2">
               {busy ? (
                 <span className="inline-flex items-center gap-2"><span className="h-3.5 w-3.5 rounded-full border-2 border-current border-t-transparent animate-spin" />Retrying…</span>
@@ -61,7 +64,7 @@ function RetryBanner({ meeting, retry, onDone }) {
                 <span className="inline-flex items-center gap-2"><Icon.Refresh width={15} height={15} />Retry {retry?.action === 'retranscribe' ? 'transcription' : 'summary'}</span>
               )}
             </button>
-          </div>
+          </div>}
         </div>
       </div>
     </div>
@@ -70,24 +73,31 @@ function RetryBanner({ meeting, retry, onDone }) {
 
 /* ── action item (in-note, checkable) ─────────────────────────────────── */
 function ActionItem({ item, todo, onToggle }) {
+  const isAdmin = useIsAdmin();
   const [done, setDone] = useState(Boolean(todo?.done));
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
   useEffect(() => { if (todo) setDone(Boolean(todo.done)); }, [todo]);
 
   async function change() {
     if (!todo || busy) return;
     const next = !done;
-    setDone(next); setBusy(true);
+    setDone(next); setBusy(true); setErr(null);
     try { await api.setTodoDone(todo.id, next); onToggle?.(); }
-    catch { setDone(!next); }
+    catch (e) {
+      setDone(!next);
+      setErr(e?.status === 403 ? 'Only admins can edit action items.' : (e?.message || 'Could not update this item.'));
+    }
     finally { setBusy(false); }
   }
 
   return (
     <li className="flex items-start gap-3 group">
-      <input type="checkbox" checked={done} onChange={change} disabled={!todo || busy} className="pcheck mt-0.5" aria-label={item.task} />
+      <input type="checkbox" checked={done} onChange={change} disabled={!todo || busy || !isAdmin}
+        title={isAdmin ? undefined : 'Only admins can edit action items.'} className="pcheck mt-0.5" aria-label={item.task} />
       <div className="min-w-0">
         <span className={`text-[14.5px] leading-relaxed ${done ? 'line-through text-muted' : 'text-ink'}`}>{item.task}</span>
+        {err && <span className="block text-xs text-error mt-0.5" role="alert">{err}</span>}
         {item.assignee && (
           <span className="ml-2 inline-flex items-center gap-1.5 align-middle chip">
             <Avatar name={item.assignee} size={16} />{item.assignee}
@@ -102,11 +112,14 @@ function ActionItem({ item, todo, onToggle }) {
 function Transcript({ utterances }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState('');
+  // Filtering a multi-hour transcript on every keystroke is expensive; let the
+  // input stay responsive and filter against the deferred query.
+  const deferredQ = useDeferredValue(q);
+  const filtered = useMemo(() => {
+    const needle = deferredQ.trim().toLowerCase();
+    return needle ? utterances.filter((u) => u.text.toLowerCase().includes(needle)) : utterances;
+  }, [utterances, deferredQ]);
   if (!utterances.length) return null;
-
-  const filtered = q.trim()
-    ? utterances.filter((u) => u.text.toLowerCase().includes(q.toLowerCase()))
-    : utterances;
 
   return (
     <section className="mt-10 pt-8 border-t border-border">
@@ -125,7 +138,7 @@ function Transcript({ utterances }) {
         <div className="space-y-4">
           {filtered.length === 0 && <p className="text-sm text-muted">No lines match "{q}".</p>}
           {filtered.map((u, i) => (
-            <div key={i} className="flex items-start gap-3">
+            <div key={u.id ?? i} className="flex items-start gap-3">
               <Avatar name={u.display_name} size={28} />
               <div className="min-w-0">
                 <div className="flex items-baseline gap-2">
@@ -191,14 +204,36 @@ function AskBox({ guildId, meetingId }) {
 }
 
 /* ── meeting actions (export / regenerate / merge / delete) ────────────── */
-function MeetingActions({ meeting, meetings, regenerate, regenerating, onRegenerate, hasAudio, onReload }) {
-  const { user, authEnabled } = useAuth();
+// Merge candidates: other meetings from this meeting's own server (never the
+// server-switcher's selection), loaded only when the merge picker opens.
+function useMergeCandidates(meeting, active) {
+  const [state, setState] = useState({ rows: null, error: null });
+  useEffect(() => {
+    if (!active) return undefined;
+    let stale = false;
+    setState({ rows: null, error: null });
+    api.meetings(meeting.guild_id)
+      .then((rows) => {
+        if (stale) return;
+        const list = (Array.isArray(rows) ? rows : [])
+          .filter((m) => m.id !== meeting.id && ((m.utterance_count ?? 1) > 0 || m.failed));
+        setState({ rows: list, error: null });
+      })
+      .catch((e) => { if (!stale) setState({ rows: [], error: e?.message || 'Could not load meetings.' }); });
+    return () => { stale = true; };
+  }, [meeting.id, meeting.guild_id, active]);
+  return state;
+}
+
+function MeetingActions({ meeting, regenerate, regenerating, onRegenerate, hasAudio, onReload }) {
+  const isAdmin = useIsAdmin();
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState(false); // false | 'pick' | 'busy'
   const [sources, setSources] = useState(() => new Set());
   const [err, setErr] = useState(null);
-  const others = (meetings || []).filter((m) => m.id !== meeting.id);
+  const candidates = useMergeCandidates(meeting, !!mode);
+  const others = candidates.rows ?? [];
   // Close the menu/merge popover on outside click or Escape (a11y).
   const ref = useDismissable(open || !!mode, () => { setOpen(false); if (mode !== 'busy') setMode(false); });
 
@@ -212,7 +247,7 @@ function MeetingActions({ meeting, meetings, regenerate, regenerating, onRegener
   async function merge() {
     if (sources.size === 0) return;
     setMode('busy'); setErr(null);
-    try { await api.mergeMeetings(meeting.id, [...sources]); setMode(false); setSources(new Set()); navigate(0); }
+    try { await api.mergeMeetings(meeting.id, [...sources]); setMode(false); setSources(new Set()); onReload?.(); }
     catch (e) { setErr(e?.message || 'Merge failed'); setMode('pick'); }
   }
 
@@ -235,7 +270,7 @@ function MeetingActions({ meeting, meetings, regenerate, regenerating, onRegener
               <Icon.Download width={15} height={15} /> Download recording
             </a>
           )}
-          {hasAudio && (!authEnabled || user?.isAdmin) && (
+          {hasAudio && isAdmin && (
             <button role="menuitem" onClick={async () => {
               setOpen(false);
               if (!window.confirm('Delete this recording? The transcript and notes will stay.')) return;
@@ -245,25 +280,32 @@ function MeetingActions({ meeting, meetings, regenerate, regenerating, onRegener
               <Icon.Trash width={15} height={15} /> Delete recording
             </button>
           )}
-          <button role="menuitem" onClick={() => { setOpen(false); onRegenerate?.(); }}
-            disabled={!regenerate?.eligible || regenerating}
-            title={!regenerate?.eligible && regenerate?.reason ? regenerate.reason : 'Re-run the summary with the current summarizer settings'}
-            className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-ink hover:bg-surface-2 disabled:opacity-40">
-            <Icon.Refresh width={15} height={15} /> Regenerate summary
-          </button>
-          <button role="menuitem" onClick={() => { setMode('pick'); setOpen(false); }} disabled={others.length === 0}
-            className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-ink hover:bg-surface-2 disabled:opacity-40">
-            <Icon.Merge width={15} height={15} /> Merge another meeting
-          </button>
-          <button role="menuitem" onClick={del} className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-error hover:bg-error-soft">
-            <Icon.Trash width={15} height={15} /> Delete meeting
-          </button>
+          {isAdmin && (
+            <>
+              <button role="menuitem" onClick={() => { setOpen(false); onRegenerate?.(); }}
+                disabled={!regenerate?.eligible || regenerating}
+                title={!regenerate?.eligible && regenerate?.reason ? regenerate.reason : 'Re-run the summary with the current summarizer settings'}
+                className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-ink hover:bg-surface-2 disabled:opacity-40">
+                <Icon.Refresh width={15} height={15} /> Regenerate summary
+              </button>
+              <button role="menuitem" onClick={() => { setErr(null); setMode('pick'); setOpen(false); }}
+                className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-ink hover:bg-surface-2">
+                <Icon.Merge width={15} height={15} /> Merge another meeting
+              </button>
+              <button role="menuitem" onClick={del} className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-error hover:bg-error-soft">
+                <Icon.Trash width={15} height={15} /> Delete meeting
+              </button>
+            </>
+          )}
         </div>
       )}
       {mode && (
         <div className="absolute right-0 mt-1.5 w-80 card shadow-lg p-3 z-20">
           <p className="text-sm font-semibold text-ink mb-2">Merge into this note</p>
           <div className="max-h-64 overflow-y-auto -mx-1 px-1 space-y-0.5">
+            {candidates.rows === null && <p className="text-xs text-muted px-2 py-1.5">Loading meetings…</p>}
+            {candidates.error && <p className="text-xs text-error px-2 py-1.5">{candidates.error}</p>}
+            {candidates.rows?.length === 0 && !candidates.error && <p className="text-xs text-muted px-2 py-1.5">No other meetings to merge.</p>}
             {others.map((m) => (
               <label key={m.id} className="flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-surface-2 cursor-pointer text-sm">
                 <input type="checkbox" className="pcheck h-4 w-4" checked={sources.has(m.id)} onChange={() => toggle(m.id)} disabled={mode === 'busy'} />
@@ -287,11 +329,10 @@ function MeetingActions({ meeting, meetings, regenerate, regenerating, onRegener
 }
 
 /* ── prev/next meeting nav ────────────────────────────────────────────── */
-function MeetingNav({ meetings, id }) {
-  const idx = meetings.findIndex((m) => String(m.id) === String(id));
-  if (idx === -1) return null;
-  const newer = meetings[idx - 1]; // list is newest-first
-  const older = meetings[idx + 1];
+function MeetingNav({ neighbors }) {
+  const older = neighbors?.older;
+  const newer = neighbors?.newer;
+  if (!older && !newer) return null;
   return (
     <div className="flex items-center justify-between gap-3 mt-12 pt-6 border-t border-border">
       {older ? (
@@ -311,38 +352,77 @@ function MeetingNav({ meetings, id }) {
 }
 
 /* ── note document ────────────────────────────────────────────────────── */
-function Note({ data, todos, guildId, meetings, refetchTodos, onReload }) {
-  const { meeting, summary, attendees, utterances, retry } = data;
-  const notes = summary?.notes;
-  const duration = fmtDuration(meeting.started_at, meeting.ended_at);
-  const meetingTodos = todos.filter((t) => String(t.meeting_id) === String(meeting.id));
-  const [progress, setProgress] = useState(data.progress);
-  const running = !!progress;
-  const isFailed = !running && ['transcription_failed', 'summary_failed', 'processing'].includes(meeting.status);
-  const [regen, setRegen] = useState(() => ({
-    busy: data.regenerate?.state === 'running', err: data.regenerate?.error ?? null,
-  }));
-  const [starting, setStarting] = useState(false);
+const PROGRESS_POLL_MS = 2500;
+// Polls with no progress and an unchanged status before giving up (~20 s): a
+// meeting left "processing" by a crash would otherwise be polled forever.
+const IDLE_POLL_LIMIT = 8;
 
+// Follows server-side processing (transcription, summary, a retry) for one
+// meeting. Pauses while the tab is hidden and stops once nothing is running.
+function useMeetingProgress(meeting, initial, onReload) {
+  const [progress, setProgress] = useState(initial);
+  const [watching, setWatching] = useState(false);
+  const [outcome, setOutcome] = useState(null);
+  const watchingRef = useRef(false);
+  useEffect(() => { setProgress(initial); }, [initial]);
+
+  const active = Boolean(progress) || watching || meeting.status === 'processing';
   useEffect(() => {
-    if (!running && meeting.status !== 'processing') return;
+    if (!active) return undefined;
     let stop = false;
     let timer;
+    let idle = 0;
+    let sawProgress = false;
+    function finish(message) {
+      if (watchingRef.current && message) setOutcome(message);
+      watchingRef.current = false;
+      setWatching(false);
+      onReload?.();
+    }
     async function poll() {
+      if (stop) return;
+      if (document.hidden) { timer = setTimeout(poll, PROGRESS_POLL_MS); return; }
       try {
         const current = await api.meetingProgress(meeting.id);
         if (stop) return;
         setProgress(current.progress);
-        if (!current.progress && current.status !== meeting.status) {
-          onReload?.();
-          return;
+        if (current.progress) { sawProgress = true; idle = 0; }
+        else if (current.status !== meeting.status) return finish(null);
+        else if (sawProgress || ++idle >= IDLE_POLL_LIMIT) {
+          return finish('The retry ended without fixing this meeting. Check the server log for details.');
         }
       } catch { /* Retry after a temporary connection failure. */ }
-      if (!stop) timer = setTimeout(poll, 2500);
+      if (!stop) timer = setTimeout(poll, PROGRESS_POLL_MS);
     }
     void poll();
     return () => { stop = true; clearTimeout(timer); };
-  }, [running, meeting.id, meeting.status, onReload]);
+  }, [active, meeting.id, meeting.status, onReload]);
+
+  const watchRetry = useCallback(() => {
+    watchingRef.current = true;
+    setOutcome(null);
+    setWatching(true);
+  }, []);
+  return { progress, watching, outcome, watchRetry };
+}
+
+function findTodo(todos, item) {
+  return todos.find((t) => t.task === item.task && (t.assignee ?? null) === (item.assignee ?? null))
+    ?? todos.find((t) => t.task === item.task) ?? null;
+}
+
+function Note({ data, onReload }) {
+  const { meeting, summary, attendees, utterances, retry } = data;
+  const notes = summary?.notes;
+  const duration = fmtDuration(meeting.started_at, meeting.ended_at);
+  const todos = data.todos ?? [];
+  const { progress, watching, outcome, watchRetry } = useMeetingProgress(meeting, data.progress, onReload);
+  const running = !!progress;
+  const isFailed = !running && !watching && ['transcription_failed', 'summary_failed', 'processing'].includes(meeting.status);
+  const [regen, setRegen] = useState(() => ({
+    busy: data.regenerate?.state === 'running', err: data.regenerate?.error ?? null,
+  }));
+  const [starting, setStarting] = useState(false);
 
   useEffect(() => {
     if (!regen.busy) return;
@@ -395,7 +475,7 @@ function Note({ data, todos, guildId, meetings, refetchTodos, onReload }) {
               {attendees?.length > 0 && <span className="inline-flex items-center gap-1.5"><Icon.Users width={14} height={14} />{attendees.length} attendees</span>}
             </p>
           </div>
-          <MeetingActions meeting={meeting} meetings={meetings} regenerate={data.regenerate}
+          <MeetingActions meeting={meeting} regenerate={data.regenerate}
             regenerating={starting || regen.busy} onRegenerate={regenerateSummary} hasAudio={data.hasAudio} onReload={onReload} />
         </div>
 
@@ -406,8 +486,9 @@ function Note({ data, todos, guildId, meetings, refetchTodos, onReload }) {
         )}
       </header>
 
-      {isFailed && <RetryBanner meeting={meeting} retry={retry} onDone={onReload} />}
+      {isFailed && <RetryBanner meeting={meeting} retry={retry} outcome={outcome} onStarted={watchRetry} />}
       {running && !regen.busy && <p className="card p-4 mt-8 text-sm text-muted" role="status"><ProgressText progress={progress} /></p>}
+      {watching && !running && <p className="card p-4 mt-8 text-sm text-muted" role="status">Retry queued…</p>}
       {summary && meeting.status === 'done' &&
         <DiscordDelivery meeting={meeting} summary={summary} target={data.deliveryTarget} onReload={onReload} busy={running || regen.busy} />}
 
@@ -489,10 +570,9 @@ function Note({ data, todos, guildId, meetings, refetchTodos, onReload }) {
                 <Icon.CheckSquare width={16} height={16} className="text-primary" /> Action items
               </h2>
               <ul className="space-y-3">
-                {notes.actionItems.map((item) => {
-                  const todo = meetingTodos.find((t) => t.task === item.task) ?? null;
-                  return <ActionItem key={item.task} item={item} todo={todo} onToggle={refetchTodos} />;
-                })}
+                {notes.actionItems.map((item, i) => (
+                  <ActionItem key={`${i}:${item.task}`} item={item} todo={findTodo(todos, item)} onToggle={onReload} />
+                ))}
               </ul>
             </section>
           )}
@@ -517,14 +597,14 @@ function Note({ data, todos, guildId, meetings, refetchTodos, onReload }) {
       )}
 
       <Transcript utterances={utterances ?? []} />
-      {guildId && <AskBox guildId={guildId} meetingId={meeting.id} />}
-      <MeetingNav meetings={meetings} id={meeting.id} />
+      {meeting.guild_id && <AskBox guildId={meeting.guild_id} meetingId={meeting.id} />}
+      <MeetingNav neighbors={data.neighbors} />
     </article>
   );
 }
 
 function DiscordDelivery({ meeting, summary, target, onReload, busy }) {
-  const { user, authEnabled } = useAuth();
+  const isAdmin = useIsAdmin();
   const [posting, setPosting] = useState(false);
   const [error, setError] = useState(null);
   const status = meeting.delivery_status;
@@ -557,7 +637,7 @@ function DiscordDelivery({ meeting, summary, target, onReload, busy }) {
         <p role="status">{label}</p>
         {(error || meeting.delivery_error) && <p className="text-xs text-error" role="alert">{error || meeting.delivery_error}</p>}
       </div>
-      {(!authEnabled || user?.isAdmin) &&
+      {isAdmin &&
         <button className="btn btn-ghost" onClick={post} disabled={!target || busy || posting || status === 'sending'}>
           {posting ? 'Posting…' : 'Post to Discord'}
         </button>}
@@ -587,52 +667,41 @@ function NoteSkeleton() {
 
 export default function Reading() {
   const { id } = useParams();
-  const { guildId } = useGuild();
-  const [meetings, setMeetings] = useState([]);
   const [data, setData] = useState(null);
-  const [todos, setTodos] = useState([]);
-  const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-
-  useEffect(() => {
-    if (!guildId) return;
-    let stale = false;
-    api.meetings(guildId)
-      .then((rows) => { if (!stale) setMeetings((Array.isArray(rows) ? rows : []).filter((m) => (m.utterance_count ?? 1) > 0 || m.failed)); })
-      .catch(() => { if (!stale) setMeetings([]); });
-    return () => { stale = true; };
-  }, [guildId]);
-
-  function loadTodos() {
-    if (!guildId) return;
-    api.todos(guildId).then((t) => setTodos(Array.isArray(t) ? t : [])).catch(() => {});
-  }
+  const [reloadError, setReloadError] = useState(null);
+  // The meeting carries its own guild, todos and prev/next neighbours, so this
+  // page never depends on the server switcher (a deep link or reload into
+  // another server's meeting keeps working). `current` tags each request with
+  // the id it was made for so a slow response for the previous meeting can't
+  // replace the one now on screen.
+  const current = useRef(id);
+  current.current = id;
 
   const reloadMeeting = useCallback(() => {
-    if (!id || !guildId) return;
-    Promise.all([api.meeting(id), api.todos(guildId)])
-      .then(([m, t]) => { setData(m); setTodos(Array.isArray(t) ? t : []); })
-      .catch(() => {});
-    api.meetings(guildId).then((rows) => setMeetings((Array.isArray(rows) ? rows : []).filter((m) => (m.utterance_count ?? 1) > 0 || m.failed))).catch(() => {});
-  }, [id, guildId]);
+    const forId = id;
+    api.meeting(forId)
+      .then((m) => { if (current.current === forId) { setData(m); setReloadError(null); } })
+      // Keep showing what we have; say the refresh failed instead of hiding it.
+      .catch((e) => { if (current.current === forId) setReloadError(e?.message || 'Could not refresh this meeting.'); });
+  }, [id]);
 
   useEffect(() => {
-    if (!id || !guildId) return;
     let stale = false;
-    setLoading(true); setError(null); setData(null);
-    Promise.all([api.meeting(id), api.todos(guildId)])
-      .then(([m, t]) => { if (stale) return; setData(m); setTodos(Array.isArray(t) ? t : []); })
-      .catch((e) => { if (!stale) setError(e?.message || 'Failed to load meeting'); })
-      .finally(() => { if (!stale) setLoading(false); });
+    setError(null); setReloadError(null); setData(null);
+    api.meeting(id)
+      .then((m) => { if (!stale) setData(m); })
+      .catch((e) => { if (!stale) setError(e?.message || 'Failed to load meeting'); });
     return () => { stale = true; };
-  }, [id, guildId]);
+  }, [id]);
 
-  if (loading || (!data && !error)) return <NoteSkeleton />;
   if (error) return <div className="px-8 py-10"><Empty icon={Icon.Doc} title="Couldn't load meeting" body={error} /></div>;
+  if (!data) return <NoteSkeleton />;
 
   return (
     <div className="px-6 md:px-8 py-7">
-      <Note key={data.meeting.id} data={data} todos={todos} guildId={guildId} meetings={meetings} refetchTodos={loadTodos} onReload={reloadMeeting} />
+      {reloadError && <p className="max-w-[760px] mx-auto mb-3 text-xs text-error" role="alert">{reloadError}</p>}
+      <Note key={data.meeting.id} data={data} onReload={reloadMeeting} />
     </div>
   );
 }

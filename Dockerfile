@@ -6,8 +6,8 @@
 # 1) Build the web dashboard (Vite → web/dist)
 FROM node:24-bookworm-slim AS web
 WORKDIR /app/web
-COPY web/package.json web/package-lock.json* ./
-RUN npm install
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
 COPY web/ ./
 RUN npm run build
 

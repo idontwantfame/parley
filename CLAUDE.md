@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `npm start` — run the bot (src/index.js). Requires the STT sidecar running too.
 - `npm test` — run all unit tests (`node --test`).
 - `npm run sidecar` — start the Python faster-whisper STT sidecar (stt_sidecar/server.py).
-- Sidecar tests: `cd stt_sidecar && .venv/bin/python -m pytest test_server.py -q` (a local venv exists; deps in stt_sidecar/requirements.txt).
+- Sidecar tests: `cd stt_sidecar && .venv/bin/python -m pytest test_server.py -q` (create the venv first: `python3 -m venv stt_sidecar/.venv && stt_sidecar/.venv/bin/pip install -r stt_sidecar/requirements.txt`).
+- If npm refuses install scripts (strict allow-scripts), `npm ci --ignore-scripts` is enough for the tests; `postinstall` applies scripts/patch-discord-voice.mjs.
 - Run a single Node test file: `node --test test/<name>.test.js`.
 - Requires Node >= 22.5 (uses the built-in `node:sqlite`).
 
@@ -19,7 +20,7 @@ Per-user Discord audio streams give free speaker attribution (no ML diarization)
 
 Flow: capture per-speaker PCM → on meeting end, orchestrator (src/pipeline/orchestrator.js) transcribes each track via the sidecar → stores utterances in SQLite → summarizes via a pluggable adapter → saves summary → delivers a structured notes thread to Discord.
 
-Concurrency: src/voice/meeting-manager.js keys active meetings by guild+channel (multiple channels record at once; no global singleton).
+Concurrency: at most ONE active meeting per guild — Discord allows a bot in one voice channel per guild and @discordjs/voice keeps one connection per guild, so joining a second channel would silently move the bot. src/voice/guild-voice-gate.js + meeting-manager.js enforce this (/join elsewhere is refused; auto-join skips busy guilds). Different guilds record concurrently. Auto-leave waits a grace period (AUTO_LEAVE_GRACE_MS) so brief reconnects don't split a meeting.
 
 Pluggable summarizer (src/adapters/summarizer/): gemini (default), ollama, openai, opencode, openrouter — all return the same StructuredNotes shape. Chosen per-guild via /setup.
 

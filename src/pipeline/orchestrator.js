@@ -1,4 +1,5 @@
 import { transcribeTracks } from './transcribe.js';
+import { STT_PROVIDER_LABELS } from '../adapters/stt/index.js';
 import { buildTranscript, computeTalkTime } from './summarize.js';
 import { getSummarizer } from '../adapters/summarizer/index.js';
 import { describeSummarizerError } from '../adapters/summarizer/errors.js';
@@ -10,6 +11,51 @@ import { withMeetingProgress } from './progress.js';
 import { deliverSavedNotes } from '../delivery/status.js';
 import { dirname } from 'node:path';
 import { retainRecording } from '../voice/recording-archive.js';
+
+// Provider-neutral: the STT provider may be the local sidecar or a cloud API.
+function withTranscriptionMessage(err, cfg) {
+  const provider = STT_PROVIDER_LABELS[cfg?.sttProvider || 'sidecar'] || 'the speech-to-text provider';
+  err.userMessage = `Transcription failed — check that ${provider} is reachable and configured. (${err.message})`;
+  return err;
+}
+
+function failTranscription(db, meetingId, err, cfg) {
+  db.setTranscriptionComplete(meetingId, false);
+  db.setMeetingStatus(meetingId, 'transcription_failed');
+  return withTranscriptionMessage(err, cfg);
+}
+
+// Transcribe every track and persist the utterances. Throws (with a
+// userMessage) when nothing usable came back or the transcript can't be saved.
+async function transcribeAndStore(db, meetingId, opts, transcribe) {
+  let result;
+  try {
+    result = await transcribe(opts.tracks, { ...opts.cfg, transcriptionVocabulary: getVocabulary(db) });
+  } catch (err) {
+    throw failTranscription(db, meetingId, err, opts.cfg);
+  }
+  // transcribeTracks returns { utterances, failures }, but opts.transcribe is an
+  // injectable seam other callers/tests still use to return a bare array.
+  const { utterances, failures = [] } = Array.isArray(result) ? { utterances: result } : result;
+
+  // A2: one or more tracks failing STT must not sink a meeting that otherwise
+  // has usable transcript — only bail out when every track failed.
+  if (failures.length > 0) {
+    console.warn(`[orchestrator] ${failures.length} track(s) failed transcription for meeting ${meetingId}`);
+  }
+  if (utterances.length === 0 && failures.length > 0) {
+    const err = new Error(`All ${failures.length} track(s) failed transcription. First error: ${failures[0].error}`);
+    throw failTranscription(db, meetingId, err, opts.cfg);
+  }
+  try {
+    db.replaceUtterances(meetingId, utterances, { complete: failures.length === 0 });
+  } catch (err) {
+    db.setMeetingStatus(meetingId, 'transcription_failed');
+    err.userMessage = `Transcription could not be saved safely. (${err.message})`;
+    throw err;
+  }
+  return { utterances, failures };
+}
 
 export function processMeeting(db, meetingId, opts) {
   return withMeetingProgress(meetingId, opts.tracks.length, (progress) => runMeeting(db, meetingId, opts, progress));
@@ -27,48 +73,9 @@ async function runMeeting(db, meetingId, opts, progress) {
 
   db.setMeetingStatus(meetingId, 'processing');
 
-  let utterances;
-  let failures = [];
   const transcribeStart = Date.now();
-  try {
-    const result = await transcribe(opts.tracks, { ...opts.cfg, transcriptionVocabulary: getVocabulary(db) });
-    // transcribeTracks returns { utterances, failures }, but opts.transcribe
-    // is an injectable seam other callers/tests still use to return a bare
-    // utterances array — accept both shapes.
-    if (Array.isArray(result)) {
-      utterances = result;
-    } else {
-      utterances = result.utterances;
-      failures = result.failures || [];
-    }
-  } catch (err) {
-    db.setTranscriptionComplete(meetingId, false);
-    db.setMeetingStatus(meetingId, 'transcription_failed');
-    err.userMessage = `Transcription failed — the STT sidecar may be down or unreachable. (${err.message})`;
-    throw err;
-  }
+  const { utterances, failures } = await transcribeAndStore(db, meetingId, opts, transcribe);
   const transcribeMs = Date.now() - transcribeStart;
-
-  // A2: one or more tracks failing STT must not sink a meeting that
-  // otherwise has usable transcript — only bail out when every track
-  // failed and nothing came through.
-  if (failures.length > 0) {
-    console.warn(`[orchestrator] ${failures.length} track(s) failed transcription for meeting ${meetingId}`);
-  }
-  if (utterances.length === 0 && failures.length > 0) {
-    db.setTranscriptionComplete(meetingId, false);
-    db.setMeetingStatus(meetingId, 'transcription_failed');
-    const err = new Error(`All ${failures.length} track(s) failed transcription`);
-    err.userMessage = `Transcription failed — the STT sidecar may be down or unreachable. (${err.message})`;
-    throw err;
-  }
-  try {
-    db.replaceUtterances(meetingId, utterances, { complete: failures.length === 0 });
-  } catch (err) {
-    db.setMeetingStatus(meetingId, 'transcription_failed');
-    err.userMessage = `Transcription could not be saved safely. (${err.message})`;
-    throw err;
-  }
 
   // Nobody actually spoke (bot joined an empty/near-silent channel). Don't
   // summarize or deliver — signal the caller to discard the meeting so these
@@ -115,13 +122,12 @@ async function runMeeting(db, meetingId, opts, progress) {
   // summarizer.lastUsed is set by FallbackSummarizer to whichever provider
   // actually produced these notes; plain adapters leave it undefined.
   const modelUsed = summarizer.lastUsed ?? `${opts.cfg.summarizerProvider}:${opts.cfg.summarizerModel || ''}`;
-  db.saveSummary(meetingId, notes, talktime, modelUsed, new Date().toISOString(), timings);
-  // Seed createdAt from the MEETING date, not now(): a pipeline that runs long
-  // (long transcription queue) would otherwise stamp today onto a meeting that
-  // started hours ago, so the action items collapse onto the wrong day in the
-  // timeline view. (Mirrors what db.backfillTodos + realignTodoDates already do
-  // for backfilled rows.)
-  db.seedTodos(meetingId, meeting.guild_id, notes.actionItems || [], meeting.started_at);
+  // Swap summary + todos in one transaction (like retry/regenerate): a re-run
+  // after a crash must drop stale todos and keep the ones already ticked off.
+  // Todos are dated from the MEETING, not now(): a pipeline that runs long
+  // would otherwise stamp today onto a meeting that started hours ago, so the
+  // action items collapse onto the wrong day in the timeline view.
+  db.replaceSummary(meetingId, meeting.guild_id, notes, talktime, modelUsed, meeting.started_at, timings);
   let audioRetained = false;
   if (opts.cfg.keepAudio && opts.tracks.length > 0) {
     progress.stage = 'archiving';

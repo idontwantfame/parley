@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api.js';
+import Field from '../components/Field.jsx';
 import { useGuild } from '../GuildContext.jsx';
-import { useAuth } from '../AuthContext.jsx';
+import { useAuth, useIsAdmin } from '../AuthContext.jsx';
 import { useSystem } from '../SystemContext.jsx';
 import { Page, PageHead } from '../components/Page.jsx';
 import { Icon, Empty } from '../components/ui.jsx';
@@ -50,15 +51,6 @@ function useCatalog(provider) {
   return { catalog: state.catalog, loading: state.loading, reload: () => load(true) };
 }
 
-function Field({ label, hint, children }) {
-  return (
-    <div>
-      <label className="block text-[13px] font-medium text-ink mb-1.5">{label}</label>
-      {children}
-      {hint && <p className="text-xs text-muted mt-1.5">{hint}</p>}
-    </div>
-  );
-}
 
 function Card({ title, desc, children }) {
   return (
@@ -69,6 +61,17 @@ function Card({ title, desc, children }) {
       </div>
       <div className="space-y-4">{children}</div>
     </section>
+  );
+}
+
+// Settings the server reserves for admins: other users see the current values
+// with every control disabled instead of controls that would just fail (403).
+function AdminFieldset({ isAdmin, children }) {
+  return (
+    <fieldset disabled={!isAdmin} className="space-y-4 min-w-0">
+      {!isAdmin && <p className="text-xs text-muted">Only admins can change these settings.</p>}
+      {children}
+    </fieldset>
   );
 }
 
@@ -325,6 +328,7 @@ function DeviceBadge({ device, model, batchSize }) {
 function ConnectionCard({ sys, onChanged }) {
   const [open, setOpen] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  const [restartErr, setRestartErr] = useState(null);
   const bot = sys?.bot;
   const conn = sys?.connection;
   if (!sys?.managed) {
@@ -340,8 +344,9 @@ function ConnectionCard({ sys, onChanged }) {
     );
   }
   async function restart() {
-    setRestarting(true);
+    setRestarting(true); setRestartErr(null);
     try { await api.botAction('restart'); await onChanged?.(); }
+    catch (e) { setRestartErr(e?.status === 403 ? 'Only admins can reconnect the bot.' : (e?.message || 'Reconnect failed.')); }
     finally { setRestarting(false); }
   }
   return (
@@ -357,6 +362,7 @@ function ConnectionCard({ sys, onChanged }) {
         </div>
       </div>
       {bot?.state === 'error' && bot?.error && <p className="text-xs text-error mt-2">{bot.error}</p>}
+      {restartErr && <p className="text-xs text-error mt-2" role="alert">{restartErr}</p>}
       {open && (
         <div className="mt-4 pt-4 border-t border-border">
           <ConnectionForm conn={conn} submitLabel="Save & reconnect" onSaved={async () => { setOpen(false); await onChanged?.(); }} />
@@ -368,6 +374,7 @@ function ConnectionCard({ sys, onChanged }) {
 
 export default function Setup() {
   const { user, authEnabled } = useAuth();
+  const isAdmin = useIsAdmin();
   const { guildId } = useGuild();
   const { status: sys, refresh: refreshSys } = useSystem();
   const [data, setData] = useState(null);
@@ -379,8 +386,23 @@ export default function Setup() {
   const [sumDraft, setSumDraft] = useState(null);
   const [sttDraft, setSttDraft] = useState(null);
 
-  function reload() { if (guildId) api.config(guildId).then(setData).catch(() => setData(null)); }
-  useEffect(() => { reload(); }, [guildId]);
+  const [loadErr, setLoadErr] = useState(null);
+  // Tags each request with the guild it was for: a slow response for the
+  // previous server must never be shown (or saved back) under the new one.
+  const current = useRef(guildId);
+  current.current = guildId;
+  const reload = useCallback(() => {
+    const forGuild = guildId;
+    if (!forGuild) return Promise.resolve();
+    return api.config(forGuild)
+      .then((d) => { if (current.current === forGuild) { setData(d); setLoadErr(null); } })
+      .catch((e) => { if (current.current === forGuild) setLoadErr(e?.message || 'Could not load settings.'); });
+  }, [guildId]);
+  useEffect(() => {
+    // Switching servers: drop the previous server's config before loading.
+    setData(null); setLoadErr(null); setSumDraft(null); setSttDraft(null);
+    reload();
+  }, [reload]);
 
   // One catalog per model field: the primary provider's and the fallback's.
   const models = useCatalog(data?.config?.summarizerProvider);
@@ -397,6 +419,13 @@ export default function Setup() {
       <ConnectionCard sys={sys} onChanged={refreshSys} />
       {sidecarUrlSetting && <div className="mt-5"><Card title="Transcription">{sidecarUrlSetting}</Card></div>}
       <div className="mt-5"><Empty icon={Icon.Settings} title="No server selected" body="Pick a server from the top bar to configure summarizer, transcription, and delivery." /></div>
+    </Page>
+  );
+  if (!data && loadErr) return (
+    <Page max="720px">
+      <PageHead title="Settings" subtitle="Discord connection and per-server configuration." />
+      <Empty icon={Icon.Settings} title="Couldn't load settings" body={loadErr}
+        action={<button className="btn btn-primary !py-2" onClick={reload}>Retry</button>} />
     </Page>
   );
   if (!data) return (
@@ -531,10 +560,10 @@ export default function Setup() {
             )}
           </Field>
           )}
-          <PromptEditor key={guildId} label="Summary prompt" value={c.summaryPrompt}
+          {isAdmin && <PromptEditor key={guildId} label="Summary prompt" value={c.summaryPrompt}
             hint="Instructions for the transcript. Keep the JSON output shape for structured notes and todos."
-            defaultValue={defaultSummaryPrompt} onSave={(summaryPrompt) => save({ summaryPrompt })} />
-          {(c.summarizerProvider === 'ollama' || c.summarizerFallbackProvider === 'ollama') && (
+            defaultValue={defaultSummaryPrompt} onSave={(summaryPrompt) => save({ summaryPrompt })} />}
+          {isAdmin && (c.summarizerProvider === 'ollama' || c.summarizerFallbackProvider === 'ollama') && (
             <PromptEditor key={`overview-${guildId}`} label="Overview prompt" value={c.overviewPrompt}
               hint="Instructions for the final recap of a long Ollama summary. Ask for plain text."
               defaultValue={defaultOverviewPrompt} maxLength={2000} rows={4}
@@ -543,6 +572,7 @@ export default function Setup() {
         </Card>
 
         <Card title="Transcription" desc="How spoken audio becomes text.">
+          <AdminFieldset isAdmin={isAdmin}>
           <Field label="Provider" hint={sttDraft ? 'Add the API key below to switch to this provider.' : (STT_HELP[sttProvider] || '')}>
             <div className="relative">
               <select className={sel} value={sttProvider}
@@ -589,6 +619,7 @@ export default function Setup() {
               )}
             </>
           )}
+          </AdminFieldset>
 
           <Field label="Spoken language">
             <div className="relative">
@@ -623,6 +654,7 @@ export default function Setup() {
         </Card>
 
         <Card title="Behavior">
+          <AdminFieldset isAdmin={isAdmin}>
           <Switch checked={c.autoJoin} onChange={(e) => save({ autoJoin: e.target.checked })}
             label="Auto-join voice" desc="Start recording automatically when a voice channel reaches the minimum below." />
           <Field label="Minimum people to auto-join" hint="Counts people only. Set to 1 to record solo sessions automatically.">
@@ -638,6 +670,7 @@ export default function Setup() {
           </Field>
           <AutoJoinChannels key={JSON.stringify([guildId, c.autoJoinChannelIds])}
             channels={voiceChannels} selected={c.autoJoinChannelIds} save={save} />
+          </AdminFieldset>
           <RecordingRetention enabled={c.keepAudio} save={save} />
         </Card>
         <SpeakerNames key={guildId} guildId={guildId} />

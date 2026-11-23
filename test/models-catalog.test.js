@@ -228,3 +228,24 @@ test('formatContext compacts token windows', () => {
   assert.equal(formatContext(512), '512');
   assert.equal(formatContext(null), '');
 });
+
+test('concurrent cold-cache lookups share one catalog fetch per provider', async () => {
+  clearModelCache();
+  let calls = 0;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const fetchImpl = async () => {
+    calls++;
+    await gate;
+    return { ok: true, json: async () => ({ data: [{ id: 'gpt-4o-mini' }, { id: 'gpt-4o' }] }) };
+  };
+  const pending = Array.from({ length: 5 }, () => listModels('openai', { env, fetchImpl }));
+  release();
+  const results = await Promise.all(pending);
+  assert.equal(calls, 1);
+  assert.ok(results.every((r) => r.source === 'live' && r.models.length === 2));
+  // A refresh still goes to the provider.
+  await listModels('openai', { env, fetchImpl, refresh: true });
+  assert.equal(calls, 2);
+  clearModelCache();
+});

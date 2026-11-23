@@ -50,3 +50,28 @@ test('shouldAutoLeave true when connected and <=1 human', () => {
   assert.equal(shouldAutoLeave({ humanCount: 2, connected: true }), false);
   assert.equal(shouldAutoLeave({ humanCount: 0, connected: false }), false);
 });
+
+// ── one meeting per guild (Discord + @discordjs/voice: one voice connection per guild) ──
+import { guildBusyWith, botMovedAway } from '../src/voice/decisions.js';
+
+test('guildBusyWith names the other channel being recorded or joined in the same guild', () => {
+  assert.equal(guildBusyWith({ channelId: 'B', activeChannelId: 'A' }), 'A');
+  assert.equal(guildBusyWith({ channelId: 'B', joiningChannelId: 'A' }), 'A');
+  assert.equal(guildBusyWith({ channelId: 'A', activeChannelId: 'A' }), null);
+  assert.equal(guildBusyWith({ channelId: 'A', joiningChannelId: 'A' }), null);
+  assert.equal(guildBusyWith({ channelId: 'A' }), null);
+});
+
+test('shouldAutoJoin skips a channel while another channel in the guild is busy', () => {
+  const options = { humanCount: 3, autoJoin: true, connected: false, channelId: 'B' };
+  assert.equal(shouldAutoJoin({ ...options, guildBusy: true }), false);
+  assert.equal(shouldAutoJoin({ ...options, guildBusy: false }), true);
+});
+
+test('botMovedAway is true only when the bot lands in a different channel than the one it records', () => {
+  assert.equal(botMovedAway({ activeChannelId: 'A', newChannelId: 'B' }), true);
+  assert.equal(botMovedAway({ activeChannelId: 'A', newChannelId: 'A' }), false);
+  // A plain disconnect is handled by the connection's Disconnected recovery.
+  assert.equal(botMovedAway({ activeChannelId: 'A', newChannelId: null }), false);
+  assert.equal(botMovedAway({ activeChannelId: null, newChannelId: 'B' }), false);
+});

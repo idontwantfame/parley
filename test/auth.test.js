@@ -93,11 +93,21 @@ test('the seeded admin can change its own password without the current one', asy
   } finally { close(); }
 });
 
+// User management is gated behind moving off the seeded default password, so
+// these tests use an admin whose password has already been changed.
+function changeAdminPassword(users, password = 'admin-pass-1') {
+  const admin = users.getUserByUsername('admin');
+  users.setPassword(admin.id, password);
+  return admin;
+}
+
 test('admin can create a user who can then log in', async () => {
   const db = openDb(':memory:');
-  const { base, close } = await listen(appWith(db).app);
+  const { app, users } = appWith(db);
+  changeAdminPassword(users);
+  const { base, close } = await listen(app);
   try {
-    const cookie = cookieOf(await jpost(base, '/api/auth/login', { username: 'admin', password: 'admin' }));
+    const cookie = cookieOf(await jpost(base, '/api/auth/login', { username: 'admin', password: 'admin-pass-1' }));
     const created = await jpost(base, '/api/users', { username: 'jane', email: 'jane@x.com', password: 'pw123456' }, cookie);
     assert.equal(created.status, 201);
 
@@ -126,10 +136,10 @@ test('non-admins cannot manage users', async () => {
 test('the last admin cannot be demoted or deleted', async () => {
   const db = openDb(':memory:');
   const { app, users } = appWith(db);
-  const admin = users.getUserByUsername('admin');
+  const admin = changeAdminPassword(users);
   const { base, close } = await listen(app);
   try {
-    const cookie = cookieOf(await jpost(base, '/api/auth/login', { username: 'admin', password: 'admin' }));
+    const cookie = cookieOf(await jpost(base, '/api/auth/login', { username: 'admin', password: 'admin-pass-1' }));
     const demote = await fetch(`${base}/api/users/${admin.id}`, {
       method: 'PATCH', headers: { 'content-type': 'application/json', cookie },
       body: JSON.stringify({ isAdmin: false }),
@@ -144,13 +154,14 @@ test('admin password reset for another user revokes their sessions', async () =>
   const db = openDb(':memory:');
   const { app, users } = appWith(db);
   const jane = users.createUser({ username: 'jane', password: 'pw123456' });
+  changeAdminPassword(users);
   const { base, close } = await listen(app);
   try {
     const janeCookie = cookieOf(await jpost(base, '/api/auth/login', { username: 'jane', password: 'pw123456' }));
     // Jane is logged in.
     assert.equal((await fetch(`${base}/api/anything`, { headers: { cookie: janeCookie } })).status, 200);
 
-    const adminCookie = cookieOf(await jpost(base, '/api/auth/login', { username: 'admin', password: 'admin' }));
+    const adminCookie = cookieOf(await jpost(base, '/api/auth/login', { username: 'admin', password: 'admin-pass-1' }));
     const reset = await jpost(base, `/api/users/${jane.id}/password`, { password: 'fresh123' }, adminCookie);
     assert.equal(reset.status, 200);
 

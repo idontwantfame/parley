@@ -1,4 +1,14 @@
 import { DatabaseSync } from 'node:sqlite';
+import { dashboardQueries } from './dashboard-queries.js';
+
+// Upper bounds for dashboard lists (newest first), so one request can never
+// load an entire guild's history.
+const TODO_LIST_LIMIT = 1000;
+// Utterance rows with per-guild speaker renames applied (append WHERE/ORDER).
+const NAMED_UTTERANCES = `SELECT u.id, u.meeting_id, u.user_id, COALESCE(n.display_name, u.display_name) AS display_name,
+    u.start_ms, u.end_ms, u.text
+  FROM utterances u JOIN meetings m ON m.id = u.meeting_id
+  LEFT JOIN speaker_names n ON n.guild_id = m.guild_id AND n.user_id = u.user_id`;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS app_settings (
@@ -117,9 +127,8 @@ export function openDb(path) {
     sql.exec(`ALTER TABLE meetings ADD COLUMN journaled_at TEXT`);
   }
   sql.exec(`CREATE INDEX IF NOT EXISTS meetings_campaign ON meetings(campaign_id)`);
-  // A journal update can't survive a restart; don't leave the UI showing a
-  // spinner forever.
-  sql.exec(`UPDATE campaigns SET journal_status = 'idle' WHERE journal_status = 'updating'`);
+  // Interrupted journal updates are reset by resetInterruptedJournals() at boot
+  // (reconcileOnBoot), not here: CLI scripts open the same db beside the bot.
 
   // Migration: add summary_language to dbs created before the column existed.
   const cols = sql.prepare(`PRAGMA table_info(guild_config)`).all();
@@ -180,10 +189,18 @@ export function openDb(path) {
       return r.lastInsertRowid;
     },
     getMeeting(id) { return sql.prepare(`SELECT * FROM meetings WHERE id = ?`).get(id); },
+    // Finished meetings (completed, failed or empty) outside campaigns that
+    // ended before the cutoff. Never recording/processing ones.
     expiredMeetings(cutoff) {
-      return sql.prepare(`SELECT * FROM meetings WHERE status = 'done' AND campaign_id IS NULL
+      return sql.prepare(`SELECT * FROM meetings
+        WHERE status IN ('done', 'transcription_failed', 'summary_failed', 'empty') AND campaign_id IS NULL
         AND delivery_status IS NOT 'sending' AND julianday(COALESCE(ended_at, started_at)) < julianday(?)
         ORDER BY id`).all(cutoff);
+    },
+    // A journal update can't survive a restart; don't leave the UI showing a
+    // spinner forever. Boot-time only (see reconcileOnBoot).
+    resetInterruptedJournals() {
+      return Number(sql.prepare(`UPDATE campaigns SET journal_status = 'idle' WHERE journal_status = 'updating'`).run().changes);
     },
     beginDelivery(id, summaryAt) {
       return sql.prepare(`UPDATE meetings SET delivery_status = 'sending', delivery_error = NULL,
@@ -257,7 +274,8 @@ export function openDb(path) {
     // one. Action items that survive the regeneration (same assignee + task)
     // keep their done state, so re-running the summary doesn't silently re-open
     // work people already ticked off. Returns the number of todos seeded.
-    replaceSummary(meetingId, guildId, notes, talktime, modelUsed, todoCreatedAt) {
+    // `timings` (optional) is stored like saveSummary's per-stage timings.
+    replaceSummary(meetingId, guildId, notes, talktime, modelUsed, todoCreatedAt, timings = null) {
       const key = (assignee, task) => `${assignee ?? ''}\u0000${task}`;
       sql.exec('BEGIN');
       try {
@@ -266,7 +284,7 @@ export function openDb(path) {
             .map((t) => key(t.assignee, t.task))
         );
         this.clearSummary(meetingId);
-        this.saveSummary(meetingId, notes, talktime, modelUsed);
+        this.saveSummary(meetingId, notes, talktime, modelUsed, new Date().toISOString(), timings);
         const n = this.seedTodos(meetingId, guildId, notes.actionItems || [], todoCreatedAt);
         if (doneKeys.size) {
           const mark = sql.prepare(`UPDATE todos SET done = 1 WHERE id = ?`);
@@ -363,25 +381,35 @@ export function openDb(path) {
       }
     },
     listUtterances(meetingId) {
-      return sql.prepare(`
-        SELECT u.id, u.meeting_id, u.user_id, COALESCE(n.display_name, u.display_name) AS display_name,
-          u.start_ms, u.end_ms, u.text
-        FROM utterances u JOIN meetings m ON m.id = u.meeting_id
-        LEFT JOIN speaker_names n ON n.guild_id = m.guild_id AND n.user_id = u.user_id
-        WHERE u.meeting_id = ? ORDER BY u.start_ms`).all(meetingId);
+      return sql.prepare(`${NAMED_UTTERANCES} WHERE u.meeting_id = ? ORDER BY u.start_ms`).all(meetingId);
+    },
+    // The last `n` utterances of a meeting, oldest first (speaker renames applied).
+    listLastUtterances(meetingId, n) {
+      return sql.prepare(
+        `SELECT * FROM (${NAMED_UTTERANCES} WHERE u.meeting_id = ? ORDER BY u.start_ms DESC, u.id DESC LIMIT ?)
+          ORDER BY start_ms, id`
+      ).all(meetingId, n);
     },
     searchUtterances(guildId, keyword) {
-      // Bind user input as a quoted FTS5 phrase literal so operator chars never throw.
-      const safe = `"${String(keyword).replace(/"/g, '""')}"`;
+      // Bind user input as a quoted FTS5 phrase literal so operator chars never
+      // throw. NUL would end the C string early ("unterminated string").
+      const safe = `"${String(keyword).replace(/\u0000/g, ' ').replace(/"/g, '""')}"`;
+      // Two phases: rank the guild's matches on (meeting, utterance) ids only,
+      // then load text and speaker names for the 50 winners — the sort no
+      // longer carries every matching row's text and name lookup.
       return sql.prepare(
-        `SELECT u.id, u.meeting_id, u.user_id, COALESCE(n.display_name, u.display_name) AS display_name,
-           u.start_ms, u.end_ms, u.text FROM utterances_fts f
-         JOIN utterances u ON u.id = f.rowid
-         JOIN meetings m ON m.id = u.meeting_id
-         LEFT JOIN speaker_names n ON n.guild_id = m.guild_id AND n.user_id = u.user_id
-         WHERE m.guild_id = ? AND utterances_fts MATCH ?
-         ORDER BY u.meeting_id DESC LIMIT 50`
-      ).all(guildId, safe);
+        `WITH hits AS (
+           SELECT u.id, u.meeting_id FROM utterances_fts f
+           JOIN utterances u ON u.id = f.rowid
+           JOIN meetings m ON m.id = u.meeting_id
+           WHERE m.guild_id = ? AND utterances_fts MATCH ?
+           ORDER BY u.meeting_id DESC, u.id LIMIT 50)
+         SELECT u.id, u.meeting_id, u.user_id, COALESCE(n.display_name, u.display_name) AS display_name,
+           u.start_ms, u.end_ms, u.text FROM hits h
+         JOIN utterances u ON u.id = h.id
+         LEFT JOIN speaker_names n ON n.guild_id = ? AND n.user_id = u.user_id
+         ORDER BY h.meeting_id DESC, h.id`
+      ).all(guildId, safe, guildId);
     },
     // `createdAt` and `timings` are both optional and backward-compatible:
     // existing callers (retry.js/api.js pass 4 args; a couple of scripts/tests
@@ -415,7 +443,7 @@ export function openDb(path) {
       }
       return n;
     },
-    listTodos(guildId, { open = false, assignee } = {}) {
+    listTodos(guildId, { open = false, assignee, limit = TODO_LIST_LIMIT } = {}) {
       const where = ['guild_id = ?'];
       const args = [guildId];
       if (open) where.push('done = 0');
@@ -423,7 +451,10 @@ export function openDb(path) {
         if (assignee === null) where.push('assignee IS NULL');
         else { where.push('assignee = ?'); args.push(assignee); }
       }
-      return sql.prepare(`SELECT * FROM todos WHERE ${where.join(' AND ')} ORDER BY id DESC`).all(...args);
+      return sql.prepare(`SELECT * FROM todos WHERE ${where.join(' AND ')} ORDER BY id DESC LIMIT ?`).all(...args, limit);
+    },
+    listMeetingTodos(meetingId) {
+      return sql.prepare(`SELECT * FROM todos WHERE meeting_id = ? ORDER BY id DESC`).all(meetingId);
     },
     listAssignees(guildId) {
       // NULL sorts first (SQLite), then alphabetical — the dropdown renders NULL as "Unassigned".
@@ -440,6 +471,14 @@ export function openDb(path) {
          UNION SELECT guild_id FROM guild_config WHERE guild_id IS NOT NULL
          UNION SELECT guild_id FROM guilds WHERE guild_id IS NOT NULL`
       ).all();
+    },
+    // Has this guild ever been seen (meetings, settings or the bot's guild list)?
+    isKnownGuild(guildId) {
+      return !!sql.prepare(
+        `SELECT 1 FROM meetings WHERE guild_id = ?1
+         UNION ALL SELECT 1 FROM guild_config WHERE guild_id = ?1
+         UNION ALL SELECT 1 FROM guilds WHERE guild_id = ?1 LIMIT 1`
+      ).get(guildId);
     },
     // Persist a guild's human name so the web UI can label it without a live
     // Discord client (e.g. the standalone API server). Called on bot ready /
@@ -511,15 +550,16 @@ export function openDb(path) {
     getCampaign(id) {
       return sql.prepare(`SELECT * FROM campaigns WHERE id = ?`).get(id) ?? null;
     },
-    listCampaigns(guildId) {
+    // `limit` (newest activity first) bounds dashboard lists; -1 = all.
+    listCampaigns(guildId, { limit = -1 } = {}) {
       const rows = sql.prepare(
         `SELECT c.*,
             (SELECT COUNT(*) FROM meetings m WHERE m.campaign_id = c.id AND m.status != 'empty') AS session_count,
             (SELECT COUNT(*) FROM meetings m WHERE m.campaign_id = c.id AND m.status = 'done' AND m.journaled_at IS NULL) AS pending_count,
             (SELECT MAX(m.started_at) FROM meetings m WHERE m.campaign_id = c.id) AS last_session_at
          FROM campaigns c WHERE c.guild_id = ?
-         ORDER BY COALESCE(last_session_at, c.created_at) DESC`
-      ).all(guildId);
+         ORDER BY COALESCE(last_session_at, c.created_at) DESC LIMIT ?`
+      ).all(guildId, limit);
       return rows.map((c) => ({ ...c, channels: this.listCampaignChannels(c.id) }));
     },
     renameCampaign(id, name) {
@@ -552,8 +592,10 @@ export function openDb(path) {
         `UPDATE meetings SET campaign_id = ? WHERE channel_id = ? AND guild_id = ? AND campaign_id IS NULL`
       ).run(campaignId, channelId, guildId).changes);
     },
-    unlinkCampaignChannel(channelId) {
-      sql.prepare(`DELETE FROM campaign_channels WHERE channel_id = ?`).run(channelId);
+    // Only removes the link when the channel belongs to this campaign.
+    unlinkCampaignChannel(campaignId, channelId) {
+      return sql.prepare(`DELETE FROM campaign_channels WHERE campaign_id = ? AND channel_id = ?`)
+        .run(campaignId, channelId).changes > 0;
     },
     listCampaignChannels(campaignId) {
       return sql.prepare(
@@ -603,6 +645,7 @@ export function openDb(path) {
     },
     // Best-matching utterances across a campaign for an FTS5 query string
     // (built by the caller from escaped terms), best match first.
+    // NUL would cut the query short inside a quoted term; treat it as a space.
     searchCampaignUtterances(campaignId, ftsQuery, limit = 15) {
       return sql.prepare(
         `SELECT u.* FROM utterances_fts f
@@ -610,140 +653,18 @@ export function openDb(path) {
            JOIN meetings m ON m.id = u.meeting_id
           WHERE m.campaign_id = ? AND utterances_fts MATCH ?
           ORDER BY bm25(utterances_fts) LIMIT ?`
-      ).all(campaignId, ftsQuery, limit);
+      ).all(campaignId, String(ftsQuery).replace(/\u0000/g, ' '), limit);
     },
     firstUtteranceMs(meetingId) {
       return sql.prepare(`SELECT MIN(start_ms) AS t FROM utterances WHERE meeting_id = ?`).get(meetingId)?.t ?? null;
     },
     utterancesBetween(meetingId, fromMs, toMs) {
       return sql.prepare(
-        `SELECT * FROM utterances WHERE meeting_id = ? AND start_ms BETWEEN ? AND ? ORDER BY start_ms`
+        `${NAMED_UTTERANCES} WHERE u.meeting_id = ? AND u.start_ms BETWEEN ? AND ? ORDER BY u.start_ms`
       ).all(meetingId, fromMs, toMs);
     },
 
-    // ── Dashboard aggregates ────────────────────────────────────────────────
-    // Meetings enriched with per-row counts + a short summary preview, in one
-    // pass. Used by the meetings overview + dashboard cards so the client never
-    // needs N detail fetches just to render a list.
-    listRecentRich(guildId, limit = 50) {
-      const rows = sql.prepare(
-        `SELECT m.*,
-            (SELECT COUNT(*) FROM utterances u WHERE u.meeting_id = m.id) AS utterance_count,
-            (SELECT COUNT(*) FROM attendees a WHERE a.meeting_id = m.id) AS attendee_count,
-            (SELECT COUNT(*) FROM todos t WHERE t.meeting_id = m.id) AS action_count,
-            (SELECT COUNT(*) FROM todos t WHERE t.meeting_id = m.id AND t.done = 0) AS open_action_count,
-            s.notes_json, s.talktime_json
-         FROM meetings m
-         LEFT JOIN summaries s ON s.meeting_id = m.id
-         WHERE m.guild_id = ? ORDER BY m.id DESC LIMIT ?`
-      ).all(guildId, limit);
-      return rows.map(({ notes_json, talktime_json, ...m }) => {
-        let tldr = null, topic_count = 0, decision_count = 0;
-        let talktime = [];
-        try { if (notes_json) {
-          const n = JSON.parse(notes_json);
-          tldr = n.tldr ?? null;
-          topic_count = Array.isArray(n.topics) ? n.topics.length : 0;
-          decision_count = Array.isArray(n.decisions) ? n.decisions.length : 0;
-        } } catch { /* keep defaults */ }
-        try { if (talktime_json) talktime = JSON.parse(talktime_json) || []; } catch { /* [] */ }
-        const attendee_names = sql.prepare(
-          `SELECT display_name FROM attendees WHERE meeting_id = ? ORDER BY display_name`
-        ).all(m.id).map((a) => a.display_name);
-        return { ...m, tldr, topic_count, decision_count, talktime, attendee_names,
-          has_summary: notes_json != null,
-          // Failed/stuck meetings the dashboard can offer a retry for. The
-          // detail endpoint refines this with a precise plan (audio on disk?).
-          failed: ['transcription_failed', 'summary_failed', 'processing'].includes(m.status) };
-      });
-    },
-
-    // Headline numbers for a guild's dashboard.
-    guildStats(guildId) {
-      const base = sql.prepare(
-        `SELECT
-           COUNT(*) AS total_meetings,
-           SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done_meetings,
-           MIN(started_at) AS first_meeting,
-           MAX(started_at) AS last_meeting
-         FROM meetings WHERE guild_id = ?`
-      ).get(guildId) || {};
-      const utt = sql.prepare(
-        `SELECT COUNT(*) AS c FROM utterances u JOIN meetings m ON m.id = u.meeting_id WHERE m.guild_id = ?`
-      ).get(guildId) || { c: 0 };
-      const todoCounts = sql.prepare(
-        `SELECT
-           COUNT(*) AS total,
-           SUM(CASE WHEN done = 0 THEN 1 ELSE 0 END) AS open,
-           SUM(CASE WHEN done = 1 THEN 1 ELSE 0 END) AS done
-         FROM todos WHERE guild_id = ?`
-      ).get(guildId) || {};
-      const people = sql.prepare(
-        `SELECT COUNT(DISTINCT user_id) AS c FROM attendees a JOIN meetings m ON m.id = a.meeting_id WHERE m.guild_id = ?`
-      ).get(guildId) || { c: 0 };
-
-      // Total talk-time ms summed from stored talktime JSON.
-      const tt = sql.prepare(
-        `SELECT s.talktime_json FROM summaries s JOIN meetings m ON m.id = s.meeting_id WHERE m.guild_id = ?`
-      ).all(guildId);
-      let total_talk_ms = 0;
-      for (const row of tt) {
-        try { for (const p of JSON.parse(row.talktime_json) || []) total_talk_ms += p.ms || 0; }
-        catch { /* skip */ }
-      }
-      return {
-        totalMeetings: base.total_meetings || 0,
-        doneMeetings: base.done_meetings || 0,
-        firstMeeting: base.first_meeting || null,
-        lastMeeting: base.last_meeting || null,
-        totalUtterances: utt.c || 0,
-        totalTalkMs: total_talk_ms,
-        people: people.c || 0,
-        todos: { total: todoCounts.total || 0, open: todoCounts.open || 0, done: todoCounts.done || 0 },
-      };
-    },
-
-    // Per-person talk-time + meeting count across the guild, descending by ms.
-    talkTimeLeaderboard(guildId) {
-      const rows = sql.prepare(
-        `SELECT s.talktime_json FROM summaries s JOIN meetings m ON m.id = s.meeting_id WHERE m.guild_id = ?`
-      ).all(guildId);
-      const by = new Map(); // name -> { ms, words, meetings }
-      for (const row of rows) {
-        let parsed;
-        try { parsed = JSON.parse(row.talktime_json) || []; } catch { continue; }
-        for (const p of parsed) {
-          const name = p.displayName || 'Unknown';
-          const cur = by.get(name) || { displayName: name, ms: 0, words: 0, meetings: 0 };
-          cur.ms += p.ms || 0;
-          cur.words += p.words || 0;
-          cur.meetings += 1;
-          by.set(name, cur);
-        }
-      }
-      return [...by.values()].sort((a, b) => b.ms - a.ms);
-    },
-
-    // Meetings-per-local-day for the timeline chart (last `days` days inclusive).
-    meetingsTimeline(guildId, days = 30) {
-      const rows = sql.prepare(
-        `SELECT started_at FROM meetings WHERE guild_id = ? AND started_at IS NOT NULL`
-      ).all(guildId);
-      const counts = new Map();
-      for (const { started_at } of rows) {
-        const d = new Date(String(started_at).replace(' ', 'T'));
-        if (Number.isNaN(d.getTime())) continue;
-        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-        counts.set(key, (counts.get(key) || 0) + 1);
-      }
-      const out = [];
-      const today = new Date();
-      for (let i = days - 1; i >= 0; i--) {
-        const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - i);
-        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-        out.push({ date: key, count: counts.get(key) || 0 });
-      }
-      return out;
-    },
+    // Dashboard aggregates (meeting list, neighbours, stats): dashboard-queries.js.
+    ...dashboardQueries(sql),
   };
 }

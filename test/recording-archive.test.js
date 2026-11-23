@@ -25,3 +25,24 @@ test('archive only removes original tracks after a successful full transcription
   assert.deepEqual(await readdir(dir), [MP3_NAME]);
   assert.ok((await readFile(mp3)).length);
 });
+
+import { canDiscardAudio } from '../src/voice/recording-archive.js';
+
+// keepAudio=false deletes the meeting's audio dir after finalize — but only a
+// fully transcribed meeting may lose it: a retry re-transcribes failed speakers
+// from their PCM.
+test('audio is discarded only after a complete transcript that was not archived', () => {
+  assert.equal(canDiscardAudio({ audioRetained: false }, { transcription_complete: 1 }), true);
+  assert.equal(canDiscardAudio({ audioRetained: false, empty: true }, { transcription_complete: 1 }), true);
+});
+
+test('a partial transcript keeps the audio for a retry', () => {
+  assert.equal(canDiscardAudio({ audioRetained: false }, { transcription_complete: 0 }), false);
+});
+
+test('archived (kept) audio and unknown outcomes are never discarded', () => {
+  assert.equal(canDiscardAudio({ audioRetained: true }, { transcription_complete: 1 }), false);
+  assert.equal(canDiscardAudio(null, { transcription_complete: 1 }), false);
+  assert.equal(canDiscardAudio({ audioRetained: false }, null), false);
+  assert.equal(canDiscardAudio({ audioRetained: false }, { transcription_complete: null }), false);
+});

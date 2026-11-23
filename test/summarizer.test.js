@@ -45,3 +45,18 @@ test('getSummarizer returns fake when provider is fake', () => {
 test('getSummarizer throws on unknown provider', () => {
   assert.throws(() => getSummarizer({ summarizerProvider: 'nope' }), /Unknown summarizer/);
 });
+
+test('normalizeNotes coerces loose item shapes from schema-less models and drops junk', () => {
+  const n = normalizeNotes({
+    tldr: 42,
+    topics: ['Budget', { title: 'Launch', points: ['Friday', 7, null] }, { points: ['orphan'] }, null],
+    decisions: ['Ship it', { text: 'x' }, ''],
+    openQuestions: ['Who pays?', 3],
+    actionItems: ['Email the client', { assignee: 'Alice', task: 'Book room' }, { assignee: 'Bob' }, { task: '  ' }, 5, null],
+  });
+  assert.equal(n.tldr, '');
+  assert.deepEqual(n.topics, [{ title: 'Budget', points: [] }, { title: 'Launch', points: ['Friday'] }]);
+  assert.deepEqual(n.decisions, ['Ship it']);
+  assert.deepEqual(n.openQuestions, ['Who pays?']);
+  assert.deepEqual(n.actionItems, [{ assignee: null, task: 'Email the client' }, { assignee: 'Alice', task: 'Book room' }]);
+});

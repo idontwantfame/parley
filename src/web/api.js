@@ -1,7 +1,7 @@
 // src/web/api.js
 import { Router } from 'express';
 import { ChannelType } from 'discord.js';
-import { rm } from 'node:fs/promises';
+import { readdir, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { ensureMixedWav } from '../voice/mix.js';
@@ -17,18 +17,21 @@ import { resolveSummaryLanguage } from '../adapters/summarizer/languages.js';
 import { SUMMARY_PROMPT } from '../adapters/summarizer/notes.js';
 import { DEFAULT_OVERVIEW_PROMPT } from '../adapters/summarizer/ollama.js';
 import { listModels, clearModelCache, DEFAULT_MODELS, CATALOG_PROVIDERS } from '../adapters/summarizer/models.js';
-import { secretStatus, setProviderKey, isSecretProvider, connectionStatus, setConnection } from '../store/secrets.js';
+import { secretStatus, setProviderKey, isSecretProvider, connectionStatus, setConnection, redactUrl } from '../store/secrets.js';
 import { COMMAND_CATALOG } from '../commands/definitions.js';
-import { retryMeeting, retryPlan, RETRYABLE_STATUSES, regeneratePlan, regenerateSummary } from '../pipeline/retry.js';
+import { retryMeeting, retryPlan, retryEligible, regeneratePlan, regenerateSummary } from '../pipeline/retry.js';
 import { availableSttProviders } from '../adapters/stt/index.js';
-import { requireAdmin } from './auth.js';
-import { readMeetingExport, meetingExportBasename, renderMeetingMarkdown } from '../delivery/meeting-export.js';
-import { campaignContextFor, catchUpJournal, JOURNAL_SECTIONS } from '../campaign/journal.js';
-import { askCampaign, recapCampaign } from '../campaign/ask.js';
-import { meetingProgress } from '../pipeline/progress.js';
+import { isAdminRequest, requireAdmin } from './auth.js';
+import { readMeetingExport, meetingExportBasename, renderMeetingMarkdown, autoExportMeeting } from '../delivery/meeting-export.js';
+import { campaignContextFor } from '../campaign/journal.js';
+import { meetingProgress, withMeetingProgress } from '../pipeline/progress.js';
 import { postNotes } from '../delivery/post.js';
 import { deliverSavedNotes } from '../delivery/status.js';
-import { pruneMeetings } from '../store/meeting-retention.js';
+import { pruneMeetings, removeMeetingArtifacts } from '../store/meeting-retention.js';
+import {
+  ADMIN_CONFIG_FIELDS, MEETING_PAGE_MAX, configInputError, intQuery, isSingleQuery, questionOf,
+} from './api-input.js';
+import { mountCampaignRoutes } from './campaign-routes.js';
 
 function audioDir(id) {
   return join(env.dataDir, 'audio', String(id));
@@ -48,15 +51,45 @@ function anyGuildUsesSidecar(db) {
   } catch { return true; }
 }
 
-export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
+// Guard middleware: admin-only when the body touches any of `fields`.
+function requireAdminForFields(fields) {
+  return (req, res, next) => (fields.some((field) => req.body?.[field] !== undefined)
+    ? requireAdmin(req, res, next) : next());
+}
+
+const artifactDirs = () => ({ dataDir: env.dataDir, exportDir: env.exportDir });
+
+export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAudio = ensureMixedWav }) {
   const r = Router();
   // Meeting ids with a summary regeneration in flight (guards double-submits).
   const regeneration = new Map();
+  // Meeting id -> in-flight WAV mix, so concurrent downloads share one mix.
+  const mixes = new Map();
   // The live Discord client may not exist yet (bot starts lazily once creds are
   // set). Always resolve it fresh from the controller so routes pick it up the
   // moment the bot connects, without rebuilding the router. `client` is still
   // accepted directly for tests and the standalone server.
   const liveClient = () => bot?.client || client;
+  const botSessions = () => (bot && typeof bot.liveMeetings === 'function' ? bot.liveMeetings() : []);
+
+  // Why a meeting can't be deleted/merged/retried/regenerated right now, or
+  // null. Live capture writes into the meeting's audio folder, so recording
+  // (or bot-side processing) meetings must never be touched.
+  function busyReason(meeting) {
+    if (meeting.status === 'recording' || botSessions().some((s) => Number(s.meetingId) === meeting.id)) {
+      return 'This meeting is still being recorded or processed.';
+    }
+    if (meetingProgress(meeting.id) || regeneration.get(meeting.id)?.state === 'running') {
+      return 'This meeting is already being processed.';
+    }
+    if (meeting.delivery_status === 'sending') return 'Discord delivery is in progress.';
+    return null;
+  }
+
+  function mixOnce(id) {
+    if (!mixes.has(id)) mixes.set(id, Promise.resolve().then(() => mixAudio(audioDir(id))).finally(() => mixes.delete(id)));
+    return mixes.get(id);
+  }
 
   // Active recordings for a guild, enriched with the voice channel's current
   // members (so the UI can show who's live). Reads in-memory bot sessions; empty
@@ -64,8 +97,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
   // carry a `phase`: 'recording' (capture in progress) or 'processing'
   // (recording stopped, transcribe/summarize pipeline still running).
   function liveMeetings(guildId) {
-    const sessions = (bot && typeof bot.liveMeetings === 'function' ? bot.liveMeetings() : [])
-      .filter((s) => s.guildId === guildId);
+    const sessions = botSessions().filter((s) => s.guildId === guildId);
     const c = liveClient();
     return sessions.map((s) => {
       let attendees = db.listAttendees(s.meetingId).map((a) => ({ id: a.user_id, displayName: a.display_name }));
@@ -93,8 +125,14 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     res.json(allIds.map((id) => ({ id, name: guildName(c, id, dbNames) })));
   });
 
+  // Newest first. ?limit=1..100 (default 100) and ?before=<meeting id> page back.
   r.get('/guilds/:g/meetings', (req, res) => {
-    res.json(db.listRecentRich(req.params.g, 100));
+    const limit = intQuery(req.query.limit, MEETING_PAGE_MAX, MEETING_PAGE_MAX);
+    const before = intQuery(req.query.before, Number.MAX_SAFE_INTEGER, null);
+    if (Number.isNaN(limit) || Number.isNaN(before)) {
+      return res.status(400).json({ error: `limit must be 1-${MEETING_PAGE_MAX} and before a meeting id.` });
+    }
+    res.json(db.listRecentRich(req.params.g, limit, { before }));
   });
 
   // In-progress recordings for this guild, enriched with the channel's current
@@ -121,20 +159,23 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
 
   // Dashboard aggregates — headline stats, talk-time leaderboard, timeline.
   r.get('/guilds/:g/stats', (req, res) => {
-    res.json({
-      stats: db.guildStats(req.params.g),
-      leaderboard: db.talkTimeLeaderboard(req.params.g),
-      timeline: db.meetingsTimeline(req.params.g, 30),
-    });
+    res.json(db.statsBundle(req.params.g, 30));
   });
 
-  r.get('/meetings/:id', (req, res) => {
+  // Meeting detail bundle: notes, transcript, this meeting's todos, the
+  // adjacent meetings in the list, and what the retry/regenerate actions can do.
+  r.get('/meetings/:id', async (req, res) => {
     const id = Number(req.params.id);
     const meeting = db.getMeeting(id);
     if (!meeting) return res.status(404).json({ error: 'meeting not found' });
-    const plan = retryPlan(db, id, { dataDir: env.dataDir });
-    const regen = regeneratePlan(db, id);
-    const progress = meetingProgress(id);
+    const utterances = db.listUtterances(id);
+    const audioFiles = await readdir(audioDir(id)).catch(() => null);
+    // The retry/regenerate planners re-read the meeting, its transcript and
+    // its audio folder; hand them what this request already loaded instead.
+    const loaded = { ...db, getMeeting: () => meeting, listUtterances: () => utterances };
+    const listAudio = () => { if (!audioFiles) throw new Error('No audio folder.'); return audioFiles; };
+    const plan = retryPlan(loaded, id, { dataDir: env.dataDir, exists: listAudio });
+    const regen = regeneratePlan(loaded, id);
     const cfg = getGuildConfig(db, meeting.guild_id);
     const channelId = cfg.notesChannelId || meeting.channel_id;
     const channel = liveClient()?.channels?.cache?.get(channelId);
@@ -142,14 +183,17 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
       meeting,
       summary: db.getSummary(id),
       attendees: db.listAttendees(id),
-      utterances: db.listUtterances(id),
-      retry: { eligible: !progress && RETRYABLE_STATUSES.has(meeting.status) && plan.ok, action: plan.action, reason: plan.reason || null },
-      progress,
+      utterances,
+      todos: db.listMeetingTodos(id),
+      neighbors: db.meetingNeighbors(meeting),
+      retry: { eligible: !busyReason(meeting) && retryEligible(meeting, plan),
+        action: plan.action, reason: plan.reason || null },
+      progress: meetingProgress(id),
       deliveryTarget: channelId ? {
         id: channelId, name: channel?.name || (channelId === meeting.channel_id ? meeting.channel_name : null),
       } : null,
       regenerate: { eligible: regen.ok, reason: regen.reason || null, ...regeneration.get(id) },
-      hasAudio: meeting.status === 'done' && !!meeting.audio_retained && existsSync(audioDir(id)),
+      hasAudio: meeting.status === 'done' && !!meeting.audio_retained && audioFiles !== null,
     });
   });
 
@@ -184,7 +228,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     }
     const mp3 = join(audioDir(id), MP3_NAME);
     const isMp3 = existsSync(mp3);
-    const file = isMp3 ? mp3 : await ensureMixedWav(audioDir(id));
+    const file = isMp3 ? mp3 : await mixOnce(id);
     if (!file) return res.status(404).json({ error: 'No recording is available for this meeting.' });
     res.setHeader('Cache-Control', 'private, no-store');
     res.download(file, `${meetingExportBasename(meeting)}.${isMp3 ? 'mp3' : 'wav'}`);
@@ -194,7 +238,8 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     const id = Number(req.params.id);
     const meeting = db.getMeeting(id);
     if (meeting?.status !== 'done') return res.status(404).json({ error: 'Completed meeting not found.' });
-    if (meetingProgress(id)) return res.status(409).json({ error: 'Wait for processing to finish.' });
+    const busy = busyReason(meeting);
+    if (busy) return res.status(409).json({ error: busy });
     if (meeting.audio_retained) {
       await rm(audioDir(id), { recursive: true, force: true });
       db.setAudioRetained(id, false);
@@ -220,14 +265,18 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
 
   // Retry a failed/stuck meeting: re-summarize if the transcript survived, else
   // re-transcribe from the saved PCM. Posts to Discord too when a live client
-  // is attached. Returns the new status so the UI can refresh.
-  r.post('/meetings/:id/retry', requireAdmin, async (req, res) => {
+  // is attached. Eligibility is checked up front; the work runs in the
+  // background (202) and reports through GET /meetings/:id/progress, with the
+  // outcome reflected in the meeting's status.
+  r.post('/meetings/:id/retry', requireAdmin, (req, res) => {
     const id = Number(req.params.id);
-    if (meetingProgress(id)) return res.status(409).json({ error: 'This meeting is already being processed.' });
     const meeting = db.getMeeting(id);
     if (!meeting) return res.status(404).json({ error: 'meeting not found' });
-    if (!RETRYABLE_STATUSES.has(meeting.status) || meeting.delivery_status === 'sending') {
-      return res.status(409).json({ error: 'This meeting cannot be retried in its current state.' });
+    const busy = busyReason(meeting);
+    if (busy) return res.status(409).json({ error: busy });
+    const plan = retryPlan(db, id, { dataDir: env.dataDir });
+    if (!retryEligible(meeting, plan)) {
+      return res.status(409).json({ error: plan.ok ? 'This meeting cannot be retried in its current state.' : plan.reason });
     }
     const c = liveClient();
     const deliver = c
@@ -236,13 +285,12 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
           await postNotes({ client: c, meeting: db.getMeeting(id), cfg, notes, talktime });
         }
       : null;
-    try {
-      const result = await retryMeeting(db, id, { dataDir: env.dataDir, deliver });
-      if (!result.ok) return res.status(502).json({ error: result.reason || 'Retry failed.', ...result });
-      res.json({ ok: true, ...result, meeting: db.getMeeting(id) });
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
+    // retryMeeting registers its progress synchronously, so a poll right after
+    // this response already sees the retry running.
+    retryMeeting(db, id, { dataDir: env.dataDir, deliver })
+      .then((result) => { if (!result.ok) console.warn(`[retry] meeting ${id}: ${result.reason || 'retry failed'}`); })
+      .catch((error) => console.error(`[retry] meeting ${id} failed:`, error));
+    res.status(202).json({ ok: true, started: true });
   });
 
   // Regenerate a completed meeting's summary from its stored transcript with the
@@ -259,8 +307,8 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     const plan = regeneratePlan(db, id);
     if (!plan.meeting) return res.status(404).json({ error: 'meeting not found' });
     if (!plan.ok) return res.status(409).json({ error: plan.reason });
-    if (plan.meeting.delivery_status === 'sending') return res.status(409).json({ error: 'Discord delivery is in progress.' });
-    if (regeneration.get(id)?.state === 'running') return res.status(409).json({ error: 'A regeneration is already running for this meeting.' });
+    const busy = busyReason(plan.meeting);
+    if (busy) return res.status(409).json({ error: busy });
     regeneration.set(id, { state: 'running' });
     res.status(202).json({ state: 'running' });
     void regenerateSummary(db, id).then((result) => {
@@ -275,63 +323,81 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     const id = Number(req.params.id);
     const meeting = db.getMeeting(id);
     if (!meeting) return res.status(404).json({ error: 'meeting not found' });
-    if (regeneration.get(id)?.state === 'running' || meetingProgress(id) || meeting.delivery_status === 'sending') {
-      return res.status(409).json({ error: 'The meeting is being processed.' });
-    }
+    const busy = busyReason(meeting);
+    if (busy) return res.status(409).json({ error: busy });
     regeneration.delete(id);
     db.deleteMeeting(id);
-    await rm(audioDir(id), { recursive: true, force: true }).catch(() => {});
+    await removeMeetingArtifacts(meeting, artifactDirs());
     res.json({ ok: true });
   });
 
-  // Merge sourceIds into the target meeting, then re-summarize the combined
-  // transcript. Sources must share the target's guild.
-  r.post('/meetings/:id/merge', requireAdmin, async (req, res) => {
-    const targetId = Number(req.params.id);
-    const target = db.getMeeting(targetId);
-    if (!target) return res.status(404).json({ error: 'meeting not found' });
-    const sourceIds = (Array.isArray(req.body?.sourceIds) ? req.body.sourceIds : [])
-      .map(Number).filter((s) => s && s !== targetId);
-    if (sourceIds.length === 0) return res.status(400).json({ error: 'sourceIds required' });
-    for (const sid of sourceIds) {
-      const m = db.getMeeting(sid);
-      if (!m) return res.status(404).json({ error: `meeting ${sid} not found` });
-      if (m.guild_id !== target.guild_id) return res.status(400).json({ error: 'meetings belong to different guilds' });
-    }
-
-    const merged = db.mergeMeetings(targetId, sourceIds);
-
-    // Re-summarize the now-combined transcript and replace the target's notes.
-    const utterances = db.listUtterances(targetId).map((u) => ({
+  // Summarize a merged meeting's combined transcript and swap in the new notes
+  // (transactionally; action items that survive keep their done state).
+  async function resummarizeMerged(target) {
+    const utterances = db.listUtterances(target.id).map((u) => ({
       displayName: u.display_name, userId: u.user_id, text: u.text,
       startMs: u.start_ms, endMs: u.end_ms,
     }));
     const cfg = getGuildConfig(db, target.guild_id);
-    const transcript = buildTranscript(utterances);
-    const talktime = computeTalkTime(utterances);
     const meta = {
       channelName: target.channel_name, date: target.started_at,
-      attendees: db.listAttendees(targetId).map((a) => a.display_name),
+      attendees: db.listAttendees(target.id).map((a) => a.display_name),
       summaryLanguage: resolveSummaryLanguage(cfg),
       summaryPrompt: cfg.summaryPrompt,
       campaignContext: campaignContextFor(db, target),
     };
+    const summarizer = getSummarizer(cfg);
+    const notes = await summarizer.summarize(buildTranscript(utterances), meta);
+    const modelUsed = summarizer.lastUsed ?? `${cfg.summarizerProvider}:${cfg.summarizerModel || ''}`;
+    db.replaceSummary(target.id, target.guild_id, notes, computeTalkTime(utterances), modelUsed, target.started_at);
+  }
+
+  // Look up merge sources: an error { status, error } or { sources }.
+  function mergeSources(target, rawIds) {
+    const ids = [...new Set((Array.isArray(rawIds) ? rawIds : []).map(Number))]
+      .filter((id) => Number.isSafeInteger(id) && id > 0 && id !== target.id);
+    if (ids.length === 0) return { status: 400, error: 'sourceIds required' };
+    const sources = ids.map((id) => db.getMeeting(id));
+    const missing = ids.find((_, i) => !sources[i]);
+    if (missing) return { status: 404, error: `meeting ${missing} not found` };
+    if (sources.some((m) => m.guild_id !== target.guild_id)) return { status: 400, error: 'meetings belong to different guilds' };
+    for (const m of [target, ...sources]) {
+      const busy = busyReason(m);
+      if (busy) return { status: 409, error: `Meeting ${m.id}: ${busy}` };
+    }
+    return { sources };
+  }
+
+  // Merge sourceIds into the target meeting, then re-summarize the combined
+  // transcript. Sources must share the target's guild and be idle.
+  r.post('/meetings/:id/merge', requireAdmin, async (req, res) => {
+    const target = db.getMeeting(Number(req.params.id));
+    if (!target) return res.status(404).json({ error: 'meeting not found' });
+    const { sources, status, error } = mergeSources(target, req.body?.sourceIds);
+    if (error) return res.status(status).json({ error });
+
+    const merged = db.mergeMeetings(target.id, sources.map((m) => m.id));
     try {
-      const summarizer = getSummarizer(cfg);
-      const notes = await summarizer.summarize(transcript, meta);
-      db.clearSummary(targetId);
-      db.saveSummary(targetId, notes, talktime, summarizer.lastUsed ?? `${cfg.summarizerProvider}:${cfg.summarizerModel || ''}`);
-      db.seedTodos(targetId, target.guild_id, notes.actionItems || [], target.started_at);
+      // Progress is registered before the first await, so the target can't be
+      // deleted, retried or merged again while this runs.
+      await withMeetingProgress(target.id, null, async () => {
+        // The sources are gone from the db; drop their audio and transcript
+        // exports (never throws), then re-summarize the combined transcript.
+        await Promise.all(sources.map((m) => removeMeetingArtifacts(m, artifactDirs())));
+        await resummarizeMerged(target);
+      });
     } catch (e) {
       // Data is already merged; surface the summarize failure but don't unwind.
+      await autoExportMeeting(db, target.id);
       return res.status(502).json({ error: e.message, merged });
     }
-    for (const sid of merged) await rm(audioDir(sid), { recursive: true, force: true }).catch(() => {});
+    await autoExportMeeting(db, target.id);
     res.json({ ok: true, merged });
   });
 
   r.get('/guilds/:g/todos', (req, res) => {
     const { open, assignee } = req.query;
+    if (!isSingleQuery(open) || !isSingleQuery(assignee)) return res.status(400).json({ error: 'Repeat each filter at most once.' });
     const opts = { open: open === '1' };
     if (assignee !== undefined) opts.assignee = assignee === '__unassigned__' ? null : assignee;
     res.json(db.listTodos(req.params.g, opts));
@@ -342,11 +408,13 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
   });
 
   r.patch('/todos/:id', requireAdmin, (req, res) => {
-    db.setTodoDone(Number(req.params.id), !!req.body.done);
+    if (typeof req.body?.done !== 'boolean') return res.status(400).json({ error: 'done must be true or false.' });
+    db.setTodoDone(Number(req.params.id), req.body.done);
     res.json({ ok: true });
   });
 
   r.get('/guilds/:g/search', (req, res) => {
+    if (!isSingleQuery(req.query.q)) return res.status(400).json({ error: 'Send one search query.' });
     const q = (req.query.q || '').trim();
     res.json(q ? db.searchUtterances(req.params.g, q) : []);
   });
@@ -406,9 +474,16 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     });
   });
 
-  r.patch('/guilds/:g/config', (req, res, next) =>
-    req.body?.keepAudio !== undefined ? requireAdmin(req, res, next) : next(), async (req, res) => {
-    const result = validateSetup(req.body, env);
+  // Open to every user for everyday settings; ADMIN_CONFIG_FIELDS need an admin.
+  r.patch('/guilds/:g/config', requireAdminForFields(ADMIN_CONFIG_FIELDS), async (req, res) => {
+    const isKnown = db.isKnownGuild(req.params.g) || !!liveClient()?.guilds?.cache?.has?.(req.params.g);
+    if (!isKnown) return res.status(404).json({ error: 'Unknown server.' });
+    const input = req.body ?? {};
+    const inputError = configInputError(input);
+    if (inputError) return res.status(400).json({ error: inputError });
+    // Validate against the guild's stored settings (e.g. a bare sttModel must
+    // suit the provider already saved, not one the client claims).
+    const result = validateSetup(input, env, getGuildConfig(db, req.params.g));
     if (!result.ok) return res.status(400).json({ error: result.error });
     const config = setGuildConfig(db, req.params.g, result.patch);
     // Follow the transcription backend with the local sidecar process: start it
@@ -430,14 +505,15 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
 
   // Full model catalog for a provider, queried live (Gemini ListModels, the
   // OpenAI-compatible /models endpoints, Ollama's installed tags) and cached.
-  // `?refresh=1` bypasses the cache. Degrades to the curated shortlist when the
-  // provider can't be reached — see adapters/summarizer/models.js.
+  // `?refresh=1` bypasses the cache for admins (others get the cached catalog,
+  // so they can't make Parley hammer provider APIs). Degrades to the curated
+  // shortlist when the provider can't be reached — see adapters/summarizer/models.js.
   r.get('/providers/:provider/models', async (req, res) => {
     const { provider } = req.params;
     if (!CATALOG_PROVIDERS.includes(provider)) {
       return res.status(400).json({ error: `Unknown provider "${provider}". Use one of: ${CATALOG_PROVIDERS.join(', ')}.` });
     }
-    res.json(await listModels(provider, { env, refresh: req.query.refresh === '1' }));
+    res.json(await listModels(provider, { env, refresh: req.query.refresh === '1' && isAdminRequest(req) }));
   });
 
   // Set or clear a provider's API key. Persists to .env and updates the live
@@ -489,7 +565,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
         : { state: c ? 'ready' : 'stopped', connected: !!c, hasCreds: !!env.discordToken,
             user: c?.user ? { tag: c.user.tag, id: c.user.id } : null, guildCount: c?.guilds?.cache?.size ?? 0 },
       managed: !!bot,
-      sttUrl: env.sttUrl,
+      sttUrl: redactUrl(env.sttUrl),
       sidecar: sidecar ? sidecar.status() : null,
     });
   });
@@ -564,7 +640,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     const id = Number(req.params.id);
     const meeting = db.getMeeting(id);
     if (!meeting) return res.status(404).json({ error: 'meeting not found' });
-    const question = (req.body?.question || '').trim();
+    const question = questionOf(req.body);
     if (!question) return res.status(400).json({ error: 'question required' });
     const transcript = db.listUtterances(id).map((u) => `${u.display_name}: ${u.text}`).join('\n');
     try {
@@ -577,149 +653,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null }) {
     } catch (e) { res.status(502).json({ error: e.message }); }
   });
 
-  // ── Campaigns (cross-session memory) ───────────────────────────────────
-  // A campaign groups sessions, keeps an LLM-maintained journal, and answers
-  // questions across all of its sessions. Voice channels link to a campaign so
-  // new recordings there join it automatically.
-  const cleanName = (v) => (typeof v === 'string' ? v.trim().slice(0, 100) : '');
-  const getCampaignOr404 = (req, res) => {
-    const c = db.getCampaign(Number(req.params.id));
-    if (!c) res.status(404).json({ error: 'campaign not found' });
-    return c;
-  };
-
-  r.get('/guilds/:g/campaigns', (req, res) => {
-    res.json(db.listCampaigns(req.params.g).map(({ journal, ...c }) => ({ ...c, has_journal: !!journal })));
-  });
-
-  r.post('/guilds/:g/campaigns', requireAdmin, (req, res) => {
-    const name = cleanName(req.body?.name);
-    if (!name) return res.status(400).json({ error: 'name required' });
-    const id = db.createCampaign({ guildId: req.params.g, name });
-    let attached = 0;
-    if (req.body?.channelId) {
-      attached = db.linkCampaignChannel(id, { guildId: req.params.g, channelId: String(req.body.channelId),
-        channelName: req.body.channelName ?? null, includePast: !!req.body.includePast });
-    }
-    res.json({ ok: true, campaign: db.getCampaign(id), attached });
-  });
-
-  // Voice channels to offer for linking: live ones from Discord, plus any
-  // channel a meeting was ever recorded in (so it works with the bot offline).
-  r.get('/guilds/:g/voice-channels', (req, res) => {
-    const byId = new Map();
-    const rows = db.sql.prepare(
-      `SELECT channel_id, channel_name FROM meetings WHERE guild_id = ? AND channel_id IS NOT NULL
-        GROUP BY channel_id ORDER BY MAX(started_at) DESC`
-    ).all(req.params.g);
-    for (const r0 of rows) byId.set(r0.channel_id, { id: r0.channel_id, name: r0.channel_name || r0.channel_id });
-    const guild = liveClient()?.guilds?.cache?.get(req.params.g);
-    if (guild) {
-      for (const ch of guild.channels.cache.values()) {
-        if (ch.type === ChannelType.GuildVoice || ch.type === ChannelType.GuildStageVoice) byId.set(ch.id, { id: ch.id, name: ch.name });
-      }
-    }
-    const links = db.sql.prepare(`SELECT channel_id, campaign_id FROM campaign_channels WHERE guild_id = ?`).all(req.params.g);
-    const linked = new Map(links.map((l) => [l.channel_id, l.campaign_id]));
-    res.json([...byId.values()].map((c) => ({ ...c, campaignId: linked.get(c.id) ?? null })));
-  });
-
-  r.get('/campaigns/:id', (req, res) => {
-    const c = getCampaignOr404(req, res);
-    if (!c) return;
-    const sessions = db.listCampaignSessions(c.id).map(({ notes, ...m }) => ({
-      ...m, tldr: notes?.tldr ?? null, has_summary: !!notes,
-    }));
-    // Meetings in this guild that aren't in any campaign, for "Add sessions".
-    const unassigned = db.listRecentRich(c.guild_id, 200)
-      .filter((m) => m.campaign_id == null && m.status !== 'empty')
-      .map((m) => ({ id: m.id, channel_name: m.channel_name, started_at: m.started_at, tldr: m.tldr, status: m.status }));
-    res.json({ campaign: c, channels: db.listCampaignChannels(c.id), sessions, unassigned, sections: JOURNAL_SECTIONS });
-  });
-
-  r.patch('/campaigns/:id', requireAdmin, (req, res) => {
-    const c = getCampaignOr404(req, res);
-    if (!c) return;
-    if (req.body?.name !== undefined) {
-      const name = cleanName(req.body.name);
-      if (!name) return res.status(400).json({ error: 'name cannot be empty' });
-      db.renameCampaign(c.id, name);
-    }
-    if (req.body?.journal !== undefined) {
-      if (c.journal_status === 'updating') return res.status(409).json({ error: 'The journal is being updated; try again when it finishes.' });
-      const text = typeof req.body.journal === 'string' ? req.body.journal : '';
-      db.setCampaignJournal(c.id, text.trim() ? text : null);
-    }
-    res.json({ ok: true, campaign: db.getCampaign(c.id) });
-  });
-
-  r.delete('/campaigns/:id', requireAdmin, (req, res) => {
-    const c = getCampaignOr404(req, res);
-    if (!c) return;
-    db.deleteCampaign(c.id);
-    res.json({ ok: true });
-  });
-
-  r.post('/campaigns/:id/channels', requireAdmin, (req, res) => {
-    const c = getCampaignOr404(req, res);
-    if (!c) return;
-    const channelId = req.body?.channelId ? String(req.body.channelId) : '';
-    if (!channelId) return res.status(400).json({ error: 'channelId required' });
-    const attached = db.linkCampaignChannel(c.id, { guildId: c.guild_id, channelId,
-      channelName: req.body.channelName ?? null, includePast: !!req.body.includePast });
-    res.json({ ok: true, attached, channels: db.listCampaignChannels(c.id) });
-  });
-
-  r.delete('/campaigns/:id/channels/:channelId', requireAdmin, (req, res) => {
-    const c = getCampaignOr404(req, res);
-    if (!c) return;
-    db.unlinkCampaignChannel(req.params.channelId);
-    res.json({ ok: true, channels: db.listCampaignChannels(c.id) });
-  });
-
-  // Move a meeting into a campaign (campaignId) or out of one (null).
-  r.put('/meetings/:id/campaign', requireAdmin, (req, res) => {
-    const meeting = db.getMeeting(Number(req.params.id));
-    if (!meeting) return res.status(404).json({ error: 'meeting not found' });
-    const campaignId = req.body?.campaignId == null ? null : Number(req.body.campaignId);
-    if (campaignId != null) {
-      const c = db.getCampaign(campaignId);
-      if (!c) return res.status(404).json({ error: 'campaign not found' });
-      if (c.guild_id !== meeting.guild_id) return res.status(400).json({ error: 'campaign belongs to a different server' });
-    }
-    db.setMeetingCampaign(meeting.id, campaignId);
-    res.json({ ok: true, meeting: db.getMeeting(meeting.id) });
-  });
-
-  // Fold sessions that aren't in the journal yet (or, with rebuild, start the
-  // journal over from every session). Runs in the background — one LLM call
-  // per session — and the UI polls the campaign's journal_status.
-  r.post('/campaigns/:id/journal/update', requireAdmin, (req, res) => {
-    const c = getCampaignOr404(req, res);
-    if (!c) return;
-    if (c.journal_status === 'updating') return res.status(409).json({ error: 'The journal is already being updated.' });
-    catchUpJournal(db, c.id, { rebuild: !!req.body?.rebuild, env })
-      .catch((e) => console.error(`[campaign] journal update for campaign ${c.id} failed: ${e.message}`));
-    res.status(202).json({ ok: true, campaign: db.getCampaign(c.id) });
-  });
-
-  r.post('/campaigns/:id/ask', async (req, res) => {
-    const c = getCampaignOr404(req, res);
-    if (!c) return;
-    const question = (req.body?.question || '').trim();
-    if (!question) return res.status(400).json({ error: 'question required' });
-    try {
-      res.json({ answer: await askCampaign(db, c.id, question, { env }) });
-    } catch (e) { res.status(502).json({ error: e.userMessage || e.message }); }
-  });
-
-  r.post('/campaigns/:id/recap', async (req, res) => {
-    const c = getCampaignOr404(req, res);
-    if (!c) return;
-    try {
-      res.json({ recap: await recapCampaign(db, c.id, { sessions: req.body?.sessions, env }) });
-    } catch (e) { res.status(502).json({ error: e.userMessage || e.message }); }
-  });
+  mountCampaignRoutes(r, { db, liveClient });
 
   return r;
 }

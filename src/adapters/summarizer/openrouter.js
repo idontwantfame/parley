@@ -1,7 +1,7 @@
-import { parseGeminiNotes } from './gemini.js';
+import { completionAnswer, notesFromCompletion } from './parse.js';
 import { summaryPrompt } from './notes.js';
 import { summaryLanguageInstruction } from './languages.js';
-import { httpError, withRetry } from './errors.js';
+import { CHAT_TIMEOUT_MS, chatFetch, postChatCompletion } from './chat.js';
 import { config } from '../../config/env.js';
 
 // OpenRouter is an OpenAI-compatible gateway to many vendors' models
@@ -11,9 +11,11 @@ import { config } from '../../config/env.js';
 // a separate class so the missing-key message and retry/error labels name
 // OpenRouter rather than OpenAI.
 export class OpenRouterSummarizer {
-  constructor(model, baseUrl = config.openrouter.baseUrl, apiKey = config.openrouter.apiKey, fetchImpl = fetch) {
+  constructor(model, baseUrl = config.openrouter.baseUrl, apiKey = config.openrouter.apiKey, fetchImpl, { timeoutMs = CHAT_TIMEOUT_MS } = {}) {
     if (!apiKey) throw new Error('OPENROUTER_API_KEY is not set in .env');
-    this.model = model; this.baseUrl = baseUrl; this.apiKey = apiKey; this.fetchImpl = fetchImpl;
+    this.model = model; this.baseUrl = baseUrl; this.apiKey = apiKey;
+    this.timeoutMs = timeoutMs;
+    this.fetchImpl = chatFetch(fetchImpl, timeoutMs);
   }
   // Optional attribution headers — OpenRouter uses these for app rankings.
   headers() {
@@ -24,29 +26,22 @@ export class OpenRouterSummarizer {
       'X-Title': 'Parley',
     };
   }
+  complete(prompt) {
+    return postChatCompletion({
+      fetchImpl: this.fetchImpl,
+      url: `${this.baseUrl}/chat/completions`,
+      headers: this.headers(),
+      payload: { model: this.model, messages: [{ role: 'user', content: prompt }] },
+      provider: 'OpenRouter',
+      timeoutMs: this.timeoutMs,
+    });
+  }
   async summarize(transcript, meta) {
     const prompt = `${summaryPrompt(meta)}${summaryLanguageInstruction(meta.summaryLanguage)}\n\nAttendees: ${(meta.attendees || []).join(', ')}\n\nTranscript:\n${transcript}`;
-    const body = await withRetry(async () => {
-      const res = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: this.headers(),
-        body: JSON.stringify({ model: this.model, messages: [{ role: 'user', content: prompt }] }),
-      });
-      if (!res.ok) throw httpError('OpenRouter', res.status, await res.text().catch(() => ''));
-      return res.json();
-    });
-    return parseGeminiNotes(body.choices?.[0]?.message?.content ?? '');
+    const body = await this.complete(prompt);
+    return notesFromCompletion(body, { provider: 'OpenRouter', allowProse: meta.summaryPrompt != null });
   }
   async ask(prompt) {
-    const body = await withRetry(async () => {
-      const res = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: this.headers(),
-        body: JSON.stringify({ model: this.model, messages: [{ role: 'user', content: prompt }] }),
-      });
-      if (!res.ok) throw httpError('OpenRouter', res.status, await res.text().catch(() => ''));
-      return res.json();
-    });
-    return body.choices?.[0]?.message?.content ?? '';
+    return completionAnswer(await this.complete(prompt));
   }
 }

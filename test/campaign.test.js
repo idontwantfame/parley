@@ -12,7 +12,7 @@ import {
   campaignContextFor, buildJournalUpdatePrompt,
 } from '../src/campaign/journal.js';
 import {
-  extractTerms, ftsQuery, askCampaign, recapCampaign, resolveCampaign, sessionNotesBlock,
+  extractTerms, ftsQuery, askCampaign, recapCampaign, resolveCampaign, sessionNotesBlock, transcriptExcerpts,
 } from '../src/campaign/ask.js';
 import { campaignChoices } from '../src/commands/autocomplete.js';
 
@@ -362,4 +362,169 @@ test('campaign API: journal update runs in the background and refuses to overlap
     const res = await fetch(`${base}/api/campaigns/${cid}/journal/update`, send('POST', {}));
     assert.equal(res.status, 202);
   } finally { close(); }
+});
+
+// ── Journal robustness ───────────────────────────────────────────────────
+const bigJournal = (perSection = 40) => ['Party', 'NPCs', 'Locations', 'Quests & Plot Threads', 'Items & Loot', 'Lore & World', 'Open Mysteries']
+  .map((s) => `## ${s}\n${Array.from({ length: perSection }, (_, i) => `- **${s} entry ${i}** — some detail about it`).join('\n')}`)
+  .join('\n\n');
+
+test('checkJournalUpdate rejects a rewrite that drops a section of the current journal', () => {
+  const prev = '## Party\n- a\n\n## NPCs\n- b\n\n## Locations\n- c';
+  assert.throws(() => checkJournalUpdate(prev, '## Party\n- a\n\n## NPCs\n- b'), /Locations/);
+  assert.doesNotThrow(() => checkJournalUpdate(prev, '## party \n- a\n\n## NPCs\n- b\n- new\n\n## Locations\n- c'));
+  assert.doesNotThrow(() => checkJournalUpdate('', '## Party\n- first fold'));
+});
+
+test('a long session without topics still folds, from a clipped transcript', async () => {
+  const db = openDb(':memory:');
+  const cid = db.createCampaign({ guildId: 'g', name: 'C' });
+  db.linkCampaignChannel(cid, { guildId: 'g', channelId: 'vc' });
+  const lines = Array.from({ length: 300 }, (_, i) => `line ${i} ${'words '.repeat(6)}`);
+  const id = session(db, { startedAt: '2026-01-01T19:00:00Z', lines });
+  db.saveSummary(id, { tldr: 'They fought', topics: [], decisions: [], openQuestions: [], actionItems: [] }, [], 'fake');
+  const s = recorder();
+  assert.deepEqual(await catchUpJournal(db, cid, { cfg: CFG, summarizer: s }), { folded: 1 });
+  const material = s.prompts[0].split('<session_material>')[1];
+  assert.ok(material.length < 7500);
+  assert.match(material, /line 0 /);
+  assert.match(material, /line 299 /); // the end of the session is kept too
+  assert.match(material, /omitted/);
+  assert.ok(db.getMeeting(id).journaled_at);
+});
+
+test('catchUpJournal reports partial progress when a later session fails', async () => {
+  const db = openDb(':memory:');
+  const cid = db.createCampaign({ guildId: 'g', name: 'C' });
+  db.linkCampaignChannel(cid, { guildId: 'g', channelId: 'vc' });
+  const first = session(db, { startedAt: '2026-01-01T19:00:00Z', lines: ['one'] });
+  const second = session(db, { startedAt: '2026-02-01T19:00:00Z', lines: ['two'] });
+  const s = recorder((_p, n) => { if (n === 2) throw new Error('provider down'); return '## Party\n- one'; });
+  await assert.rejects(catchUpJournal(db, cid, { cfg: CFG, summarizer: s }), /provider down/);
+  const c = db.getCampaign(cid);
+  assert.equal(c.journal_status, 'error');
+  assert.match(c.journal_error, /1 of 2 sessions/);
+  assert.match(c.journal_error, /session 2/i);
+  assert.match(c.journal_error, /provider down/);
+  assert.ok(db.getMeeting(first).journaled_at);
+  assert.equal(db.getMeeting(second).journaled_at, null);
+});
+
+test('catchUpJournal lists the campaign sessions once, not once per folded session', async () => {
+  const db = openDb(':memory:');
+  const cid = db.createCampaign({ guildId: 'g', name: 'C' });
+  db.linkCampaignChannel(cid, { guildId: 'g', channelId: 'vc' });
+  for (let m = 1; m <= 4; m++) session(db, { startedAt: `2026-0${m}-01T19:00:00Z`, lines: [`s${m}`] });
+  let calls = 0;
+  const list = db.listCampaignSessions.bind(db);
+  db.listCampaignSessions = (id) => { calls++; return list(id); };
+  assert.deepEqual(await catchUpJournal(db, cid, { cfg: CFG, summarizer: recorder() }), { folded: 4 });
+  assert.equal(calls, 1);
+});
+
+test('the automatic fold shows journal_status updating while it runs, then idle', async () => {
+  const db = openDb(':memory:');
+  const cid = db.createCampaign({ guildId: 'g', name: 'C' });
+  db.linkCampaignChannel(cid, { guildId: 'g', channelId: 'vc' });
+  const id = session(db, { startedAt: '2026-01-01T19:00:00Z', lines: ['x'] });
+  let during;
+  const s = recorder((p) => { during = db.getCampaign(cid).journal_status; return JOURNAL; });
+  await foldMeetingIntoJournal(db, id, { cfg: CFG, summarizer: s });
+  assert.equal(during, 'updating');
+  assert.equal(db.getCampaign(cid).journal_status, 'idle');
+});
+
+test('a failed automatic fold leaves a visible, actionable journal error', async () => {
+  const db = openDb(':memory:');
+  const cid = db.createCampaign({ guildId: 'g', name: 'C' });
+  db.linkCampaignChannel(cid, { guildId: 'g', channelId: 'vc' });
+  db.setCampaignJournal(cid, bigJournal(60));
+  const id = db.createMeeting({ guildId: 'g', channelId: 'vc', channelName: 'dnd', startedAt: '2026-01-01T19:00:00Z' });
+  const result = await processMeeting(db, id, {
+    tracks: [], cfg: CFG, summarizer: recorder(),
+    transcribe: async () => ({ utterances: [{ userId: 'u1', displayName: 'Alex', startMs: 0, endMs: 1000, text: 'hi' }], failures: [] }),
+  });
+  assert.match(result.journal.error, /too long/);
+  const c = db.getCampaign(cid);
+  assert.equal(c.journal_status, 'error');
+  assert.match(c.journal_error, /characters/);
+  assert.match(c.journal_error, /Update journal/);
+});
+
+test('journal excerpts fed to prompts keep every section and whole entries', async () => {
+  const db = openDb(':memory:');
+  const cid = db.createCampaign({ guildId: 'g', name: 'C' });
+  db.linkCampaignChannel(cid, { guildId: 'g', channelId: 'vc' });
+  db.setCampaignJournal(cid, bigJournal());
+  const id = session(db, { startedAt: '2026-01-01T19:00:00Z', lines: ['the amulet'] });
+  const context = campaignContextFor(db, db.getMeeting(id));
+  assert.ok(context.length <= 3500, `context is ${context.length} chars`);
+  for (const line of context.split('\n')) {
+    assert.ok(line === '' || /^## /.test(line) || /^- \*\*.+ entry \d+\*\* — some detail about it$/.test(line) || /^- …/.test(line), `cut entry: ${line}`);
+  }
+  assert.match(context, /## Open Mysteries\n- \*\*Open Mysteries entry 0\*\*/);
+  const s = recorder('ok');
+  await askCampaign(db, cid, 'What about the amulet?', { cfg: CFG, summarizer: s });
+  await recapCampaign(db, cid, { cfg: CFG, summarizer: s });
+  for (const p of s.prompts) {
+    const journal = p.split('<campaign_journal>')[1].split('</campaign_journal>')[0];
+    assert.ok(journal.length <= 4100);
+    assert.match(journal, /## Open Mysteries\n- \*\*Open Mysteries entry 0\*\*/);
+  }
+});
+
+// ── Campaign Q&A excerpts ────────────────────────────────────────────────
+function excerptDb(rows, ranked) {
+  return {
+    searchCampaignUtterances: () => ranked,
+    firstUtteranceMs: (id) => Math.min(...rows.filter((u) => u.meeting_id === id).map((u) => u.start_ms)),
+    utterancesBetween: (id, from, to) => rows.filter((u) => u.meeting_id === id && u.start_ms >= from && u.start_ms <= to),
+  };
+}
+
+test('transcriptExcerpts keeps the best match even when an older window is over budget', () => {
+  const monologue = { meeting_id: 1, start_ms: 1000, display_name: 'GM', text: 'dragon '.repeat(700) };
+  const best = { meeting_id: 9, start_ms: 5000, display_name: 'Ann', text: 'We killed the dragon Vex at the bridge.' };
+  const db = excerptDb([monologue, best], [best, monologue]); // bm25: session 9 first
+  const out = transcriptExcerpts(db, 7, 'who killed the dragon', [{ id: 1, number: 1 }, { id: 9, number: 9 }], 4000);
+  assert.match(out, /\[Session 9, around 00:00\]\nAnn: We killed the dragon Vex/);
+  assert.ok(out.length <= 4000);
+});
+
+test('transcriptExcerpts picks by rank, then shows the kept passages in session order', () => {
+  const rows = [
+    { meeting_id: 1, start_ms: 0, display_name: 'Al', text: 'the amulet was found' },
+    { meeting_id: 2, start_ms: 0, display_name: 'Bo', text: 'the amulet glows' },
+  ];
+  const out = transcriptExcerpts(excerptDb(rows, [rows[1], rows[0]]), 7, 'amulet', [{ id: 1, number: 1 }, { id: 2, number: 2 }], 4000);
+  assert.ok(out.indexOf('[Session 1') < out.indexOf('[Session 2'));
+  assert.ok(out.indexOf('[Session 1') >= 0);
+});
+
+test('transcriptExcerpts clips an oversize window to the lines nearest the match', () => {
+  const rows = Array.from({ length: 50 }, (_, i) => ({ meeting_id: 1, start_ms: i * 1000, display_name: 'GM', text: i === 25 ? 'the amulet shatters' : `filler line number ${i} ${'x'.repeat(40)}` }));
+  const out = transcriptExcerpts(excerptDb(rows, [rows[25]]), 7, 'amulet', [{ id: 1, number: 1 }], 600);
+  assert.ok(out.length > 0 && out.length <= 600, `length ${out.length}`);
+  assert.match(out, /GM: the amulet shatters/);
+  assert.match(out, /filler line number 24 /);
+  assert.doesNotMatch(out, /filler line number 0 /);
+});
+
+test('recapCampaign reads only the end of the last session, with renamed speakers', async () => {
+  const db = openDb(':memory:');
+  const cid = db.createCampaign({ guildId: 'g', name: 'C' });
+  db.linkCampaignChannel(cid, { guildId: 'g', channelId: 'vc' });
+  session(db, { startedAt: '2026-01-01T19:00:00Z', lines: Array.from({ length: 100 }, (_, i) => `line ${i}`).concat('The door slams shut!') });
+  db.setSpeakerName('g', 'u1', 'Alexandra');
+  db.listUtterances = () => { throw new Error('loaded the whole session'); };
+  const asked = [];
+  const listLast = db.listLastUtterances.bind(db);
+  db.listLastUtterances = (id, n) => { asked.push(n); return listLast(id, n); };
+  const s = recorder('Previously…');
+  await recapCampaign(db, cid, { cfg: CFG, summarizer: s });
+  assert.deepEqual(asked, [60]);
+  const tail = s.prompts[0].split('<end_of_last_session>')[1];
+  assert.match(tail, /Alexandra: The door slams shut!/);
+  assert.doesNotMatch(tail, /line 39\n/);
+  assert.match(tail, /line 41\n/);
 });

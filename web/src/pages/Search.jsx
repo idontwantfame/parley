@@ -5,6 +5,9 @@ import { useGuild } from '../GuildContext.jsx';
 import { Page, PageHead } from '../components/Page.jsx';
 import { Avatar, Icon, Empty } from '../components/ui.jsx';
 
+// The server returns at most this many matches per search.
+const SEARCH_RESULT_CAP = 50;
+
 function highlight(text, q) {
   if (!q) return text;
   const needle = q.toLowerCase();
@@ -83,7 +86,11 @@ export default function Search() {
           <Empty icon={Icon.Search} title={`No matches${urlQ ? ` for "${urlQ}"` : ''}`} body="Try different keywords or a shorter phrase." />
         ) : rows.length > 0 ? (
           <>
-            <p className="text-xs text-muted mb-2 px-1">{rows.length} {rows.length === 1 ? 'result' : 'results'}</p>
+            <p className="text-xs text-muted mb-2 px-1">
+              {rows.length >= SEARCH_RESULT_CAP
+                ? `Showing the first ${rows.length} matches. Use more specific words to narrow it down.`
+                : `${rows.length} ${rows.length === 1 ? 'result' : 'results'}`}
+            </p>
             <ul className="card p-1 divide-y divide-border">
               {rows.map((row) => <ResultRow key={row.id} row={row} q={urlQ} />)}
             </ul>

@@ -7,14 +7,32 @@ export class MeetingManager {
     this.now = now;
     this.active = new Map();              // key "guild:channel" -> session
     this.processing = new Map();          // meetingId -> post-recording session data
+    this.finalizing = new Map();          // meetingId -> finalize `done` promise
   }
 
   key(guildId, channelId) { return `${guildId}:${channelId}`; }
   isActive(guildId, channelId) { return this.active.has(this.key(guildId, channelId)); }
 
+  // At most one recording per guild: Discord allows the bot in one voice channel
+  // per guild and @discordjs/voice shares a single connection per guild, so a
+  // second channel would take over the first meeting's connection and audio.
+  activeInGuild(guildId) {
+    const session = [...this.active.values()].find((s) => s.guildId === guildId);
+    return session ? plain(session) : null;
+  }
+
+  /** The voice connection this recording was started on (null when not live). */
+  connectionOf(guildId, channelId) {
+    return this.active.get(this.key(guildId, channelId))?.connection ?? null;
+  }
+
   start({ guildId, channelId, channelName, connection, guild, attendees }) {
     const k = this.key(guildId, channelId);
     if (this.active.has(k)) return this.active.get(k).meetingId;
+    const other = this.activeInGuild(guildId);
+    if (other) {
+      throw new Error(`Already recording channel ${other.channelId} in this server (one voice channel per server).`);
+    }
 
     const startedAt = this.now();
     const meetingId = this.db.createMeeting({ guildId, channelId, channelName, startedAt });
@@ -49,7 +67,17 @@ export class MeetingManager {
     const session = this.active.get(k);
     if (!session) return null;
     this.active.delete(k);
-    if (session.stopAll) await session.stopAll();  // flush in-flight speaking turns first
+    // Track this meeting as in flight from now on (not only once finalize
+    // starts), so waitForFinalize can't miss a stop that is still flushing.
+    let settle;
+    this.finalizing.set(session.meetingId, new Promise((resolve) => { settle = resolve; }));
+    try {
+      if (session.stopAll) await session.stopAll();  // flush in-flight speaking turns first
+    } catch (err) {
+      this.finalizing.delete(session.meetingId);
+      settle();
+      throw err;
+    }
     const tracks = session.registry.list();
 
     const stoppedAt = this.now();
@@ -80,22 +108,37 @@ export class MeetingManager {
         } catch { /* leave it */ }
         throw err;
       })
-      .finally(() => this.processing.delete(session.meetingId));
+      .finally(() => {
+        this.processing.delete(session.meetingId);
+        this.finalizing.delete(session.meetingId);
+        settle();
+      });
     done.catch(() => {}); // callers may not await `done` — never leave an unhandled rejection
 
     return { meetingId: session.meetingId, done };
   }
 
+  /**
+   * Wait (bounded) for every in-flight finalize pipeline to settle — used before
+   * tearing down the Discord client those pipelines deliver notes through.
+   * Resolves { timedOut, pending } and never rejects.
+   */
+  async waitForFinalize(timeoutMs) {
+    const pending = [...this.finalizing.values()];
+    if (pending.length === 0) return { timedOut: false, pending: 0 };
+    let timer;
+    const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve('timeout'), timeoutMs); });
+    const outcome = await Promise.race([Promise.allSettled(pending).then(() => 'done'), timeout]);
+    clearTimeout(timer);
+    return outcome === 'timeout'
+      ? { timedOut: true, pending: this.finalizing.size }
+      : { timedOut: false, pending: 0 };
+  }
+
   // In-progress recordings, as plain data for the web dashboard's live view.
   // No Discord/voice handles leak out — just what the UI needs to render.
   listActive() {
-    return [...this.active.values()].map((s) => ({
-      meetingId: s.meetingId,
-      guildId: s.guildId,
-      channelId: s.channelId,
-      channelName: s.channelName,
-      startedAt: s.startedAt,
-    }));
+    return [...this.active.values()].map(plain);
   }
 
   // Meetings whose recording stopped but whose pipeline (transcribe/summarize/
@@ -110,4 +153,14 @@ export class MeetingManager {
       stoppedAt: s.stoppedAt,
     }));
   }
+}
+
+function plain(s) {
+  return {
+    meetingId: s.meetingId,
+    guildId: s.guildId,
+    channelId: s.channelId,
+    channelName: s.channelName,
+    startedAt: s.startedAt,
+  };
 }

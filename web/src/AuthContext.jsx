@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { api, setUnauthorizedHandler } from './api.js';
 
 const Ctx = createContext(null);
@@ -51,6 +51,13 @@ export function AuthProvider({ children }) {
     }
   }, []);
 
+  // Retry from the "can't reach the server" card: show the spinner while the
+  // request is in flight instead of flashing the Login screen.
+  const retry = useCallback(() => {
+    setLoading(true);
+    return refresh();
+  }, [refresh]);
+
   useEffect(() => { refresh(); }, [refresh]);
 
   // A 401 from any API call (expired/revoked session mid-use) clears the user so
@@ -73,9 +80,16 @@ export function AuthProvider({ children }) {
     window.location.assign('/');
   }, []);
 
-  return (
-    <Ctx.Provider value={{ user, authEnabled, defaultPasswordActive, loading, error, refresh, login, logout, setUser }}>
-      {children}
-    </Ctx.Provider>
+  const value = useMemo(
+    () => ({ user, authEnabled, defaultPasswordActive, loading, error, refresh, retry, login, logout }),
+    [user, authEnabled, defaultPasswordActive, loading, error, refresh, retry, login, logout],
   );
+  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
+}
+
+// True when the signed-in user may perform admin-only actions (or when the
+// server runs without auth, in which case every action is allowed).
+export function useIsAdmin() {
+  const { user, authEnabled } = useAuth();
+  return !authEnabled || Boolean(user?.isAdmin);
 }

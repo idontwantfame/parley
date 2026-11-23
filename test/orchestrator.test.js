@@ -204,3 +204,52 @@ test('processMeeting reports delivered:true on a successful post', async () => {
   assert.equal(db.getMeeting(id).delivery_status, 'posted');
   assert.equal(db.getMeeting(id).delivery_summary_at, db.getSummary(id).created_at);
 });
+
+test('processMeeting names the STT provider and the first track error when every track fails', async () => {
+  const { db, id } = seed();
+  const err = await processMeeting(db, id, {
+    tracks,
+    cfg: { summarizerProvider: 'fake', sttProvider: 'openai' },
+    summarizer: new FakeSummarizer(),
+    transcribe: async () => ({ utterances: [], failures: [{ userId: 'u1', displayName: 'Alice', error: 'OpenAI STT HTTP 400: unsupported response_format' }] }),
+  }).catch((e) => e);
+  assert.match(err.userMessage, /OpenAI/);
+  assert.match(err.userMessage, /HTTP 400: unsupported response_format/);
+  assert.doesNotMatch(err.userMessage, /sidecar/i);
+});
+
+test('processMeeting blames the local sidecar only when the sidecar is the provider', async () => {
+  const { db, id } = seed();
+  const err = await processMeeting(db, id, {
+    tracks,
+    cfg: { summarizerProvider: 'fake' },
+    summarizer: new FakeSummarizer(),
+    transcribe: async () => { throw new Error('connect ECONNREFUSED'); },
+  }).catch((e) => e);
+  assert.match(err.userMessage, /Local sidecar/);
+  assert.match(err.userMessage, /ECONNREFUSED/);
+});
+
+test('processMeeting re-run swaps the summary and todos atomically, keeping ticked-off items', async () => {
+  const { db, id } = seed();
+  const meeting = db.getMeeting(id);
+  db.saveSummary(id, { tldr: 'old', topics: [], decisions: [], openQuestions: [], actionItems: [] }, [], 'fake');
+  db.seedTodos(id, meeting.guild_id, [{ assignee: 'Alice', task: 'ship it' }, { assignee: 'Bob', task: 'stale task' }]);
+  const shipped = db.listTodos(meeting.guild_id).find((t) => t.task === 'ship it');
+  db.sql.prepare('UPDATE todos SET done = 1 WHERE id = ?').run(shipped.id);
+
+  let summaryWrites = 0;
+  const saveSummary = db.saveSummary.bind(db);
+  db.saveSummary = (...args) => { summaryWrites++; return saveSummary(...args); };
+  await processMeeting(db, id, {
+    tracks,
+    cfg: { summarizerProvider: 'fake' },
+    summarizer: new FakeSummarizer({ tldr: 'new', actionItems: [{ assignee: 'Alice', task: 'ship it' }] }),
+    transcribe: async () => ({ utterances: [{ userId: 'u1', displayName: 'Alice', startMs: 0, endMs: 1000, text: 'ship it' }], failures: [] }),
+  });
+  const todos = db.listTodos(meeting.guild_id);
+  assert.deepEqual(todos.map((t) => [t.task, t.done]), [['ship it', 1]]);
+  assert.equal(db.getSummary(id).notes.tldr, 'new');
+  assert.equal(db.getSummary(id).timings.tracks, 1);
+  assert.equal(summaryWrites, 1, 'one write, inside replaceSummary');
+});

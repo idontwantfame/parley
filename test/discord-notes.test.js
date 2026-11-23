@@ -187,3 +187,35 @@ test('renderNotes omits empty optional sections but keeps Action Items', () => {
 test('chunk leaves short text as a single piece', () => {
   assert.deepEqual(chunk('short', 1900), ['short']);
 });
+
+import { notesThreadName } from '../src/delivery/post.js';
+
+test('notes thread names never exceed Discord\'s 100-character limit', () => {
+  const longName = '🎲'.repeat(30) + 'x'.repeat(70); // a 100-char channel name
+  const name = notesThreadName(longName, '2026-10-01T10:00:00Z');
+  assert.ok(name.length <= 100, `length ${name.length}`);
+  assert.match(name, /^Notes — /);
+  assert.match(name, / 2026-10-01$/, 'the date stays visible');
+  assert.doesNotMatch(name, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/, 'no split surrogate pair');
+});
+
+test('short notes thread names are unchanged', () => {
+  assert.equal(notesThreadName('Crew', '2026-10-01T10:00:00Z'), 'Notes — Crew 2026-10-01');
+});
+
+test('Discord delivery creates threads with a safe name', async () => {
+  const created = [];
+  const thread = { send: async () => {} };
+  const channel = {
+    type: 0, // ChannelType.GuildText
+    send: async () => {},
+    threads: { create: async (opts) => { created.push(opts.name); return thread; } },
+  };
+  await postNotes({
+    client: { channels: { fetch: async () => channel } },
+    meeting: { channel_id: 'v', channel_name: 'n'.repeat(100), started_at: '2026-10-01T10:00:00Z', ended_at: '2026-10-01T10:45:00Z' },
+    cfg: { useThread: true }, notes, talktime,
+  });
+  assert.equal(created.length, 1);
+  assert.ok(created[0].length <= 100);
+});

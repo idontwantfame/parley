@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createOpenAICompatibleSTT, normalize } from '../src/adapters/stt/openai-compatible.js';
+import { wavHeader } from '../src/voice/audio.js';
 import {
   getSTT, resolveSttModel, sttProviderReady, availableSttProviders,
   STT_PROVIDERS, STT_MODELS,
@@ -98,6 +99,43 @@ test('openai-compatible retries once then succeeds', async () => {
   const { fetchImpl } = captureFetch([new Error('net'), { ok: true, status: 200, body: { text: 'ok', words: [] } }]);
   const out = await createOpenAICompatibleSTT({ baseUrl: 'http://x/v1', apiKey: 'k' }, { fetchImpl, readFile: fakeRead, retries: 1 })('/tmp/a.wav', {});
   assert.equal(out.text, 'ok');
+});
+
+test('gpt-4o transcribe models get plain json and one segment spanning the track', async () => {
+  // These models reject verbose_json / word timestamps (HTTP 400 on every track).
+  const wav = Buffer.concat([wavHeader(64_000), Buffer.alloc(64_000)]); // 2s of 16kHz mono s16le
+  for (const model of ['gpt-4o-transcribe', 'gpt-4o-mini-transcribe']) {
+    const { fetchImpl, calls } = captureFetch([{ ok: true, status: 200, body: { text: ' hello there ' } }]);
+    const stt = createOpenAICompatibleSTT({ baseUrl: 'http://x/v1', apiKey: 'k' }, { fetchImpl, readFile: async () => wav });
+    const out = await stt('/tmp/a.wav', { model });
+    const form = calls[0].init.body;
+    assert.equal(form.get('response_format'), 'json');
+    assert.equal(form.get('timestamp_granularities[]'), null);
+    assert.equal(out.text, 'hello there');
+    assert.deepEqual(out.words, [{ word: 'hello there', start: 0, end: 2 }]);
+  }
+});
+
+test('whisper models keep verbose_json with word timestamps', async () => {
+  const { fetchImpl, calls } = captureFetch([{ ok: true, status: 200, body: { text: 'x', words: [] } }]);
+  await createOpenAICompatibleSTT({ baseUrl: 'http://x/v1', apiKey: 'k' }, { fetchImpl, readFile: fakeRead })('/tmp/a.wav', { model: 'whisper-1' });
+  assert.equal(calls[0].init.body.get('response_format'), 'verbose_json');
+  assert.equal(calls[0].init.body.get('timestamp_granularities[]'), 'word');
+});
+
+test('openai-compatible does not retry a 4xx or a timeout', async () => {
+  const bad = captureFetch([{ ok: false, status: 400, body: 'unsupported response_format' }, { ok: true, status: 200, body: { text: 'x' } }]);
+  await assert.rejects(
+    createOpenAICompatibleSTT({ baseUrl: 'http://x/v1', apiKey: 'k' }, { fetchImpl: bad.fetchImpl, readFile: fakeRead, retries: 2 })('/tmp/a.wav', { model: 'whisper-1' }),
+    /HTTP 400: unsupported response_format/,
+  );
+  assert.equal(bad.calls.length, 1);
+  const slow = captureFetch([new DOMException('timeout', 'TimeoutError'), { ok: true, status: 200, body: { text: 'x' } }]);
+  await assert.rejects(
+    createOpenAICompatibleSTT({ baseUrl: 'http://x/v1', apiKey: 'k' }, { fetchImpl: slow.fetchImpl, readFile: fakeRead, retries: 2 })('/tmp/a.wav', { model: 'whisper-1' }),
+    /timed out/,
+  );
+  assert.equal(slow.calls.length, 1);
 });
 
 // ── resolver / model selection ───────────────────────────────────────────────

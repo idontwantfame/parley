@@ -2,23 +2,41 @@
 // All Discord bot wiring. Exported as startBot() so it can be launched lazily —
 // the web UI boots first (even with no credentials) and starts the bot once the
 // user connects their Discord app. Returns the live client + meeting manager.
+//
+// One meeting per guild: Discord lets a bot sit in a single voice channel per
+// guild and @discordjs/voice keeps one connection per guild, so joins, stops and
+// connection teardown are all scoped to the guild's one recording.
 import { Client, GatewayIntentBits, ChannelType } from 'discord.js';
-import { joinVoiceChannel, getVoiceConnection, entersState, VoiceConnectionStatus } from '@discordjs/voice';
+import { VoiceConnectionStatus } from '@discordjs/voice';
 import { rm } from 'node:fs/promises';
 import { config, validateEnv } from './config/env.js';
 import { getGuildConfig, setGuildConfig } from './store/config.js';
 import { deployCommands, clearGlobalCommands } from './commands/deploy.js';
 import { MeetingManager } from './voice/meeting-manager.js';
 import { TrackRegistry, attachCapture } from './voice/capture.js';
+import { connectToChannel } from './voice/connect.js';
+import { waitForReconnect } from './voice/reconnect.js';
+import { GuildVoiceGate, AUTO_LEAVE_GRACE_MS } from './voice/guild-voice-gate.js';
+import { canDiscardAudio } from './voice/recording-archive.js';
 import { processMeeting } from './pipeline/orchestrator.js';
 import { getSummarizer } from './adapters/summarizer/index.js';
 import { resolveSummaryLanguage } from './adapters/summarizer/languages.js';
-import { shouldAutoJoin, shouldAutoLeave } from './voice/decisions.js';
-import { validateSetup } from './commands/setup-logic.js';
+import { shouldAutoJoin, shouldAutoLeave, botMovedAway } from './voice/decisions.js';
+import { validateSetup, formatConfigReply } from './commands/setup-logic.js';
 import { handleAutocomplete } from './commands/autocomplete.js';
+import { resolveGuildMeeting, renderStatus, renderHistory } from './commands/meeting-lookup.js';
+import { joinRefusal, joinOutcomeReply } from './commands/voice-replies.js';
 import { renderNotesChunks, chunk } from './delivery/discord-notes.js';
-import { postNotes } from './delivery/post.js';
+import { postNotes, notesThreadName } from './delivery/post.js';
 import { askCampaign, recapCampaign, resolveCampaign } from './campaign/ask.js';
+
+// Minimal, non-privileged intents (MessageContent would fail login). Mentions
+// are off by default for EVERY message: notes, LLM answers, transcripts and
+// error text are posted verbatim and must never ping @everyone/@here or roles.
+export const CLIENT_OPTIONS = {
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+  allowedMentions: { parse: [] },
+};
 
 export function startBot({ db, audioRoot }) {
   validateEnv({
@@ -33,9 +51,9 @@ export function startBot({ db, audioRoot }) {
   const DEBUG_VOICE = process.env.DEBUG_VOICE === '1';
   const debugLog = (...args) => { if (DEBUG_VOICE) console.log(...args); };
 
-  const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
-  });
+  const client = new Client(CLIENT_OPTIONS);
+  // Always have an 'error' listener: an EventEmitter 'error' without one throws.
+  client.on('error', (err) => console.error('[discord] client error:', err.message));
   client.on('raw', (packet) => {
     if (!DEBUG_VOICE) return;
     if (packet.t === 'VOICE_STATE_UPDATE' || packet.t === 'VOICE_SERVER_UPDATE') {
@@ -48,43 +66,53 @@ export function startBot({ db, audioRoot }) {
     startCapture: ({ meetingId, connection, guild, audioDir }) => {
       const registry = new TrackRegistry();
       const { stopAll } = attachCapture({
-        connection, guild, audioDir, registry,
+        connection, guild, audioDir, registry, meetingId,
         // Record latecomers the moment they first speak (INSERT OR IGNORE keeps
         // it idempotent), so attendees isn't limited to the start snapshot.
         onSpeaker: (userId, displayName) => db.addAttendee(meetingId, userId, displayName),
       });
       return { registry, stopAll };
     },
-    finalize: async (meetingId, tracks, session) => {
-      const meeting = db.getMeeting(meetingId);
-      const cfg = getGuildConfig(db, meeting.guild_id);
-      try {
-        const result = await processMeeting(db, meetingId, {
-          tracks,
-          cfg,
-          summarizer: getSummarizer(cfg),
-          deliver: async (notes, talktime) => postNotes({ client, meeting, cfg, notes, talktime }),
-        });
-        if (!result?.audioRetained) await rm(session.audioDir, { recursive: true, force: true }).catch(() => {});
-        // Nobody spoke — drop the empty meeting record entirely.
-        if (result?.empty) db.deleteMeeting(meetingId);
-        // Summary succeeded but posting didn't (perms/deleted channel): the notes
-        // are safe in the dashboard and the meeting stays 'done'. Best-effort ping
-        // the origin channel so people aren't left waiting on a thread that never comes.
-        else if (result?.deliveryError) {
-          const ch = await client.channels.fetch(meeting.channel_id).catch(() => null);
-          if (ch) await ch.send(`⚠️ Meeting ${meetingId} notes are ready in the dashboard, but I couldn't post them here: ${result.deliveryError}`).catch(() => {});
-        }
-      } catch (err) {
-        console.error(`Meeting ${meetingId} failed:`, err.message);
-        const reason = err.userMessage || err.message;
-        const ch = await client.channels.fetch(cfg.notesChannelId || meeting.channel_id).catch(() => null);
-        if (ch) await ch.send(`⚠️ Meeting ${meetingId} failed: ${reason}\nOpen the meeting in Parley to see the available recovery options.`).catch(() => {});
-      }
-    },
+    finalize: (meetingId, tracks, session) => finalizeMeeting(meetingId, tracks, session),
   });
-  const joiningInProgress = new Set(); // "guildId:channelId" strings
-  const finalizingLostConnections = new Set(); // "guildId:channelId" strings — guards against stopping a lost session twice
+  const gate = new GuildVoiceGate();
+  const finalizingLostConnections = new Set(); // "guildId:channelId" — guards against stopping a lost session twice
+  let accepting = true; // false once the controller starts shutting the bot down
+
+  async function sendNotice(channelId, content) {
+    const ch = await client.channels.fetch(channelId).catch(() => null);
+    if (ch) await ch.send(content).catch(() => {});
+  }
+
+  async function finalizeMeeting(meetingId, tracks, session) {
+    const meeting = db.getMeeting(meetingId);
+    const cfg = getGuildConfig(db, meeting.guild_id);
+    try {
+      const result = await processMeeting(db, meetingId, {
+        tracks,
+        cfg,
+        summarizer: getSummarizer(cfg),
+        deliver: async (notes, talktime) => postNotes({ client, meeting, cfg, notes, talktime }),
+      });
+      // Keep the PCM whenever a retry could still need it (partial transcript).
+      if (canDiscardAudio(result, db.getMeeting(meetingId))) {
+        await rm(session.audioDir, { recursive: true, force: true }).catch(() => {});
+      }
+      // Nobody spoke — drop the empty meeting record entirely.
+      if (result?.empty) db.deleteMeeting(meetingId);
+      // Summary succeeded but posting didn't (perms/deleted channel): the notes
+      // are safe in the dashboard and the meeting stays 'done'. Best-effort ping
+      // the origin channel so people aren't left waiting on a thread that never comes.
+      else if (result?.deliveryError) {
+        await sendNotice(meeting.channel_id, `⚠️ Meeting ${meetingId} notes are ready in the dashboard, but I couldn't post them here: ${result.deliveryError}`);
+      }
+    } catch (err) {
+      console.error(`Meeting ${meetingId} failed:`, err.message);
+      const reason = err.userMessage || err.message;
+      await sendNotice(cfg.notesChannelId || meeting.channel_id, `⚠️ Meeting ${meetingId} failed: ${reason}\nOpen the meeting in Parley to see the available recovery options.`);
+    }
+  }
+
   function humanCount(channel) {
     return channel.members.filter((m) => !m.user.bot).size;
   }
@@ -93,24 +121,21 @@ export function startBot({ db, audioRoot }) {
       console.warn('Nickname change failed:', e.message);
     });
   }
-  function hasVoicePermissions(channel) {
-    const perms = channel.guild.members.me?.permissionsIn(channel);
-    return {
-      connect: perms?.has('Connect') ?? false,
-      speak: perms?.has('Speak') ?? false,
-      useVoiceActivity: perms?.has('UseVAD') ?? false,
-    };
+  function destroyConnection(connection) {
+    if (connection && connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
   }
-  // Shared "the meeting's voice connection is gone for real" path — used both
-  // by the normal /leave + auto-leave flow (stopAndLeave) and by the
-  // stateChange recovery below (A3). Idempotent: manager.stop() is a no-op if
-  // the session already isn't active, and the re-entrancy guard prevents two
-  // concurrent callers (e.g. Disconnected-timeout racing a Destroyed event)
-  // from both trying to finalize the same key at once.
-  async function finalizeLostConnection(guildId, channelId, reason) {
+
+  // Shared "the meeting's voice connection is gone for real" path — used by the
+  // Disconnected/Destroyed recovery below. Idempotent: no-op if the session
+  // already isn't active, and the re-entrancy guard prevents two concurrent
+  // callers (e.g. Disconnected-timeout racing a Destroyed event) from both
+  // trying to finalize the same key at once.
+  async function finalizeLostConnection(guildId, channelId, connection, reason) {
     const key = `${guildId}:${channelId}`;
     if (finalizingLostConnections.has(key)) return;
-    if (!manager.isActive(guildId, channelId)) return; // nothing to finalize
+    // Nothing to finalize — or the channel is already recording again on a
+    // newer connection, which this stale one must not end.
+    if (manager.connectionOf(guildId, channelId) !== connection) return;
     finalizingLostConnections.add(key);
     console.warn(`[voice] ${reason} for ${key} — finalizing the in-progress meeting.`);
     try {
@@ -121,135 +146,164 @@ export function startBot({ db, audioRoot }) {
       finalizingLostConnections.delete(key);
     }
   }
-  async function joinAndStart(channel) {
-    const joinKey = `${channel.guild.id}:${channel.id}`;
-    if (joiningInProgress.has(joinKey)) {
-      debugLog(`[join] Skipping duplicate join for ${joinKey}`);
-      return;
-    }
-    joiningInProgress.add(joinKey);
-    try {
-      const permCheck = hasVoicePermissions(channel);
-      if (!permCheck.connect) {
-        throw new Error('Bot lacks **Connect** permission in this voice channel. Check server roles / channel overrides.');
-      }
-      if (!permCheck.speak) {
-        throw new Error('Bot lacks **Speak** permission in this voice channel. Check server roles / channel overrides.');
-      }
-      debugLog(`[voice] joinVoiceChannel guild=${channel.guild.id} channel=${channel.id}`);
-      const handshake = {
-        sent: 0, stateUpdates: 0, serverUpdates: 0, hasEndpoint: false,
-        transitions: [], closeCodes: [],
-      };
-      const observedNetworking = new WeakSet();
-      const createAdapter = channel.guild.voiceAdapterCreator;
-      const connection = joinVoiceChannel({
-        channelId: channel.id, guildId: channel.guild.id,
-        adapterCreator(callbacks) {
-          const adapter = createAdapter({
-            ...callbacks,
-            onVoiceServerUpdate(packet) {
-              handshake.serverUpdates++;
-              handshake.hasEndpoint = Boolean(packet.endpoint);
-              callbacks.onVoiceServerUpdate(packet);
-            },
-            onVoiceStateUpdate(packet) {
-              handshake.stateUpdates++;
-              callbacks.onVoiceStateUpdate(packet);
-            },
-          });
-          return {
-            ...adapter,
-            sendPayload(payload) {
-              const sent = adapter.sendPayload(payload);
-              if (sent && payload.d.channel_id) handshake.sent++;
-              return sent;
-            },
-          };
-        },
-        selfDeaf: false, selfMute: true,
-      });
-      debugLog(`[voice] connection initial state: ${connection.state.status}`);
-      connection.on('stateChange', (oldState, newState) => {
-        debugLog(`[voice] stateChange: ${oldState.status} -> ${newState.status}`);
-        if (newState.status !== oldState.status) handshake.transitions.push(newState.status);
-        if (newState.networking && !observedNetworking.has(newState.networking)) {
-          observedNetworking.add(newState.networking);
-          newState.networking.once('close', (code) => handshake.closeCodes.push(code));
-        }
-      });
-      connection.on('error', (err) => {
-        console.error(`[voice] connection error:`, err.message);
-      });
-      try {
-        await entersState(connection, VoiceConnectionStatus.Ready, 25_000);
-        debugLog(`[voice] connection reached Ready`);
-      } catch (err) {
-        const status = connection.state.status;
-        console.error(`[voice] entersState failed after 25s. Final state: ${status}`);
-        console.error('[voice] handshake:', JSON.stringify({
-          ...handshake, channelLimit: channel.userLimit, channelFull: channel.full,
-          canMoveMembers: channel.permissionsFor(client.user)?.has('MoveMembers') ?? false,
-        }));
-        if (status !== VoiceConnectionStatus.Destroyed) connection.destroy();
-        throw new Error(`Voice connection failed while ${status}: ${err.message}`);
-      }
-      if (manager.isActive(channel.guild.id, channel.id)) {
-        connection.destroy();
+
+  // Recovery for the connection that backs a live meeting. Disconnected can be
+  // a blip/region move or "gone for good": give it a short window to start
+  // reconnecting and a bounded one to reach Ready, else end the meeting rather
+  // than leave it 'recording' with no audio.
+  function watchConnection(connection, guildId, channelId) {
+    connection.on(VoiceConnectionStatus.Disconnected, async () => {
+      const outcome = await waitForReconnect(connection);
+      if (outcome === 'ready') {
+        debugLog(`[voice] reconnected ${guildId}:${channelId}`);
         return;
       }
-      // A3: only wire up disconnect recovery for the connection that's actually
-      // about to back a meeting (past the Ready + dedup checks above) — a
-      // duplicate/losing connection is destroyed and returned above without
-      // ever reaching here, so it can't mistakenly finalize the real session.
-      // Per @discordjs/voice guidance, Disconnected can mean "about to
-      // reconnect" (region move, brief network blip) or "gone for good"
-      // (kicked, voice server closed); racing a short window for the
-      // connection to start reconnecting (Signalling/Connecting) tells them apart.
-      connection.on(VoiceConnectionStatus.Disconnected, async () => {
-        try {
-          await Promise.race([
-            entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-            entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-          ]);
-          debugLog(`[voice] Disconnected looks recoverable for ${channel.guild.id}:${channel.id} (reconnecting)`);
-        } catch {
-          console.warn(`[voice] Disconnected did not recover within 5s for ${channel.guild.id}:${channel.id}`);
-          if (connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
-          await finalizeLostConnection(channel.guild.id, channel.id, 'Voice disconnected (no reconnect)');
-        }
-      });
-      // Safety net: the connection was torn down (e.g. kicked, or destroyed
-      // elsewhere) without recovering. If a meeting is still active in memory
-      // for this guild/channel, finalize it instead of leaving a phantom
-      // "live" session — finalizeLostConnection no-ops if it already isn't active.
-      connection.on(VoiceConnectionStatus.Destroyed, async () => {
-        await finalizeLostConnection(channel.guild.id, channel.id, 'Voice connection destroyed');
-      });
-      const attendees = channel.members.filter((m) => !m.user.bot).map((m) => ({ id: m.id, displayName: m.displayName }));
-      const meetingId = manager.start({ guildId: channel.guild.id, channelId: channel.id, channelName: channel.name, connection, guild: channel.guild, attendees });
-      console.log(`[meeting] Started #${meetingId} in ${channel.name} with ${attendees.length} attendee(s)`);
-      setRecIndicator(channel.guild, true);
-    } finally {
-      // A5: always release the join lock, however we got here (early throws,
-      // the Ready timeout, the isActive race, or a clean start) — otherwise a
-      // channel that hits one of those paths can never be auto-joined again
-      // until restart.
-      joiningInProgress.delete(joinKey);
-    }
-  }
-  async function stopAndLeave(guildId, channelId) {
-    console.log(`[meeting] Stopping meeting in guild:${guildId} channel:${channelId}`);
-    // stop() resolves as soon as capture is flushed; the transcribe/summarize
-    // pipeline runs in the background (await result.done only if you must wait).
-    await manager.stop(guildId, channelId);
-    const conn = getVoiceConnection(guildId);
-    if (conn && conn.state.status !== VoiceConnectionStatus.Destroyed) conn.destroy();
-    const guild = client.guilds.cache.get(guildId);
-    if (guild) setRecIndicator(guild, false);
+      console.warn(`[voice] Disconnected ${guildId}:${channelId} ${outcome === 'gone' ? 'did not start reconnecting' : 'did not get back to Ready'}`);
+      await finalizeLostConnection(guildId, channelId, connection, 'Voice disconnected (no reconnect)');
+      destroyConnection(connection);
+    });
+    // Safety net: torn down elsewhere (kicked, destroyed) without recovering.
+    connection.on(VoiceConnectionStatus.Destroyed, async () => {
+      await finalizeLostConnection(guildId, channelId, connection, 'Voice connection destroyed');
+    });
   }
 
-  client.once('ready', async () => {
+  function startMeeting(channel, connection) {
+    const attendees = channel.members.filter((m) => !m.user.bot).map((m) => ({ id: m.id, displayName: m.displayName }));
+    const meetingId = manager.start({ guildId: channel.guild.id, channelId: channel.id, channelName: channel.name, connection, guild: channel.guild, attendees });
+    watchConnection(connection, channel.guild.id, channel.id);
+    console.log(`[meeting] Started #${meetingId} in ${channel.name} with ${attendees.length} attendee(s)`);
+    setRecIndicator(channel.guild, true);
+  }
+
+  // Join `channel` and start recording. Resolves 'started' | 'cancelled' (a stop
+  // arrived during the join window) | 'busy' (this guild is already joining).
+  // Throws when the join or the capture start fails; the connection is then
+  // destroyed and auto-join backs off from this channel for a while.
+  async function joinAndStart(channel) {
+    const guildId = channel.guild.id;
+    const active = manager.activeInGuild(guildId);
+    if (active?.channelId === channel.id) return 'started';
+    if (active) throw new Error(`Already recording <#${active.channelId}> in this server.`);
+    // A stop still flushing holds the guild's one connection; joining now would
+    // reuse it, and the stop would then destroy it under the new meeting.
+    if (gate.isLeaving(guildId) || !gate.tryBeginJoin(guildId, channel.id)) {
+      debugLog(`[join] ${guildId} is busy (joining ${gate.joiningChannel(guildId)}, leaving ${gate.isLeaving(guildId)})`);
+      return 'busy';
+    }
+    let connection = null;
+    try {
+      connection = await connectToChannel(channel, { botUser: client.user, debugLog });
+      if (gate.isCancelled(guildId) || !accepting) {
+        console.log(`[meeting] Join of ${channel.name} cancelled before recording started.`);
+        destroyConnection(connection);
+        return 'cancelled';
+      }
+      startMeeting(channel, connection);
+      gate.clearFailure(guildId, channel.id);
+      return 'started';
+    } catch (err) {
+      gate.recordFailure(guildId, channel.id);
+      destroyConnection(connection); // a failed start must not keep a live connection + listeners
+      throw err;
+    } finally {
+      gate.endJoin(guildId);
+    }
+  }
+
+  async function stopAndLeave(guildId, channelId) {
+    console.log(`[meeting] Stopping meeting in guild:${guildId} channel:${channelId}`);
+    gate.cancelLeave(guildId);
+    // Capture THIS session's connection before stopping: a fresh per-guild
+    // lookup could be a different (newer) connection.
+    const connection = manager.connectionOf(guildId, channelId);
+    gate.beginLeave(guildId);
+    try {
+      // stop() resolves as soon as capture is flushed; the transcribe/summarize
+      // pipeline runs in the background (await result.done only if you must wait).
+      const result = await manager.stop(guildId, channelId);
+      const guild = client.guilds.cache.get(guildId);
+      if (guild && result) setRecIndicator(guild, false);
+      return result;
+    } finally {
+      destroyConnection(connection);
+      gate.endLeave(guildId);
+    }
+  }
+
+  function cancelJoin(guildId, channelId) {
+    return gate.requestCancel(guildId, channelId);
+  }
+
+  // Called by the controller before stop/restart: refuse new recordings and
+  // cancel in-flight joins while live meetings are flushed and finalized.
+  function quiesce() {
+    accepting = false;
+    gate.clear();
+  }
+
+  async function autoLeaveIfStillEmpty(guildId, channelId) {
+    const channel = client.channels.cache.get(channelId);
+    if (!channel || !manager.isActive(guildId, channelId)) return;
+    const cfg = getGuildConfig(db, guildId);
+    const minPeople = cfg.autoJoin ? cfg.autoJoinMinPeople : undefined;
+    if (!shouldAutoLeave({ humanCount: humanCount(channel), connected: true, minPeople })) return;
+    console.log(`[meeting] ${channel.name} stayed empty for ${AUTO_LEAVE_GRACE_MS / 1000}s — leaving.`);
+    await stopAndLeave(guildId, channelId).catch((e) => console.error('auto-leave failed:', e.message));
+    await autoJoinWaitingChannel(channel.guild);
+  }
+
+  // One recording per guild means a busy channel elsewhere may have been
+  // skipped (e.g. the group moved channels together); pick it up now.
+  async function autoJoinWaitingChannel(guild) {
+    const cfg = getGuildConfig(db, guild.id);
+    for (const channel of guild.channels.cache.values()) {
+      if (manager.activeInGuild(guild.id) || gate.joiningChannel(guild.id)) return;
+      if (channel.type === ChannelType.GuildVoice) await evaluateChannel(channel, cfg, true);
+    }
+  }
+
+  // Re-evaluate one voice channel after a member moved. Auto-leave waits out a
+  // grace period (a mobile reconnect must not split the meeting); auto-join
+  // never targets a second channel while the guild already records or joins.
+  async function evaluateChannel(voiceChannel, cfg, mayJoin) {
+    const guildId = voiceChannel.guild.id;
+    const connected = manager.isActive(guildId, voiceChannel.id);
+    const count = humanCount(voiceChannel);
+    const minPeople = cfg.autoJoin ? cfg.autoJoinMinPeople : undefined;
+    debugLog(`[vSU] guild=${guildId} channel=${voiceChannel.id} humans=${count} connected=${connected} autoJoin=${cfg.autoJoin}`);
+    if (shouldAutoLeave({ humanCount: count, connected, minPeople })) {
+      if (gate.scheduleLeave(guildId, voiceChannel.id, () => autoLeaveIfStillEmpty(guildId, voiceChannel.id))) {
+        debugLog(`[vSU] auto-leave in ${AUTO_LEAVE_GRACE_MS}ms unless people return to ${voiceChannel.id}`);
+      }
+      return;
+    }
+    if (connected) {
+      if (gate.cancelLeave(guildId)) debugLog(`[vSU] participants returned to ${voiceChannel.id}; staying`);
+      return;
+    }
+    if (!mayJoin || !accepting || gate.inBackoff(guildId, voiceChannel.id)) return;
+    const guildBusy = Boolean(manager.activeInGuild(guildId) || gate.joiningChannel(guildId) || gate.isLeaving(guildId));
+    if (shouldAutoJoin({
+      humanCount: count, autoJoin: cfg.autoJoin, connected, minPeople, guildBusy,
+      channelId: voiceChannel.id, allowedChannelIds: cfg.autoJoinChannelIds,
+    })) {
+      debugLog(`[vSU] auto-join triggered for ${voiceChannel.id}`);
+      await joinAndStart(voiceChannel).catch((e) => console.error('auto-join failed:', e.message));
+    }
+  }
+
+  // The bot's own voice state: a moderator dragging it into another channel
+  // would otherwise file that channel's audio under the current meeting.
+  async function handleOwnVoiceState(newState) {
+    const guildId = newState.guild.id;
+    const active = manager.activeInGuild(guildId);
+    if (!botMovedAway({ activeChannelId: active?.channelId ?? null, newChannelId: newState.channelId })) return;
+    console.warn(`[voice] Moved out of ${active.channelName} — ending meeting #${active.meetingId} instead of recording the new channel.`);
+    await stopAndLeave(guildId, active.channelId).catch((e) => console.error('ending moved meeting failed:', e.message));
+  }
+
+  client.once('clientReady', async () => {
     console.log(`Logged in as ${client.user.tag}`);
     // Per-guild registration is instant; global is slow and cache-flaky (the
     // reason newly-added commands like /post showed up intermittently). Clear the
@@ -282,26 +336,18 @@ export function startBot({ db, audioRoot }) {
   client.on('guildUpdate', (_old, guild) => db.upsertGuild(guild.id, guild.name));
 
   client.on('voiceStateUpdate', async (oldState, newState) => {
-    const guild = newState.guild;
-    const channel = newState.channel || oldState.channel;
-    if (!channel) return;
-    const cfg = getGuildConfig(db, guild.id);
-    for (const voiceChannel of new Set([oldState.channel, channel])) {
-      if (voiceChannel?.type !== ChannelType.GuildVoice) continue;
-      const connected = manager.isActive(guild.id, voiceChannel.id);
-      const count = humanCount(voiceChannel);
-      const occupancy = { humanCount: count, connected, minPeople: cfg.autoJoin ? cfg.autoJoinMinPeople : undefined };
-      debugLog(`[vSU] guild=${guild.id} channel=${voiceChannel.id} user=${newState.id} old=${oldState.channelId} new=${newState.channelId} humans=${count} connected=${connected} autoJoin=${cfg.autoJoin}`);
-      if (shouldAutoLeave(occupancy)) {
-        debugLog(`[vSU] auto-leave triggered for ${voiceChannel.id}`);
-        await stopAndLeave(guild.id, voiceChannel.id).catch((e) => console.error('auto-leave failed:', e.message));
-      } else if (voiceChannel === channel && shouldAutoJoin({
-        ...occupancy, autoJoin: cfg.autoJoin, channelId: voiceChannel.id,
-        allowedChannelIds: cfg.autoJoinChannelIds,
-      })) {
-        debugLog(`[vSU] auto-join triggered for ${voiceChannel.id}`);
-        await joinAndStart(voiceChannel).catch((e) => console.error('auto-join failed:', e.message));
+    // An async listener's rejection is unhandled (and fatal on Node 22): contain it.
+    try {
+      if (newState.id === client.user?.id) return await handleOwnVoiceState(newState);
+      const channel = newState.channel || oldState.channel;
+      if (!channel) return;
+      const cfg = getGuildConfig(db, newState.guild.id);
+      for (const voiceChannel of new Set([oldState.channel, channel])) {
+        if (voiceChannel?.type !== ChannelType.GuildVoice) continue;
+        await evaluateChannel(voiceChannel, cfg, voiceChannel === channel);
       }
+    } catch (err) {
+      console.error('[vSU] voice state handling failed:', err);
     }
   });
 
@@ -315,26 +361,32 @@ export function startBot({ db, audioRoot }) {
     const { commandName, guild, member } = interaction;
     try {
       if (commandName === 'join') {
-        const vc = member.voice?.channel;
-        if (!vc) return interaction.reply({ content: '❌ Join a voice channel first.', ephemeral: true });
-        if (manager.isActive(guild.id, vc.id)) return interaction.reply({ content: '✅ Already recording this channel.', ephemeral: true });
+        const vc = member.voice?.channel ?? null;
+        const refusal = joinRefusal({
+          channel: vc, accepting,
+          activeChannelId: manager.activeInGuild(guild.id)?.channelId ?? null,
+          joiningChannelId: gate.joiningChannel(guild.id),
+        });
+        if (refusal) return interaction.reply({ content: refusal, ephemeral: true });
         await interaction.deferReply({ ephemeral: true });
-        await joinAndStart(vc);
-        return interaction.editReply('✅ Recording started.');
+        return interaction.editReply(joinOutcomeReply(await joinAndStart(vc)));
       }
       if (commandName === 'leave') {
-        const vc = member.voice?.channel;
-        const channelId = vc?.id;
-        if (!channelId || !manager.isActive(guild.id, channelId)) return interaction.reply({ content: "❌ I'm not recording here.", ephemeral: true });
-        await interaction.deferReply({ ephemeral: true });
-        await stopAndLeave(guild.id, channelId);
-        return interaction.editReply('✅ Stopped. Processing — notes will post shortly.');
+        const channelId = member.voice?.channel?.id;
+        if (channelId && manager.isActive(guild.id, channelId)) {
+          await interaction.deferReply({ ephemeral: true });
+          await stopAndLeave(guild.id, channelId);
+          return interaction.editReply('✅ Stopped. Processing — notes will post shortly.');
+        }
+        if (channelId && cancelJoin(guild.id, channelId)) {
+          return interaction.reply({ content: "🛑 Cancelled — I was still joining, and I'll leave without recording.", ephemeral: true });
+        }
+        return interaction.reply({ content: "❌ I'm not recording here.", ephemeral: true });
       }
       if (commandName === 'summary') {
-        const id = interaction.options.getInteger('meeting') ?? db.listRecent(guild.id, 1)[0]?.id;
-        const s = id ? db.getSummary(id) : null;
+        const m = resolveGuildMeeting(db, guild.id, interaction.options.getInteger('meeting'));
+        const s = m ? db.getSummary(m.id) : null;
         if (!s) return interaction.reply({ content: '❌ No summary found.', ephemeral: true });
-        const m = db.getMeeting(id);
         const cfg = getGuildConfig(db, guild.id);
         const parts = renderNotesChunks(s.notes, s.talktime, {
           channelName: m.channel_name, date: m.started_at,
@@ -346,10 +398,9 @@ export function startBot({ db, audioRoot }) {
         return;
       }
       if (commandName === 'post') {
-        const id = interaction.options.getInteger('meeting') ?? db.listRecent(guild.id, 1)[0]?.id;
-        const s = id ? db.getSummary(id) : null;
+        const m = resolveGuildMeeting(db, guild.id, interaction.options.getInteger('meeting'));
+        const s = m ? db.getSummary(m.id) : null;
         if (!s) return interaction.reply({ content: '❌ No summary found.', ephemeral: true });
-        const m = db.getMeeting(id);
         const cfg = getGuildConfig(db, guild.id);
         const parts = renderNotesChunks(s.notes, s.talktime, {
           channelName: m.channel_name, date: m.started_at,
@@ -361,36 +412,26 @@ export function startBot({ db, audioRoot }) {
         if (cfg.useThread && interaction.channel?.type === ChannelType.GuildText) {
           // Fall back to the channel itself if thread creation fails (e.g. missing perms).
           target = await interaction.channel.threads
-            .create({ name: `Notes — ${m.channel_name} ${m.started_at.slice(0, 10)}` })
+            .create({ name: notesThreadName(m.channel_name, m.started_at) })
             .catch(() => interaction.channel);
         }
         for (const p of parts) await target.send(p);
         const where = target === interaction.channel ? 'this channel' : `thread <#${target.id}>`;
-        return interaction.editReply(`✅ Posted summary for meeting #${id} in ${where}.`);
+        return interaction.editReply(`✅ Posted summary for meeting #${m.id} in ${where}.`);
       }
       if (commandName === 'history') {
-        const rows = db.listRecent(guild.id, 10);
-        const text = rows.length ? rows.map((m) => `#${m.id} • ${m.channel_name} • ${m.started_at} • ${m.status}`).join('\n') : 'No meetings yet.';
-        return interaction.reply({ content: text, ephemeral: true });
+        return interaction.reply({ content: renderHistory(db.listRecent(guild.id, 10)), ephemeral: true });
       }
       if (commandName === 'status') {
-        const sessions = [...manager.active.entries()];
-        const activeText = sessions.length
-          ? sessions.map(([k, s]) => `🔴 Recording in <#${s.channelId}> (meeting #${s.meetingId})`).join('\n')
-          : '🟢 Not currently recording.';
-        const recent = db.listRecent(guild.id, 5);
-        const recentText = recent.length
-          ? '\n\n**Recent meetings:**\n' + recent.map((m) => `#${m.id} • ${m.channel_name} • ${m.started_at} • ${m.status}`).join('\n')
-          : '';
-        return interaction.reply({ content: activeText + recentText, ephemeral: true });
+        const content = renderStatus({ guildId: guild.id, active: manager.listActive(), recent: db.listRecent(guild.id, 5) });
+        return interaction.reply({ content, ephemeral: true });
       }
       if (commandName === 'raw') {
-        const id = interaction.options.getInteger('meeting') ?? db.listRecent(guild.id, 1)[0]?.id;
-        const m = id ? db.getMeeting(id) : null;
+        const m = resolveGuildMeeting(db, guild.id, interaction.options.getInteger('meeting'));
         if (!m) return interaction.reply({ content: '❌ No meeting found.', ephemeral: true });
-        const attendees = db.listAttendees(id);
-        const utterances = db.listUtterances(id);
-        const summary = db.getSummary(id);
+        const attendees = db.listAttendees(m.id);
+        const utterances = db.listUtterances(m.id);
+        const summary = db.getSummary(m.id);
         const payload = {
           meeting: m,
           attendees: attendees.map((a) => ({ user_id: a.user_id, display_name: a.display_name })),
@@ -488,10 +529,10 @@ export function startBot({ db, audioRoot }) {
           language: interaction.options.getString('language') ?? undefined,
           summary_language: interaction.options.getString('summary_language') ?? undefined,
         };
-        const result = validateSetup(input, config);
+        const result = validateSetup(input, config, getGuildConfig(db, guild.id));
         if (!result.ok) return interaction.reply({ content: `❌ ${result.error}`, ephemeral: true });
         const merged = setGuildConfig(db, guild.id, result.patch);
-        return interaction.reply({ content: `✅ Config updated:\n\`\`\`json\n${JSON.stringify(merged, null, 2)}\n\`\`\``, ephemeral: true });
+        return interaction.reply({ content: formatConfigReply(merged), ephemeral: true });
       }
     } catch (err) {
       console.error('interaction error:', err);
@@ -505,8 +546,8 @@ export function startBot({ db, audioRoot }) {
   // becomes an unhandled rejection and kills the process (taking the web
   // dashboard down with it — the very tool meant to fix the token). Surface it
   // through the client's 'error' channel instead so the controller can report it.
-  const loginResult = client.login(config.discordToken).catch((err) => {
+  client.login(config.discordToken).catch((err) => {
     client.emit('error', err instanceof Error ? err : new Error(String(err)));
   });
-  return { client, manager, stopAndLeave, loginResult };
+  return { client, manager, stopAndLeave, cancelJoin, quiesce };
 }

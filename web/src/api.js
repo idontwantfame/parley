@@ -4,25 +4,26 @@
 let onUnauthorized = null;
 export function setUnauthorizedHandler(fn) { onUnauthorized = fn; }
 
+// Build an Error from a failed response, preferring the server's JSON {error}
+// but falling back cleanly when the body is HTML (e.g. an older server's 404
+// page) so callers never see a raw "JSON.parse: unexpected character" error.
+async function responseError(r) {
+  let message = r.status === 401 ? 'Not authenticated' : (r.statusText || `Request failed (${r.status})`);
+  try { const body = await r.json(); if (body?.error) message = body.error; } catch { /* non-JSON body */ }
+  const err = new Error(message);
+  err.status = r.status;
+  return err;
+}
+
 const json = async (r) => {
-  // Surface auth failures distinctly so the app can redirect to /login.
-  if (r.status === 401) {
-    if (onUnauthorized) { try { onUnauthorized(); } catch { /* ignore */ } }
-    const err = new Error('Not authenticated');
-    err.status = 401;
-    return Promise.reject(err);
+  if (r.ok) return r.json();
+  // Surface auth failures distinctly so the app can drop back to the login
+  // screen, but keep the server's message (a failed login says "Invalid
+  // username or password.", not "Not authenticated").
+  if (r.status === 401 && onUnauthorized) {
+    try { onUnauthorized(); } catch { /* ignore */ }
   }
-  if (!r.ok) {
-    // Try to read a JSON {error}, but fall back cleanly when the body is HTML
-    // (e.g. an older server's 404 page) so callers never see a raw
-    // "JSON.parse: unexpected character" error.
-    let message = r.statusText || `Request failed (${r.status})`;
-    try { const body = await r.json(); if (body?.error) message = body.error; } catch { /* non-JSON body */ }
-    const err = new Error(message);
-    err.status = r.status;
-    return Promise.reject(err);
-  }
-  return r.json();
+  throw await responseError(r);
 };
 
 const jsonBody = (method, body) => ({
@@ -33,7 +34,14 @@ const jsonBody = (method, body) => ({
 
 export const api = {
   guilds: () => fetch('/api/guilds').then(json),
-  meetings: (g) => fetch(`/api/guilds/${g}/meetings`).then(json),
+  // Newest first. `before` is a meeting id cursor for the next (older) page.
+  meetings: (g, { limit, before } = {}) => {
+    const p = new URLSearchParams();
+    if (limit) p.set('limit', String(limit));
+    if (before) p.set('before', String(before));
+    const qs = p.toString();
+    return fetch(`/api/guilds/${g}/meetings${qs ? `?${qs}` : ''}`).then(json);
+  },
   live: (g) => fetch(`/api/guilds/${g}/live`).then(json),
   stopLive: (g, channelId) => fetch(`/api/guilds/${g}/live/${channelId}/stop`, { method: 'POST' }).then(json),
   stats: (g) => fetch(`/api/guilds/${g}/stats`).then(json),
@@ -44,14 +52,7 @@ export const api = {
   deleteMeetingAudio: (id) => fetch(`/api/meetings/${id}/audio`, { method: 'DELETE' }).then(json),
   postMeetingNotes: (id) => fetch(`/api/meetings/${id}/repost`, { method: 'POST' }).then(json),
   meetingProgress: (id) => fetch(`/api/meetings/${id}/progress`).then(json),
-  todos: (g, { open, assignee } = {}) => {
-    const p = new URLSearchParams();
-    if (open) p.set('open', '1');
-    if (assignee !== undefined) p.set('assignee', assignee === null ? '__unassigned__' : assignee);
-    const qs = p.toString();
-    return fetch(`/api/guilds/${g}/todos${qs ? `?${qs}` : ''}`).then(json);
-  },
-  assignees: (g) => fetch(`/api/guilds/${g}/assignees`).then(json),
+  todos: (g, { open } = {}) => fetch(`/api/guilds/${g}/todos${open ? '?open=1' : ''}`).then(json),
   ask: (g, id, question) => fetch(`/api/guilds/${g}/meetings/${id}/ask`, jsonBody('POST', { question })).then(json),
   setTodoDone: (id, done) => fetch(`/api/todos/${id}`, jsonBody('PATCH', { done })).then(json),
   deleteMeeting: (id) => fetch(`/api/meetings/${id}`, { method: 'DELETE' }).then(json),

@@ -2,15 +2,10 @@ import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { api } from '../api.js';
 import { useGuild } from '../GuildContext.jsx';
-import { useAuth } from '../AuthContext.jsx';
+import { useIsAdmin } from '../AuthContext.jsx';
 import { Page, PageHead } from '../components/Page.jsx';
 import { Icon, Empty } from '../components/ui.jsx';
 import { fmtRelative } from '../lib/format.js';
-
-export function useIsAdmin() {
-  const { user, authEnabled } = useAuth();
-  return !authEnabled || !!user?.isAdmin;
-}
 
 function CreateCampaign({ guildId, onCancel }) {
   const navigate = useNavigate();
@@ -120,7 +115,8 @@ export default function Campaigns() {
         )}
       />
       {creating && guildId && <CreateCampaign guildId={guildId} onCancel={() => setCreating(false)} />}
-      {error ? <Empty icon={Icon.Book} title="Couldn't load campaigns" body={error} />
+      {!guildId ? <Empty icon={Icon.Book} title="No server selected" body="Pick a server in the sidebar to see its campaigns." />
+        : error ? <Empty icon={Icon.Book} title="Couldn't load campaigns" body={error} />
         : !rows ? (
           <div className="grid sm:grid-cols-2 gap-4">{[0, 1].map((i) => <div key={i} className="h-36 skeleton rounded-[14px]" />)}</div>
         ) : rows.length === 0 && !creating ? (

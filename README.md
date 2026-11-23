@@ -330,7 +330,7 @@ Discord delivery uses the summary language for its headings. Set **`WEB_PUBLIC_U
 
 Completed meetings show their Discord delivery status. An admin can choose **Post to Discord** to send the saved notes to the configured destination.
 
-Set `MEETING_RETENTION_DAYS` to a positive whole number to remove old completed meetings outside campaigns in the daily sweep. The default is zero. An admin can preview the cleanup with `POST /api/system/prune` and a JSON body with `days`. Add `"confirm": true` to apply it.
+Set `MEETING_RETENTION_DAYS` to a positive whole number to remove old meetings outside campaigns in the daily sweep: completed meetings, plus failed and empty ones (with their retained audio and exported files). Meetings that are still recording or processing are never removed. The default is zero. An admin can preview the cleanup with `POST /api/system/prune` and a JSON body with `days`. Add `"confirm": true` to apply it.
 
 Edit speaker labels in **Settings → Speaker display names**. Overrides apply by Discord user ID to transcripts and new summaries. Use **Regenerate summary** in a completed meeting’s action menu to apply new names or prompt/model settings to existing notes. The background job uses the saved transcript, and regenerated notes stay in Parley.
 

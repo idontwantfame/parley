@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { config, hasDiscordCreds } from './config/env.js';
 import { openDb } from './store/db.js';
 import { reconcileOnBoot, sweepAudio } from './store/reconcile.js';
-import { BotController } from './bot-controller.js';
+import { BotController, createShutdown } from './bot-controller.js';
 import { SidecarController } from './sidecar-controller.js';
 import { startWebServer } from './web/server.js';
 import { pruneMeetings } from './store/meeting-retention.js';
@@ -35,16 +35,19 @@ setInterval(() => {
 const bot = new BotController({ db, audioRoot });
 // Local STT sidecar lifecycle (start/stop from the dashboard). No-op/unmanaged
 // in Docker where the sidecar is its own container.
-const sidecar = new SidecarController({ sttUrl: config.sttUrl });
+// Read the URL live: the dashboard can change it (PUT /system/connection).
+const sidecar = new SidecarController({ sttUrl: () => config.sttUrl });
 
 // The web UI is on by default in a hosted/container deploy. Set WEB_UI=0 to run
 // headless (CLI-only). It binds 127.0.0.1 unless WEB_UI_HOST overrides it.
 const webEnabled = process.env.WEB_UI !== '0' && process.env.WEB_UI !== 'false';
+let webServer = null;
 if (webEnabled) {
   const port = Number(process.env.WEB_UI_PORT) || 3000;
   const host = process.env.WEB_UI_HOST || '127.0.0.1';
   try {
     const server = await startWebServer({ db, bot, sidecar, port, host });
+    webServer = server;
     const bound = server.address().port;
     console.log(`[web] dashboard on http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${bound}`);
   } catch (e) {
@@ -60,6 +63,19 @@ if (webEnabled) {
     );
   }
 }
+
+// `docker stop` / Ctrl+C: flush live recordings and give their pipelines a few
+// seconds (bounded below Docker's 10 s grace), stop a sidecar we spawned, close
+// the dashboard, then exit. A second signal exits immediately.
+const shutdown = createShutdown({
+  bot, sidecar,
+  closeServer: () => new Promise((resolve) => {
+    if (!webServer) return resolve();
+    webServer.close(() => resolve());
+    webServer.closeAllConnections?.(); // live views keep connections open
+  }),
+});
+for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { void shutdown(signal); });
 
 // True when any admin still carries the seeded default password (must change).
 function defaultPasswordActive(database) {

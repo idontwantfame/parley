@@ -38,7 +38,7 @@ export function renderMeetingMarkdown({ meeting, summary, attendees, utterances 
     lines.push('> Summarisation failed. The available transcript is preserved below.', '');
   } else if (summary?.notes) {
     lines.push(renderNotes(summary.notes, summary.talktime || [],
-      { channelName: meeting.channel_name, date: meeting.started_at }), '');
+      { channelName: meeting.channel_name, date: meeting.started_at, endedAt: meeting.ended_at }), '');
   }
   lines.push('## Full transcript', '', '_Timestamps are UTC capture times._', '');
   for (const u of utterances) {

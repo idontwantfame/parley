@@ -60,6 +60,31 @@ test('reconcileOnBoot sweeps audio dirs for gone/terminal meetings, keeps retrya
   } finally { cleanup(); }
 });
 
+test('sweepAudio keeps PCM of a done meeting with an incomplete transcript until audio retention expires', async () => {
+  const { dir, cleanup } = tmp();
+  try {
+    const db = openDb(':memory:');
+    const audioRoot = join(dir, 'audio');
+    const make = (endedAt) => {
+      const id = db.createMeeting({ guildId: 'g', channelId: 'c', channelName: 'x', startedAt: 't' });
+      db.setMeetingStatus(id, 'done');
+      db.setTranscriptionComplete(id, false);
+      db.sql.prepare('UPDATE meetings SET ended_at = ? WHERE id = ?').run(endedAt, id);
+      const d = join(audioRoot, String(id));
+      mkdirSync(d, { recursive: true });
+      writeFileSync(join(d, 'u1_0.pcm'), 'x');
+      return id;
+    };
+    const recent = make(new Date().toISOString());
+    const expired = make(new Date(Date.now() - 40 * 86_400_000).toISOString());
+
+    const r = await reconcileOnBoot(db, audioRoot, { log: quiet, retentionDays: 30 });
+    assert.equal(existsSync(join(audioRoot, String(recent))), true);   // retry can re-transcribe it
+    assert.equal(existsSync(join(audioRoot, String(expired))), false); // past audio retention
+    assert.equal(r.sweptDirs, 1);
+  } finally { cleanup(); }
+});
+
 test('reconcileOnBoot is a no-op when the audio root does not exist', async () => {
   const db = openDb(':memory:');
   const r = await reconcileOnBoot(db, '/nonexistent/parley/audio', { log: quiet });

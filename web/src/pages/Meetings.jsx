@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import { api } from '../api.js';
 import { useGuild } from '../GuildContext.jsx';
@@ -6,6 +6,11 @@ import { Page, PageHead } from '../components/Page.jsx';
 import { MeetingCard, MeetingRow } from '../components/MeetingCard.jsx';
 import { Icon, Empty } from '../components/ui.jsx';
 import { bucketOf, BUCKET_ORDER } from '../lib/format.js';
+
+const PAGE_SIZE = 50;
+// Hide meetings that produced no transcript, unless they failed (retryable).
+const isListed = (m) => (m.utterance_count ?? 1) > 0 || m.failed;
+const nextCursor = (page) => (page.length === PAGE_SIZE ? page[page.length - 1].id : null);
 
 function Toggle({ options, value, onChange }) {
   return (
@@ -39,16 +44,43 @@ export default function Meetings() {
   const [error, setError] = useState(null);
   const [view, setView] = useState('grid');
   const [channel, setChannel] = useState('__all__');
+  // Cursor paging: `cursor` is the id of the oldest meeting fetched so far
+  // (null once the server returned a short page, i.e. nothing older remains).
+  const [cursor, setCursor] = useState(null);
+  const [moreState, setMoreState] = useState({ busy: false, error: null });
+  const forGuild = useRef(guildId);
+  forGuild.current = guildId;
 
   useEffect(() => {
     if (!guildId) return;
     let stale = false;
-    setMeetings(null); setError(null); setChannel('__all__');
-    api.meetings(guildId)
-      .then((rows) => { if (!stale) setMeetings((Array.isArray(rows) ? rows : []).filter((m) => (m.utterance_count ?? 1) > 0 || m.failed)); })
+    setMeetings(null); setError(null); setChannel('__all__'); setCursor(null);
+    setMoreState({ busy: false, error: null });
+    api.meetings(guildId, { limit: PAGE_SIZE })
+      .then((rows) => {
+        if (stale) return;
+        const page = Array.isArray(rows) ? rows : [];
+        setMeetings(page.filter(isListed));
+        setCursor(nextCursor(page));
+      })
       .catch((e) => { if (!stale) setError(e?.message || 'Failed to load'); });
     return () => { stale = true; };
   }, [guildId, navigationKey]);
+
+  async function loadMore() {
+    const g = guildId;
+    setMoreState({ busy: true, error: null });
+    try {
+      const page = await api.meetings(g, { limit: PAGE_SIZE, before: cursor });
+      if (forGuild.current !== g) return;
+      const rows = Array.isArray(page) ? page : [];
+      setMeetings((prev) => [...(prev ?? []), ...rows.filter(isListed)]);
+      setCursor(nextCursor(rows));
+      setMoreState({ busy: false, error: null });
+    } catch (e) {
+      if (forGuild.current === g) setMoreState({ busy: false, error: e?.message || 'Failed to load more' });
+    }
+  }
 
   const channels = useMemo(() => {
     if (!meetings) return [];
@@ -77,7 +109,7 @@ export default function Meetings() {
     <Page>
       <PageHead
         title="Meetings"
-        subtitle={meetings ? `${filtered.length} meeting${filtered.length === 1 ? '' : 's'}` : 'Loading…'}
+        subtitle={meetings ? `${filtered.length}${cursor ? '+' : ''} meeting${filtered.length === 1 && !cursor ? '' : 's'}` : 'Loading…'}
         actions={
           <Toggle
             value={view}
@@ -123,6 +155,14 @@ export default function Meetings() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+      {meetings && cursor && !error && (
+        <div className="mt-6 flex flex-col items-center gap-2">
+          <button className="btn btn-ghost" onClick={loadMore} disabled={moreState.busy}>
+            {moreState.busy ? 'Loading…' : 'Load older meetings'}
+          </button>
+          {moreState.error && <p className="text-xs text-error" role="alert">{moreState.error}</p>}
         </div>
       )}
     </Page>

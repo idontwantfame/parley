@@ -10,34 +10,17 @@ import { getSummarizer } from '../adapters/summarizer/index.js';
 import { resolveSummaryLanguage, summaryLanguageInstruction } from '../adapters/summarizer/languages.js';
 import { getGuildConfig } from '../store/config.js';
 import { formatMs } from '../pipeline/summarize.js';
+import { trimJournal } from './journal.js';
+import { extractTerms } from '../pipeline/search-terms.js';
+
+export { extractTerms };
 
 const NOTES_BUDGET = 60_000; // characters of session notes
 const EXCERPT_BUDGET = 30_000; // characters of transcript excerpts
 const EXCERPT_HITS = 15;
 const WINDOW_MS = 30_000; // conversation kept on each side of a hit
-
-const STOPWORDS = new Set(`a about above after again against all am an and any are as at be because been
-before being below between both but by can could did do does doing down during each few for from
-further had has have having he her here hers herself him himself his how i if in into is it its itself
-just me more most my myself no nor not now of off on once only or other our ours ourselves out over own
-same she should so some such than that the their theirs them themselves then there these they this
-those through to too under until up very was we were what when where which while who whom why will
-with would you your yours yourself yourselves ever never also still yet again ago last first next
-tell remind know remember happened happen happens said say says thing things get got go went going
-party session sessions campaign game time did does anyone someone something name named called`.split(/\s+/));
-
-/** Search terms from a natural-language question (lowercased, deduped, stopwords dropped). */
-export function extractTerms(question, max = 8) {
-  const words = String(question).toLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}'’-]*/gu) || [];
-  const out = [];
-  for (const w of words) {
-    const t = w.replace(/['’]s$/, '').replace(/['’-]+$/, '');
-    if (t.length < 3 || STOPWORDS.has(t) || out.includes(t)) continue;
-    out.push(t);
-    if (out.length >= max) break;
-  }
-  return out;
-}
+const JOURNAL_BUDGET = 4000; // characters of campaign journal
+const TAIL_LINES = 60; // closing lines of the last session for a recap
 
 /** FTS5 query matching any term, with prefix matching so "goblin" finds "goblins". */
 export function ftsQuery(terms) {
@@ -72,42 +55,70 @@ export function sessionNotesBlock(sessions, budget = NOTES_BUDGET) {
   return blocks.join('\n\n');
 }
 
-/** Transcript passages around the best full-text matches for the question. */
+// One window of conversation per hit; overlapping windows in a session merge.
+// Windows come out best match first (a merged window keeps its best rank).
+function hitWindows(hits) {
+  return hits.reduce((windows, h) => {
+    const from = h.start_ms - WINDOW_MS, to = h.start_ms + WINDOW_MS;
+    const i = windows.findIndex((w) => w.meetingId === h.meeting_id && from <= w.to && to >= w.from);
+    if (i < 0) return [...windows, { meetingId: h.meeting_id, from, to, hitMs: h.start_ms }];
+    const w = windows[i];
+    return windows.with(i, { ...w, from: Math.min(w.from, from), to: Math.max(w.to, to) });
+  }, []);
+}
+
+// The lines of a window nearest its hit that fit `limit` characters, in order.
+function nearestLines(rows, hitMs, limit) {
+  const lines = rows.map((u) => ({ u, text: `${u.display_name}: ${u.text}` }));
+  const byDistance = [...lines].sort((a, b) => Math.abs(a.u.start_ms - hitMs) - Math.abs(b.u.start_ms - hitMs));
+  const chosen = new Set();
+  let used = 0;
+  for (const line of byDistance) {
+    if (used + line.text.length + 1 > limit) break;
+    chosen.add(line);
+    used += line.text.length + 1;
+  }
+  return lines.filter((line) => chosen.has(line));
+}
+
+function windowText(db, w, session, limit) {
+  const rows = db.utterancesBetween(w.meetingId, w.from, w.to);
+  const number = session?.number ?? '?';
+  const headerRoom = `[Session ${number}, around 000:00]\n`.length;
+  const lines = nearestLines(rows, w.hitMs, limit - headerRoom);
+  if (!lines.length) return '';
+  // start_ms is absolute; show times relative to the session's first line.
+  const origin = db.firstUtteranceMs(w.meetingId) ?? 0;
+  return `[Session ${number}, around ${formatMs(Math.max(0, lines[0].u.start_ms - origin))}]\n`
+    + lines.map((line) => line.text).join('\n');
+}
+
+/**
+ * Transcript passages around the best full-text matches for the question.
+ * Passages are chosen best match first (an oversize one is cut to the lines
+ * nearest its match, or skipped), then shown in session order.
+ */
 export function transcriptExcerpts(db, campaignId, question, sessions, budget = EXCERPT_BUDGET) {
   const terms = extractTerms(question);
   if (!terms.length) return '';
   let hits;
   try { hits = db.searchCampaignUtterances(campaignId, ftsQuery(terms), EXCERPT_HITS); }
   catch { return ''; } // malformed FTS input should never sink the answer
-  const numberOf = new Map(sessions.map((s) => [s.id, s]));
-  // Merge overlapping windows per session.
-  const windows = new Map();
-  for (const h of hits) {
-    const list = windows.get(h.meeting_id) || [];
-    const from = h.start_ms - WINDOW_MS, to = h.start_ms + WINDOW_MS;
-    const overlap = list.find((w) => from <= w.to && to >= w.from);
-    if (overlap) { overlap.from = Math.min(overlap.from, from); overlap.to = Math.max(overlap.to, to); }
-    else list.push({ from, to });
-    windows.set(h.meeting_id, list);
-  }
-  const parts = [];
+  const sessionById = new Map(sessions.map((s) => [s.id, s]));
+  const kept = [];
   let used = 0;
-  const ordered = [...windows.entries()].sort((a, b) => (numberOf.get(a[0])?.number ?? 0) - (numberOf.get(b[0])?.number ?? 0));
-  for (const [meetingId, list] of ordered) {
-    const session = numberOf.get(meetingId);
-    // start_ms is absolute; show times relative to the session's first line.
-    const origin = db.firstUtteranceMs(meetingId) ?? 0;
-    for (const w of list.sort((a, b) => a.from - b.from)) {
-      const rows = db.utterancesBetween(meetingId, w.from, w.to);
-      if (!rows.length) continue;
-      const text = `[Session ${session?.number ?? '?'}, around ${formatMs(Math.max(0, rows[0].start_ms - origin))}]\n`
-        + rows.map((u) => `${u.display_name}: ${u.text}`).join('\n');
-      if (used + text.length > budget) return parts.join('\n\n');
-      parts.push(text);
-      used += text.length;
-    }
+  for (const w of hitWindows(hits)) {
+    const separator = kept.length ? 2 : 0;
+    const session = sessionById.get(w.meetingId);
+    const text = windowText(db, w, session, budget - used - separator);
+    if (!text) continue;
+    kept.push({ number: session?.number ?? 0, from: w.from, text });
+    used += separator + text.length;
   }
-  return parts.join('\n\n');
+  return kept
+    .sort((a, b) => a.number - b.number || a.from - b.from)
+    .map((k) => k.text)
+    .join('\n\n');
 }
 
 export function buildCampaignAskPrompt({ campaignName, question, journal, notes, excerpts }) {
@@ -168,7 +179,7 @@ export async function askCampaign(db, campaignId, question, opts = {}) {
   const prompt = buildCampaignAskPrompt({
     campaignName: campaign.name,
     question: question.slice(0, 1500),
-    journal: campaign.journal?.slice(0, 4000),
+    journal: trimJournal(campaign.journal, JOURNAL_BUDGET),
     notes: sessionNotesBlock(sessions, 5000).slice(-5000),
     excerpts: transcriptExcerpts(db, campaignId, question, sessions, 4000),
   });
@@ -182,11 +193,11 @@ export async function recapCampaign(db, campaignId, { sessions: count = 1, ...op
   const n = Math.max(1, Math.min(5, Number(count) || 1));
   const recent = done.slice(-n);
   const last = recent[recent.length - 1];
-  const tail = db.listUtterances(last.id).slice(-60).map((u) => `${u.display_name}: ${u.text}`).join('\n').slice(-3500);
+  const tail = db.listLastUtterances(last.id, TAIL_LINES).map((u) => `${u.display_name}: ${u.text}`).join('\n').slice(-3500);
   const budget = Math.floor(6500 / recent.length);
   const prompt = buildRecapPrompt({
     campaignName: campaign.name,
-    journal: campaign.journal?.slice(0, 4000),
+    journal: trimJournal(campaign.journal, JOURNAL_BUDGET),
     notes: recent.map((s) => notesBlock(s, true).slice(0, budget)).join('\n\n'),
     lastTranscriptTail: tail,
     sessionCount: recent.length,

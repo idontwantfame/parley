@@ -31,12 +31,47 @@ test('start is idempotent per guild+channel', () => {
   assert.equal(a, b);
 });
 
-test('two channels record concurrently', () => {
+test('channels in different guilds record concurrently', () => {
   const { mgr } = makeManager();
+  mgr.start({ guildId: 'g1', channelId: 'c1', channelName: 'x', connection: {}, guild: {}, attendees: [] });
+  mgr.start({ guildId: 'g2', channelId: 'c2', channelName: 'y', connection: {}, guild: {}, attendees: [] });
+  assert.equal(mgr.isActive('g1', 'c1'), true);
+  assert.equal(mgr.isActive('g2', 'c2'), true);
+});
+
+// Discord allows the bot in one voice channel per guild and @discordjs/voice
+// shares one connection per guild, so a second channel would silently steal the
+// first meeting's connection and mislabel its audio.
+test('a second channel in the same guild is refused while one is recording', () => {
+  const { db, mgr } = makeManager();
   mgr.start({ guildId: 'g', channelId: 'c1', channelName: 'x', connection: {}, guild: {}, attendees: [] });
-  mgr.start({ guildId: 'g', channelId: 'c2', channelName: 'y', connection: {}, guild: {}, attendees: [] });
-  assert.equal(mgr.isActive('g', 'c1'), true);
-  assert.equal(mgr.isActive('g', 'c2'), true);
+  assert.throws(
+    () => mgr.start({ guildId: 'g', channelId: 'c2', channelName: 'y', connection: {}, guild: {}, attendees: [] }),
+    /already recording/i,
+  );
+  assert.equal(mgr.isActive('g', 'c2'), false);
+  assert.equal(db.listRecent('g', 10).length, 1, 'no meeting row is created for the refused channel');
+});
+
+test('activeInGuild reports the guild\'s recording as plain data', () => {
+  const { mgr } = makeManager();
+  assert.equal(mgr.activeInGuild('g'), null);
+  const id = mgr.start({ guildId: 'g', channelId: 'c1', channelName: 'general', connection: { secret: true }, guild: {}, attendees: [] });
+  const s = mgr.activeInGuild('g');
+  assert.equal(s.meetingId, id);
+  assert.equal(s.channelId, 'c1');
+  assert.equal('connection' in s, false);
+  assert.equal(mgr.activeInGuild('other'), null);
+});
+
+test('connectionOf returns the session\'s own voice connection', async () => {
+  const { mgr } = makeManager();
+  const connection = { id: 'conn-A' };
+  mgr.start({ guildId: 'g', channelId: 'c1', channelName: 'x', connection, guild: {}, attendees: [] });
+  assert.equal(mgr.connectionOf('g', 'c1'), connection);
+  assert.equal(mgr.connectionOf('g', 'c2'), null);
+  await mgr.stop('g', 'c1');
+  assert.equal(mgr.connectionOf('g', 'c1'), null);
 });
 
 test('listActive returns plain session data without voice handles', () => {
@@ -167,4 +202,65 @@ test('ended_at is stamped at recording stop and NOT overwritten at done', async 
   assert.equal(m.status, 'done');
   // Duration = recording time: the stop timestamp wins over the pipeline-finish one.
   assert.equal(m.ended_at, '2026-06-04T10:30:00Z');
+});
+
+test('waitForFinalize resolves once in-flight pipelines settle', async () => {
+  const { mgr, release } = makeDeferredManager();
+  mgr.start({ guildId: 'g', channelId: 'c', channelName: 'x', connection: {}, guild: {}, attendees: [] });
+  await mgr.stop('g', 'c');
+  let settled = false;
+  const waiting = mgr.waitForFinalize(5_000).then((r) => { settled = true; return r; });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(settled, false, 'still waiting on the gated pipeline');
+  release();
+  assert.deepEqual(await waiting, { timedOut: false, pending: 0 });
+});
+
+test('waitForFinalize gives up after the bound and reports what is still running', async () => {
+  const { mgr } = makeDeferredManager();
+  mgr.start({ guildId: 'g', channelId: 'c', channelName: 'x', connection: {}, guild: {}, attendees: [] });
+  await mgr.stop('g', 'c');
+  assert.deepEqual(await mgr.waitForFinalize(20), { timedOut: true, pending: 1 });
+});
+
+test('waitForFinalize with nothing running returns immediately', async () => {
+  const { mgr } = makeManager();
+  assert.deepEqual(await mgr.waitForFinalize(10), { timedOut: false, pending: 0 });
+});
+
+test('waitForFinalize also covers a stop that is still flushing capture', async () => {
+  const db = openDb(':memory:');
+  let releaseFlush;
+  const flushGate = new Promise((r) => { releaseFlush = r; });
+  let finalized = false;
+  const mgr = new MeetingManager({
+    db, audioRoot: '/tmp/audio',
+    startCapture: () => ({ registry: { list: () => [] }, stopAll: () => flushGate }),
+    finalize: async () => { finalized = true; },
+    now: () => '2026-06-04T10:00:00Z',
+  });
+  mgr.start({ guildId: 'g', channelId: 'c', channelName: 'x', connection: {}, guild: {}, attendees: [] });
+  const stopping = mgr.stop('g', 'c');           // session already off listActive()
+  assert.equal(mgr.listActive().length, 0);
+  let waited = false;
+  const waiting = mgr.waitForFinalize(5_000).then((r) => { waited = true; return r; });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(waited, false, 'must not report idle while capture is still flushing');
+  releaseFlush();
+  await stopping;
+  assert.deepEqual(await waiting, { timedOut: false, pending: 0 });
+  assert.equal(finalized, true);
+});
+
+test('a failing flush does not leave a phantom in-flight entry', async () => {
+  const db = openDb(':memory:');
+  const mgr = new MeetingManager({
+    db, audioRoot: '/tmp/audio',
+    startCapture: () => ({ registry: { list: () => [] }, stopAll: async () => { throw new Error('flush boom'); } }),
+    finalize: async () => {},
+    now: () => '2026-06-04T10:00:00Z',
+  });
+  mgr.start({ guildId: 'g', channelId: 'c', channelName: 'x', connection: {}, guild: {}, attendees: [] });
+  await assert.rejects(mgr.stop('g', 'c'), /flush boom/);
+  assert.deepEqual(await mgr.waitForFinalize(10), { timedOut: false, pending: 0 });
 });
