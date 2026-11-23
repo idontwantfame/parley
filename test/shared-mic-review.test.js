@@ -16,6 +16,7 @@ import { transcribeTracks } from '../src/pipeline/transcribe.js';
 import { canDiscardAudio } from '../src/voice/recording-archive.js';
 import { pcmName } from '../src/voice/audio.js';
 import { apiRouter } from '../src/web/api.js';
+import { speakerReviewNotice } from '../src/delivery/post.js';
 
 async function start(server) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -73,11 +74,12 @@ test('shared mic turns are diarized together, then approved names reach Ollama',
         sharedRequests++;
         assert.equal(request.body.get('language'), 'pl');
         assert.equal(request.body.get('diarize'), 'true');
-        assert.equal(request.body.get('file').size, 44 + 32_000 * 2 + 3200);
+        // The two 100 ms turns are joined with a 1 s pause, not the 2 s between them.
+        assert.equal(request.body.get('file').size, 44 + 3200 + 32_000 + 3200);
         return Response.json({ segments: [
           { speaker: 'SPEAKER_12', start: 0, end: 0.09, text: 'Otwieram drzwi' },
-          { speaker: 'SPEAKER_43', start: 2, end: 2.05, text: 'Wchodzę' },
-          { speaker: 'SPEAKER_12', start: 2.05, end: 2.09, text: 'Czekaj' },
+          { speaker: 'SPEAKER_43', start: 1.1, end: 1.15, text: 'Wchodzę' },
+          { speaker: 'SPEAKER_12', start: 1.15, end: 1.19, text: 'Czekaj' },
         ] });
       } },
     }),
@@ -111,7 +113,8 @@ test('shared mic turns are diarized together, then approved names reach Ollama',
   app.use('/api', apiRouter({ db }));
   const server = createServer(app);
   t.after(() => server.close());
-  const meetingUrl = `${await start(server)}/api/meetings/${id}`;
+  const base = await start(server);
+  const meetingUrl = `${base}/api/meetings/${id}`;
   const bundle = await (await fetch(meetingUrl)).json();
   assert.equal(bundle.hasAudio, true);
   assert.equal(bundle.audioOriginMs, 10000);
@@ -135,4 +138,87 @@ test('shared mic turns are diarized together, then approved names reach Ollama',
   assert.deepEqual(db.listUtterances(id).map((line) => line.display_name), ['Paweł', 'Valentin', 'Kamil', 'Paweł']);
   assert.equal(prompts.length, 1);
   assert.match(prompts[0], /Paweł: Otwieram drzwi.+Valentin: Dobrze.+Kamil: Wchodzę.+Paweł: Czekaj/s);
+
+  // A name chosen in the review can still be corrected afterwards.
+  const rename = await fetch(`${base}/api/guilds/g1/speaker-names/${speakers[2].user_id}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'Kamil N.' }),
+  });
+  assert.equal(rename.status, 200);
+  assert.equal(db.listUtterances(id)[2].display_name, 'Kamil N.');
+});
+
+test('joined shared-mic turns map line times back onto the meeting timeline', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'parley-shared-gap-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const micId = '100000000000000001';
+  const soloMicId = '100000000000000003';
+  const tracks = [];
+  // Two turns of one shared account (out of order on purpose) and one turn of another.
+  for (const [userId, startMs] of [[micId, 50_000], [micId, 10_000], [soloMicId, 70_000]]) {
+    const pcmPath = join(dir, pcmName(userId, startMs));
+    await writeFile(pcmPath, Buffer.alloc(3200, 1)); // 100 ms each
+    tracks.push({ userId, displayName: 'table', startMs, pcmPath });
+  }
+  // Joined file: 10 000 at 0–0.1 s, a 1 s pause, 50 000 at 1.1–1.2 s.
+  const joined = { segments: [
+    { speaker: 'A', start: 0.02, end: 0.5, text: 'Into the pause' },
+    { speaker: 'A', start: 0.05, end: 1.15, text: 'Across both turns' },
+    { speaker: 'B', start: 1.15, end: 9, text: 'Past the end' },
+  ] };
+  const single = { segments: [{ speaker: 'C', start: 0.01, end: 0.04, text: 'Only turn' }] };
+  const { utterances, failures } = await transcribeTracks(tracks, { sharedMicUserIds: [micId, soloMicId] }, {
+    meetingId: 7,
+    stt: async () => assert.fail('a shared mic is not transcribed per turn'),
+    diarize: async (path) => (path.endsWith('.pcm') ? single : joined),
+  });
+  assert.deepEqual(failures, []);
+  assert.deepEqual(utterances.map(({ userId, startMs, endMs }) => ({ userId, startMs, endMs })), [
+    { userId: `shared-7-${micId}-1`, startMs: 10_020, endMs: 10_100 },
+    { userId: `shared-7-${micId}-1`, startMs: 10_050, endMs: 50_050 },
+    { userId: `shared-7-${micId}-2`, startMs: 50_050, endMs: 50_100 },
+    { userId: `shared-7-${soloMicId}-1`, startMs: 70_010, endMs: 70_040 },
+  ]);
+});
+
+test('turning on a shared mic needs speaker detection on the sidecar; turning it off never does', async (t) => {
+  const db = openDb(':memory:');
+  t.after(() => db.sql.close());
+  const micId = '100000000000000001';
+  // Cloud transcription, so the managed sidecar is only needed for a shared mic.
+  setGuildConfig(db, 'g1', { sttProvider: 'openai' });
+  let capability = { available: true, speakerDetection: false, reason: 'Set HF_TOKEN on the sidecar.' };
+  const calls = [];
+  const sidecar = {
+    managed: () => true, status: () => ({}),
+    start: async () => { calls.push('start'); }, stop: async () => { calls.push('stop'); },
+  };
+  const app = express();
+  app.use(express.json());
+  app.use('/api', apiRouter({ db, sidecar, imports: { capability: async () => capability } }));
+  const server = createServer(app);
+  t.after(() => server.close());
+  const base = await start(server);
+  const patch = (sharedMicUserIds) => fetch(`${base}/api/guilds/g1/config`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sharedMicUserIds }),
+  });
+
+  const refused = await patch([micId]);
+  assert.equal(refused.status, 400);
+  assert.match((await refused.json()).error, /need speaker detection.+Set HF_TOKEN/);
+  assert.deepEqual(getGuildConfig(db, 'g1').sharedMicUserIds, []);
+  assert.deepEqual(calls, ['start', 'stop'], 'a sidecar started only to be asked is stopped again');
+
+  capability = { available: true, speakerDetection: true, reason: null };
+  assert.equal((await patch([micId])).status, 200);
+  assert.deepEqual(getGuildConfig(db, 'g1').sharedMicUserIds, [micId]);
+
+  capability = { available: false, speakerDetection: false, reason: 'Sidecar is down.' };
+  assert.equal((await patch([])).status, 200);
+  assert.deepEqual(getGuildConfig(db, 'g1').sharedMicUserIds, []);
+});
+
+test('the Discord notice for a speaker review links the meeting when a dashboard URL is set', () => {
+  assert.equal(speakerReviewNotice(12, ''),
+    '🎙️ Meeting 12 is transcribed. An admin needs to name the voices on the shared microphone in Parley before the notes are posted.');
+  assert.match(speakerReviewNotice(12, 'https://parley.example/'), /posted\.\nhttps:\/\/parley\.example\/meetings\/12$/);
 });

@@ -468,6 +468,14 @@ function Note({ data, onReload }) {
   const playable = data.hasAudio && data.audioOriginMs != null;
   const isAdmin = useIsAdmin();
   const needsSpeakerReview = meeting.status === 'speaker_review';
+  // Voices an admin can rename here: every speaker of an imported recording, or
+  // the voices found on a shared microphone once the review is done ("-0" is
+  // unattributed speech that may mix several voices).
+  const namedVoices = useMemo(() => {
+    if (meeting.source === 'import') return attendees ?? [];
+    if (needsSpeakerReview) return [];
+    return (attendees ?? []).filter((a) => a.user_id.startsWith(`shared-${meeting.id}-`) && !a.user_id.endsWith('-0'));
+  }, [attendees, meeting.id, meeting.source, needsSpeakerReview]);
   const running = !!progress;
   const isFailed = !running && !watching && ['transcription_failed', 'summary_failed', 'processing'].includes(meeting.status);
   const regen = useRegeneration(meeting, data.regenerate, onReload);
@@ -511,9 +519,9 @@ function Note({ data, onReload }) {
         )}
       </header>
 
-      {meeting.source === 'import' && isAdmin && attendees?.length > 0 && (
-        <SpeakerNamesPanel key={attendees.map((a) => `${a.user_id}=${a.display_name}`).join('|')}
-          meeting={meeting} attendees={attendees} saved={namesSaved} onSaved={() => setNamesSaved(true)}
+      {isAdmin && namedVoices.length > 0 && (
+        <SpeakerNamesPanel key={namedVoices.map((a) => `${a.user_id}=${a.display_name}`).join('|')}
+          meeting={meeting} attendees={namedVoices} saved={namesSaved} onSaved={() => setNamesSaved(true)}
           canRegenerate={!!data.regenerate?.eligible && !regen.busy && !regen.starting}
           onRegenerate={regenerateSummary} onReload={onReload} />
       )}

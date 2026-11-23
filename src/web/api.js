@@ -23,6 +23,7 @@ import { retryMeeting, retryPlan, retryEligible, regeneratePlan, regenerateSumma
 import { finishReviewedMeeting } from '../pipeline/orchestrator.js';
 import { sharedSpeakerPrefix } from '../pipeline/transcribe.js';
 import { availableSttProviders } from '../adapters/stt/index.js';
+import { sidecarCapability } from '../adapters/stt-client.js';
 import { isAdminRequest, requireAdmin } from './auth.js';
 import { readMeetingExport, meetingExportBasename, renderMeetingMarkdown, autoExportMeeting } from '../delivery/meeting-export.js';
 import { campaignContextFor } from '../campaign/journal.js';
@@ -57,8 +58,9 @@ const artifactDirs = () => ({ dataDir: env.dataDir, exportDir: env.exportDir });
 export const PENDING_RETRY_MERGE =
   "Retry this meeting's transcription before merging (some speakers' audio is still waiting to be transcribed).";
 
-// A Discord user id, or a speaker of an imported recording (import-<meeting>-<n>).
-const SPEAKER_ID = /^(?:[1-9]\d{16,19}|import-[1-9]\d{0,15}-\d{1,3})$/;
+// A Discord user id, a speaker of an imported recording (import-<meeting>-<n>),
+// or a voice found on a shared microphone (shared-<meeting>-<user id>-<n>).
+const SPEAKER_ID = /^(?:[1-9]\d{16,19}|import-[1-9]\d{0,15}-\d{1,3}|shared-[1-9]\d{0,15}-[1-9]\d{16,19}-\d{1,3})$/;
 
 function canPlayRecording(meeting, req) {
   return (meeting?.status === 'speaker_review' && isAdminRequest(req))
@@ -67,6 +69,8 @@ function canPlayRecording(meeting, req) {
 
 export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAudio = ensureMixedWav, imports = {}, oidc = null, users = null }) {
   const r = Router();
+  // Whether the local sidecar can tell speakers apart (shared by imports).
+  const speakerCapability = imports.capability ?? (() => sidecarCapability());
   // Summary regeneration status per meeting (guards double-submits; finished
   // results expire after a while).
   const regeneration = createRegenerationState();
@@ -561,6 +565,22 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
       ? null : 'Choose a text channel of this server for the notes.';
   }
 
+  // A shared microphone is transcribed with speaker detection, so turning one
+  // on needs a sidecar that can do it; otherwise every meeting that account
+  // speaks in would fail. A stopped managed sidecar is started to ask it.
+  // Turning shared microphones off is always allowed.
+  async function sharedMicUnavailable(current, patch) {
+    const added = (patch.sharedMicUserIds ?? []).some((id) => !current.sharedMicUserIds.includes(id));
+    if (!added) return null;
+    // A failed start shows up in the capability check below, with its reason.
+    if (sidecar?.managed()) await sidecar.start().catch(() => {});
+    const capability = await speakerCapability();
+    if (capability.speakerDetection) return null;
+    // Don't leave a sidecar running that was started only to be asked.
+    if (sidecar?.managed() && !anyGuildUsesSidecar(db)) await sidecar.stop().catch(() => {});
+    return `Shared microphones need speaker detection on the transcription sidecar. ${capability.reason || ''}`.trim();
+  }
+
   // Open to every user for everyday settings; ADMIN_CONFIG_FIELDS need an admin.
   r.patch('/guilds/:g/config', requireAdminForFields(ADMIN_CONFIG_FIELDS), async (req, res) => {
     const isKnown = db.isKnownGuild(req.params.g) || !!liveClient()?.guilds?.cache?.has?.(req.params.g);
@@ -570,8 +590,11 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
     if (inputError) return res.status(400).json({ error: inputError });
     // Validate against the guild's stored settings (e.g. a bare sttModel must
     // suit the provider already saved, not one the client claims).
-    const result = validateSetup(input, env, getGuildConfig(db, req.params.g));
+    const current = getGuildConfig(db, req.params.g);
+    const result = validateSetup(input, env, current);
     if (!result.ok) return res.status(400).json({ error: result.error });
+    const sharedMicError = await sharedMicUnavailable(current, result.patch);
+    if (sharedMicError) return res.status(400).json({ error: sharedMicError });
     const config = setGuildConfig(db, req.params.g, result.patch);
     // Follow the transcription backend with the local sidecar process: start it
     // when a guild switches to the sidecar, and stop it when no guild needs it

@@ -434,7 +434,7 @@ export function openDb(path) {
         sql.exec('COMMIT');
         return !!claim.changes;
       } catch (error) {
-        sql.exec('ROLLBACK');
+        try { sql.exec('ROLLBACK'); } catch { /* SQLite may have auto-rolled back */ }
         throw error;
       }
     },

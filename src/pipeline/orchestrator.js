@@ -46,8 +46,12 @@ async function transcribeAndStore(db, meetingId, opts, transcribe) {
   }
   const sharedMicFailure = failures.find(({ userId }) => opts.cfg.sharedMicUserIds?.includes(userId));
   if (sharedMicFailure) {
-    const err = new Error(`Could not separate voices on ${sharedMicFailure.displayName}'s shared mic: ${sharedMicFailure.error}`);
-    throw failTranscription(db, meetingId, err, { sttProvider: 'sidecar' });
+    const { displayName, error } = sharedMicFailure;
+    const err = failTranscription(db, meetingId,
+      new Error(`Could not separate voices on ${displayName}'s shared mic: ${error}`), { sttProvider: 'sidecar' });
+    err.userMessage = `Could not separate the voices on ${displayName}'s shared microphone (${error}). `
+      + 'Enable speaker detection on the transcription sidecar, or turn off Shared microphone for this speaker in Settings, then retry.';
+    throw err;
   }
   if (utterances.length === 0 && failures.length > 0) {
     const err = new Error(`All ${failures.length} track(s) failed transcription. First error: ${failures[0].error}`);

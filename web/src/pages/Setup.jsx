@@ -323,7 +323,8 @@ export default function Setup() {
   );
 
   const { config: c, providers, sttProviders, channels, voiceChannels, secrets = {}, defaultModels = {}, defaultSummaryPrompt, defaultOverviewPrompt } = data;
-  const save = async (patch) => {
+  // `rethrow` lets a caller show the error next to its own control too.
+  const save = async (patch, { rethrow = false } = {}) => {
     // The response belongs to the server it was saved for: if the switcher
     // moved on meanwhile (or the page reset), it must not land on screen.
     const forGuild = guildId;
@@ -335,7 +336,11 @@ export default function Setup() {
       // local sidecar; refresh system status so its pill reflects reality.
       if (patch.sttProvider !== undefined || patch.sharedMicUserIds !== undefined) refreshSys?.();
       return r;
-    } catch (e) { setMsg(e.message); setMsgErr(true); return false; }
+    } catch (e) {
+      setMsg(e.message); setMsgErr(true);
+      if (rethrow) throw e;
+      return false;
+    }
     finally { setTimeout(() => setMsg(''), 2400); }
   };
   const sel = 'input appearance-none pr-9 cursor-pointer';
@@ -710,9 +715,22 @@ function SpeakerNames({ guildId, sharedMicUserIds, saveConfig }) {
     }).catch((error) => { if (current) setMessage({ text: error.message, error: true }); });
     return () => { current = false; };
   }, [guildId, canEdit]);
+  // Whether the sidecar can separate voices. If the check fails, the switch
+  // stays usable and the server decides when it is saved.
+  const [detection, setDetection] = useState(null);
+  useEffect(() => {
+    if (!canEdit) return;
+    let current = true;
+    api.importCapability().then((cap) => { if (current) setDetection(cap); })
+      .catch(() => { if (current) setDetection(null); });
+    return () => { current = false; };
+  }, [canEdit]);
   if (!canEdit) return null;
   const speaker = speakers?.find((row) => row.user_id === speakerId);
   const shared = sharedMicUserIds.includes(speakerId);
+  // Only a sidecar that answers without speaker detection rules a shared mic
+  // out up front; a stopped one is started and asked by the server on save.
+  const sharedMicBlocked = !shared && detection?.available === true && !detection.speakerDetection;
 
   async function save(event) {
     event.preventDefault();
@@ -731,10 +749,13 @@ function SpeakerNames({ guildId, sharedMicUserIds, saveConfig }) {
 
   async function toggleSharedMic() {
     setSaving(true);
+    setMessage(null);
     try {
       await saveConfig({ sharedMicUserIds: shared
         ? sharedMicUserIds.filter((id) => id !== speakerId)
-        : [...sharedMicUserIds, speakerId] });
+        : [...sharedMicUserIds, speakerId] }, { rethrow: true });
+    } catch (error) {
+      setMessage({ text: error.message, error: true });
     } finally {
       setSaving(false);
     }
@@ -763,9 +784,11 @@ function SpeakerNames({ guildId, sharedMicUserIds, saveConfig }) {
             </Field>
           )}
           {speaker && /^[1-9]\d{16,19}$/.test(speakerId) && (
-            <Switch checked={shared} onChange={toggleSharedMic} disabled={saving}
+            <Switch checked={shared} onChange={toggleSharedMic} disabled={saving || sharedMicBlocked}
               label="Shared microphone"
-              desc="Use WhisperX to separate voices on this Discord account’s track. Review the names before Parley generates notes." />
+              desc={sharedMicBlocked
+                ? `Needs speaker detection on the transcription sidecar. ${detection.reason ?? ''}`.trim()
+                : 'Use WhisperX to separate voices on this Discord account’s track. Review the names before Parley generates notes.'} />
           )}
         </form>
       )}

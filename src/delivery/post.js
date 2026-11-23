@@ -18,6 +18,13 @@ function meetingLink(base, id) {
   }
 }
 
+// Posted when a meeting waits for an admin to name the voices on a shared
+// microphone, so the channel isn't left expecting notes that never arrive.
+export function speakerReviewNotice(meetingId, base = config.notesBaseUrl) {
+  const link = meetingLink(base, meetingId);
+  return `🎙️ Meeting ${meetingId} is transcribed. An admin needs to name the voices on the shared microphone in Parley before the notes are posted.${link ? `\n${link}` : ''}`;
+}
+
 // Discord rejects thread names over 100 characters (and the post would then
 // silently land in the channel instead). Trim the channel name, never the date,
 // and never split a surrogate pair.

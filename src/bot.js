@@ -28,7 +28,7 @@ import { ADMIN_ONLY_REPLY, lacksManageGuild } from './commands/permissions.js';
 import { resolveGuildMeeting, renderStatus, renderHistory } from './commands/meeting-lookup.js';
 import { joinRefusal, joinOutcomeReply } from './commands/voice-replies.js';
 import { renderNotesChunks, chunk } from './delivery/discord-notes.js';
-import { postNotes, notesThreadName } from './delivery/post.js';
+import { postNotes, notesThreadName, speakerReviewNotice } from './delivery/post.js';
 import { QUIET_MESSAGE, neutralizeMaskedLinks } from './delivery/discord-safe.js';
 import { askCampaign, recapCampaign, resolveCampaign } from './campaign/ask.js';
 
@@ -101,6 +101,7 @@ export function startBot({ db, audioRoot }) {
       }
       // Nobody spoke — drop the empty meeting record entirely.
       if (result?.empty) db.deleteMeeting(meetingId);
+      else if (result?.reviewPending) await sendNotice(cfg.notesChannelId || meeting.channel_id, speakerReviewNotice(meetingId));
       // Summary succeeded but posting didn't (perms/deleted channel): the notes
       // are safe in the dashboard and the meeting stays 'done'. Best-effort ping
       // the origin channel so people aren't left waiting on a thread that never comes.

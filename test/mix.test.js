@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mixTracksToWav, ensureMixedWav, MIXED_WAV_NAME } from '../src/voice/mix.js';
+import { concatTracksToWav, mixTracksToWav, ensureMixedWav, MIXED_WAV_NAME } from '../src/voice/mix.js';
 import { MIX_ORIGIN_NAME, recordingOriginMs } from '../src/voice/mix.js';
 
 function tmp() {
@@ -75,6 +75,29 @@ test('a later track is offset by its start time with silence in the gap', async 
     assert.deepEqual(samples.slice(0, 2), [11, 22]);
     assert.deepEqual(samples.slice(2, 16), Array(14).fill(0)); // zero-filled gap
     assert.deepEqual(samples.slice(16), [33, 44]);
+  } finally { cleanup(); }
+});
+
+test('concatTracksToWav joins tracks in time order with a short pause, however far apart they were', async () => {
+  const { dir, cleanup } = tmp();
+  try {
+    const a = join(dir, 'a.pcm');
+    const b = join(dir, 'b.pcm');
+    const empty = join(dir, 'empty.pcm');
+    writeFileSync(a, pcm([11, 22]));
+    writeFileSync(b, pcm([33, 44, 55]));
+    writeFileSync(empty, Buffer.alloc(0));
+    const out = join(dir, 'out.wav');
+    // An hour apart, given out of order, with an empty turn that is skipped.
+    const segments = await concatTracksToWav([
+      { path: b, startMs: 3_600_000 }, { path: empty, startMs: 5 }, { path: a, startMs: 0 },
+    ], out, { gapMs: 1 });
+    assert.deepEqual(readWav(out).samples, [11, 22, ...Array(16).fill(0), 33, 44, 55]);
+    assert.deepEqual(segments, [
+      { fileMs: 0, startMs: 0, durationMs: 0.125 },
+      { fileMs: 1.125, startMs: 3_600_000, durationMs: 0.1875 },
+    ]);
+    assert.equal(await concatTracksToWav([{ path: empty, startMs: 0 }], join(dir, 'none.wav')), null);
   } finally { cleanup(); }
 });
 

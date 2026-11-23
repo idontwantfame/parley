@@ -3,7 +3,7 @@ import { config } from '../config/env.js';
 import { mkdtemp, rm, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mixTracksToWav } from '../voice/mix.js';
+import { concatTracksToWav } from '../voice/mix.js';
 
 // Speech-to-text engines only use a short hint: faster-whisper keeps ~223
 // hotword tokens and OpenAI the last 224 prompt tokens. ~800 characters is
@@ -144,17 +144,29 @@ export function diarizedLines({ text = '', words = [], segments = [] } = {}) {
 
 export const sharedSpeakerPrefix = (meetingId) => `shared-${meetingId}-`;
 
-function attributeSharedTrack(lines, track, meetingId) {
+// Meeting time (epoch ms) of a moment in a file of joined turns: inside a turn
+// it lands in that turn; in the pause after one, at that turn's end.
+function meetingMs(segments, seconds) {
+  const fileMs = seconds * 1000;
+  const segment = segments.findLast((s) => s.fileMs <= fileMs) ?? segments[0];
+  return Math.round(segment.startMs + Math.min(Math.max(0, fileMs - segment.fileMs), segment.durationMs));
+}
+
+// Each voice the sidecar found becomes a numbered speaker of this account;
+// speech it couldn't attribute is "-0" (it may mix several voices).
+function sharedUtterances(result, segments, track, meetingId) {
   const speakers = new Map();
-  return lines.map((line) => {
+  return diarizedLines(result).map((line) => {
     if (line.speaker !== null && !speakers.has(line.speaker)) {
       speakers.set(line.speaker, speakers.size + 1);
     }
     const number = speakers.get(line.speaker) ?? 0;
     return {
-      ...line,
       userId: `${sharedSpeakerPrefix(meetingId)}${track.userId}-${number}`,
       displayName: `${track.displayName} · ${number ? `Speaker ${number}` : 'Unidentified speech'}`,
+      startMs: meetingMs(segments, line.start),
+      endMs: meetingMs(segments, line.end),
+      text: line.text,
     };
   });
 }
@@ -178,17 +190,19 @@ function transcriptionJobs(tracks, sharedMicIds) {
   return jobs;
 }
 
-async function transcribeSharedMic(turns, diarize, options) {
+// The turns are joined without the silence between them, so the sidecar only
+// processes speech (a long session would otherwise be hours of near-silence).
+async function transcribeSharedMic(turns, diarize, options, meetingId) {
   const first = turns[0];
   if (turns.length === 1) {
-    return { startMs: first.startMs, result: await diarize(first.pcmPath, options) };
+    const whole = [{ fileMs: 0, startMs: first.startMs, durationMs: Infinity }];
+    return sharedUtterances(await diarize(first.pcmPath, options), whole, first, meetingId);
   }
   const dir = await mkdtemp(join(tmpdir(), 'parley-shared-mic-'));
   try {
-    let startMs;
-    const wav = await mixTracksToWav(turns.map(({ pcmPath, startMs }) => ({ path: pcmPath, startMs })),
-      join(dir, 'track.wav'), { onOrigin: (origin) => { startMs = origin; } });
-    return { startMs, result: wav ? await diarize(wav, options) : {} };
+    const wav = join(dir, 'track.wav');
+    const segments = await concatTracksToWav(turns.map(({ pcmPath, startMs }) => ({ path: pcmPath, startMs })), wav);
+    return segments ? sharedUtterances(await diarize(wav, options), segments, first, meetingId) : [];
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -237,25 +251,19 @@ export async function transcribeTracks(tracks, cfg = {}, deps = {}) {
       let failed = false;
       try {
         if (wavPath) await convert(t.pcmPath, wavPath);
-        let lines;
-        let startMs = t.startMs;
-        if (turns) {
-          const shared = await transcribeSharedMic(turns, diarize, {
+        const lines = turns
+          ? await transcribeSharedMic(turns, diarize, {
             model: resolveSttModel(cfg, 'sidecar'), language: cfg.language, vocabulary, diarize: true,
-          });
-          startMs = shared.startMs;
-          lines = attributeSharedTrack(diarizedLines(shared.result), t, deps.meetingId);
-        } else {
-          lines = transcriptLines(await stt(wavPath ?? t.pcmPath, cfg));
-        }
+          }, deps.meetingId)
+          : transcriptLines(await stt(wavPath ?? t.pcmPath, cfg)).map((line) => ({
+            userId: t.userId,
+            displayName: t.displayName,
+            startMs: t.startMs + Math.round(line.start * 1000),
+            endMs: t.startMs + Math.round(line.end * 1000),
+            text: line.text,
+          }));
         if (!lines.length) continue; // silent track — not a failure, just nothing said
-        results[i] = lines.map((line) => ({
-          userId: line.userId ?? t.userId,
-          displayName: line.displayName ?? t.displayName,
-          startMs: startMs + Math.round(line.start * 1000),
-          endMs: startMs + Math.round(line.end * 1000),
-          text: line.text,
-        }));
+        results[i] = lines;
       } catch (err) {
         failed = true;
         failures.push({ userId: t.userId, displayName: t.displayName, error: err.message || String(err) });

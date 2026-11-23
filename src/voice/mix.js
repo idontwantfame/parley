@@ -66,12 +66,11 @@ export async function recordingOriginMs(audioDir) {
  * Mix tracks [{ path, startMs }] into a WAV at outPath.
  * Returns outPath, or null when there is nothing to mix.
  */
-export async function mixTracksToWav(tracks, outPath, { onOrigin } = {}) {
+export async function mixTracksToWav(tracks, outPath) {
   const sized = await sizedTracks(tracks);
   if (sized.length === 0) return null;
 
   const t0 = earliestStart(sized);
-  onOrigin?.(t0);
   for (const t of sized) t.offsetBytes = (t.startMs - t0) * SAMPLES_PER_MS * BYTES_PER_SAMPLE;
   const totalBytes = Math.max(...sized.map((t) => t.offsetBytes + t.bytes));
 
@@ -100,6 +99,53 @@ export async function mixTracksToWav(tracks, outPath, { onOrigin } = {}) {
     }
   } finally { await out.close(); }
   return outPath;
+}
+
+// Silence between joined turns, so speech detection keeps them apart.
+export const TURN_GAP_MS = 1000;
+const BYTES_PER_MS = SAMPLES_PER_MS * BYTES_PER_SAMPLE;
+
+// Copy a whole track into `out` at byte position `at` (after the WAV header).
+async function copyTrack(out, track, at) {
+  const src = await open(track.path, 'r');
+  try {
+    for (let pos = 0; pos < track.bytes; pos += CHUNK) {
+      const len = Math.min(CHUNK, track.bytes - pos);
+      const buf = Buffer.alloc(len);
+      await src.read(buf, 0, len, pos);
+      await out.write(buf, 0, len, 44 + at + pos);
+    }
+  } finally { await src.close(); }
+}
+
+/**
+ * Join tracks [{ path, startMs }] back to back into a WAV at outPath, in time
+ * order with `gapMs` of silence between them. Unlike mixTracksToWav the file
+ * holds only the speech, so hours of a session stay as long as what was said.
+ * Returns where each track landed, [{ fileMs, startMs, durationMs }], or null
+ * when there is nothing to join.
+ */
+export async function concatTracksToWav(tracks, outPath, { gapMs = TURN_GAP_MS } = {}) {
+  const sized = (await sizedTracks(tracks)).sort((a, b) => a.startMs - b.startMs);
+  if (sized.length === 0) return null;
+  const gapBytes = gapMs * BYTES_PER_MS;
+  const offsets = [];
+  let next = 0;
+  for (const track of sized) {
+    offsets.push(next);
+    next += track.bytes + gapBytes;
+  }
+  const totalBytes = next - gapBytes;
+
+  const out = await open(outPath, 'w+', 0o600);
+  try {
+    await out.write(wavHeader(totalBytes), 0, 44, 0);
+    await out.truncate(44 + totalBytes); // the gaps stay zero-filled silence
+    for (const [i, track] of sized.entries()) await copyTrack(out, track, offsets[i]);
+  } finally { await out.close(); }
+  return sized.map((track, i) => ({
+    fileMs: offsets[i] / BYTES_PER_MS, startMs: track.startMs, durationMs: track.bytes / BYTES_PER_MS,
+  }));
 }
 
 /**
