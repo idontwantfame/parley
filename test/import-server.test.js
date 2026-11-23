@@ -10,6 +10,7 @@ import { connect } from 'node:net';
 import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { openDb } from '../src/store/db.js';
 import { setGuildConfig } from '../src/store/config.js';
 import { startWebServer } from '../src/web/server.js';
@@ -46,6 +47,16 @@ function stalledRequest(port, path, waitMs = 2000) {
     socket.on('error', done);
     socket.write(`POST ${path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{"user`);
   });
+}
+
+async function waitForImportFailure(db, meetingId) {
+  const deadline = Date.now() + 5000;
+  do {
+    const meeting = db.getMeeting(meetingId);
+    if (meeting?.import_error) return meeting;
+    await delay(10);
+  } while (Date.now() < deadline);
+  assert.fail(`Import ${meetingId} did not report its failure`);
 }
 
 test('a request that is not received by the default deadline is refused, before any sign-in', async () => {
@@ -85,6 +96,10 @@ test('an admin recording upload may take longer than the default request deadlin
     const res = await fetch(`${base}/api/guilds/g1/imports?filename=slow.mp3`, { method: 'POST', body, duplex: 'half',
       headers: { cookie, origin: base, 'content-type': 'audio/mpeg' } });
     assert.equal(res.status, 202);
+    const { meetingId } = await res.json();
+    // Let the background import settle before the next test starts a fresh DB
+    // whose first meeting uses the same id.
+    await waitForImportFailure(db, meetingId);
   } finally {
     Object.assign(config, saved);
     server.closeAllConnections();
@@ -122,11 +137,7 @@ test('a raw upload passes auth, CSRF and the JSON parser, and a failing import i
       { method: 'POST', body: Buffer.from('not really a video'), headers });
     assert.equal(res.status, 202);
     const { meetingId } = await res.json();
-    // Settled once the failure is recorded (status first, then the reason).
-    for (let i = 0; i < 200 && !db.getMeeting(meetingId).import_error; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    const meeting = db.getMeeting(meetingId);
+    const meeting = await waitForImportFailure(db, meetingId);
     // ffmpeg is either missing or can't read the fake bytes; both fail cleanly.
     assert.equal(meeting.status, 'transcription_failed');
     assert.match(meeting.import_error, /ffmpeg is not installed|could not be read as audio or video/);

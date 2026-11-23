@@ -205,12 +205,13 @@ export function runImport(db, meetingId, job, deps = {}) {
     dataDir: config.dataDir, runFfmpeg, transcribe: defaultTranscribe, now: Date.now,
     queue: importSlot, ...deps,
   };
+  // Clean up the original upload before publishing the final failure reason.
   return withMeetingProgress(meetingId, 1, (progress) => importPipeline(db, meetingId, job, resolved, progress))
+    .finally(() => rm(job.uploadPath, { force: true }).catch((err) => {
+      console.warn(`[import] meeting ${meetingId}: could not delete the upload: ${err.message}`);
+    }))
     .catch((err) => {
       recordImportFailure(db, meetingId, err);
       throw err;
-    })
-    .finally(() => rm(job.uploadPath, { force: true }).catch((err) => {
-      console.warn(`[import] meeting ${meetingId}: could not delete the upload: ${err.message}`);
-    }));
+    });
 }

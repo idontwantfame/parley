@@ -135,9 +135,14 @@ test('runImport without speaker detection asks for none and files one speaker', 
   } finally { cleanup(); }
 });
 
-test('a missing ffmpeg fails the import clearly and still deletes the upload', async () => {
+test('a missing ffmpeg deletes the upload before publishing the failure reason', async (t) => {
   const { dir, db, meetingId, uploadPath, cleanup } = setup();
   try {
+    const setImportError = db.setImportError.bind(db);
+    t.mock.method(db, 'setImportError', (id, message) => {
+      assert.equal(existsSync(uploadPath), false);
+      setImportError(id, message);
+    });
     const runFfmpeg = async () => { throw Object.assign(new Error('spawn ffmpeg ENOENT'), { code: 'ENOENT' }); };
     await assert.rejects(runImport(db, meetingId, { uploadPath, speakers: false },
       { dataDir: dir, runFfmpeg, summarizer: quietSummarizer(), transcribe: async () => assert.fail('no STT') }),
