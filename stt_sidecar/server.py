@@ -2,7 +2,10 @@ import ctypes, glob, logging, os, re, shutil, sysconfig, tempfile, threading
 
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from typing import Annotated
+from typing import Annotated, Optional
+
+import diarize as diarization
+from speaker_transcript import build_response
 
 log = logging.getLogger("stt_sidecar")
 
@@ -36,6 +39,11 @@ def _preload_cuda_libs():
     purelib = sysconfig.get_paths()["purelib"]
     pattern = os.path.join(purelib, "nvidia", "*", "lib", "*.so*")
     for path in glob.glob(pattern):
+        # libnvblas (in nvidia-cublas-cu12) would interpose every library's
+        # BLAS calls once global; without an nvblas.conf that segfaults torch's
+        # CPU matmuls (speaker detection). ctranslate2 never uses it.
+        if os.path.basename(path).startswith("libnvblas"):
+            continue
         try:
             ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
         except OSError as err:
@@ -45,7 +53,7 @@ def _preload_cuda_libs():
 if STT_DEVICE in ("auto", "cuda"):
     _preload_cuda_libs()
 
-from faster_whisper import WhisperModel, BatchedInferencePipeline, available_models  # noqa: E402 (must follow lib preload above)
+from faster_whisper import WhisperModel, BatchedInferencePipeline, available_models, decode_audio  # noqa: E402 (must follow lib preload above)
 
 app = FastAPI()
 _state = {"model": None, "model_name": None, "device": None, "compute": None, "batched": None, "batched_for": None}
@@ -57,6 +65,11 @@ _inference_slots = threading.BoundedSemaphore(STT_MAX_CONCURRENCY)
 # the Hugging Face Hub (or opened as a local path) on the client's say-so.
 KNOWN_MODELS = frozenset(available_models())
 _LANGUAGE_CODE = re.compile(r"^[a-z]{2,3}$")
+# Whisper's (and the diarizer's) input rate: diarized uploads are decoded once
+# to 16 kHz mono and the same samples go to both.
+SAMPLE_RATE = 16000
+MIN_SPEAKERS, MAX_SPEAKERS = 1, 20
+DIARIZATION_UNAVAILABLE = "Speaker detection is not enabled on this sidecar: "
 
 
 def _resolve_batch_size():
@@ -143,6 +156,7 @@ def health():
         "device": _state["device"],
         "compute": _state["compute"],
         "batch_size": _resolve_batch_size(),
+        "diarization": diarization.status(),
     }
 
 def _validate(model: str, language: str):
@@ -154,7 +168,18 @@ def _validate(model: str, language: str):
         raise HTTPException(400, f"Unsupported language {language!r}: use 'auto' or an ISO 639-1 code such as 'en'.")
 
 
-def _transcribe_file(path: str, model: str, language: str, vocabulary: str):
+def _validate_speakers(min_speakers: Optional[int], max_speakers: Optional[int]) -> None:
+    for name, value in (("min_speakers", min_speakers), ("max_speakers", max_speakers)):
+        if value is not None and not MIN_SPEAKERS <= value <= MAX_SPEAKERS:
+            raise HTTPException(400, f"{name} must be between {MIN_SPEAKERS} and {MAX_SPEAKERS}.")
+    if min_speakers is not None and max_speakers is not None and min_speakers > max_speakers:
+        raise HTTPException(400, "min_speakers cannot be greater than max_speakers.")
+
+
+def _whisper_segments(audio, model: str, language: str, vocabulary: str) -> tuple[list[dict], str]:
+    """Transcribe `audio` (a file path, or 16 kHz mono samples as a numpy array)
+    into nested segments [{start, end, text, words: [{word, start, end}]}]
+    plus the (detected) language."""
     m = get_model(model)
     lang = None if language == "auto" else language
     supported = getattr(m, "supported_languages", None)
@@ -166,29 +191,54 @@ def _transcribe_file(path: str, model: str, language: str, vocabulary: str):
     batched = get_batched(m)
     if batched is not None:
         segments, info = batched.transcribe(
-            path, language=lang, word_timestamps=True, batch_size=_resolve_batch_size(), **hints)
+            audio, language=lang, word_timestamps=True, batch_size=_resolve_batch_size(), **hints)
     else:
-        segments, info = m.transcribe(path, language=lang, word_timestamps=True, **hints)
-    words, texts, lines = [], [], []
-    for seg in segments:  # lazy: the actual inference runs while iterating
-        texts.append(seg.text)
-        # Sentence-sized lines the dashboard can seek the recording to.
-        if seg.text.strip():
-            lines.append({"start": seg.start, "end": seg.end, "text": seg.text.strip()})
-        for w in (getattr(seg, "words", None) or []):
-            words.append({"word": w.word, "start": w.start, "end": w.end})
-    return {"text": " ".join(t.strip() for t in texts).strip(),
-            "words": words,
-            "segments": lines,
-            "language": getattr(info, "language", language)}
+        segments, info = m.transcribe(audio, language=lang, word_timestamps=True, **hints)
+    # Lazy: the actual inference runs while iterating.
+    nested = [{"start": seg.start, "end": seg.end, "text": seg.text,
+               "words": [{"word": w.word, "start": w.start, "end": w.end}
+                         for w in (getattr(seg, "words", None) or [])]}
+              for seg in segments]
+    return nested, getattr(info, "language", language)
+
+
+def _transcribe_file(path: str, model: str, language: str, vocabulary: str) -> dict:
+    return build_response(*_whisper_segments(path, model, language, vocabulary))
+
+
+def _transcribe_with_speakers(path: str, model: str, language: str, vocabulary: str,
+                              min_speakers: Optional[int], max_speakers: Optional[int]) -> dict:
+    """WhisperX-style: faster-whisper transcript, then alignment + speakers."""
+    diarization.get_labeller()  # load (or refuse with a 400) before spending time on Whisper
+    audio = decode_audio(path, sampling_rate=SAMPLE_RATE)  # decoded once, shared by every stage
+    segments, detected = _whisper_segments(audio, model, language, vocabulary)
+    labelled = diarization.label_speakers(segments, audio, detected, min_speakers, max_speakers)
+    return build_response(labelled, detected, with_speakers=True)
 
 
 # Plain `def` (audit B1): FastAPI runs sync endpoints in its threadpool, so the
 # event loop — and /health — stay responsive during long transcriptions.
 @app.post("/transcribe")
 def transcribe(file: UploadFile = File(...), model: str = Form("small"), language: str = Form("auto"),
-               vocabulary: Annotated[str, Form(max_length=131072)] = ""):
+               vocabulary: Annotated[str, Form(max_length=131072)] = "",
+               diarize: Annotated[bool, Form()] = False,
+               min_speakers: Annotated[Optional[int], Form()] = None,
+               max_speakers: Annotated[Optional[int], Form()] = None):
     _validate(model, language)
+    _validate_speakers(min_speakers, max_speakers)
+    try:
+        if diarize:
+            diarization.check_available()  # cheap: before the upload is even saved
+        return _transcribe_upload(file, model, language, vocabulary,
+                                  (min_speakers, max_speakers) if diarize else None)
+    except diarization.DiarizationUnavailable as err:
+        raise HTTPException(400, DIARIZATION_UNAVAILABLE + str(err)) from err
+
+
+def _transcribe_upload(file: UploadFile, model: str, language: str, vocabulary: str,
+                       speaker_bounds: Optional[tuple[Optional[int], Optional[int]]]) -> dict:
+    """Save the upload to a temp file and transcribe it (with speakers when
+    `speaker_bounds` = (min_speakers, max_speakers) is given)."""
     suffix = os.path.splitext(file.filename or "a.wav")[1] or ".wav"
     fd, path = tempfile.mkstemp(prefix="stt-", suffix=suffix)
     try:
@@ -196,7 +246,9 @@ def transcribe(file: UploadFile = File(...), model: str = Form("small"), languag
         with os.fdopen(fd, "wb") as tmp:
             shutil.copyfileobj(file.file, tmp)
         with _inference_slots:
-            return _transcribe_file(path, model, language, vocabulary)
+            if speaker_bounds is None:
+                return _transcribe_file(path, model, language, vocabulary)
+            return _transcribe_with_speakers(path, model, language, vocabulary, *speaker_bounds)
     finally:
         try:
             os.unlink(path)

@@ -26,6 +26,32 @@ const json = async (r) => {
   throw await responseError(r);
 };
 
+// Upload a recording for import as the raw request body. XHR rather than
+// fetch because fetch can't report upload progress for a large file.
+function uploadRecording(guildId, file, params = {}, { onProgress, signal } = {}) {
+  return new Promise((resolve, reject) => {
+    const qs = new URLSearchParams(Object.entries(params)
+      .filter(([, v]) => v !== undefined && v !== null && v !== '')
+      .map(([k, v]) => [k, String(v)]));
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/api/guilds/${encodeURIComponent(guildId)}/imports?${qs}`);
+    xhr.setRequestHeader('content-type', file.type || 'application/octet-stream');
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress?.(e.loaded / e.total); };
+    xhr.onerror = () => reject(new Error('The upload was interrupted. Check the connection and try again.'));
+    xhr.onabort = () => reject(Object.assign(new Error('Upload cancelled.'), { cancelled: true }));
+    xhr.onload = () => {
+      let body = null;
+      try { body = JSON.parse(xhr.responseText); } catch { /* non-JSON error page */ }
+      if (xhr.status >= 200 && xhr.status < 300) return resolve(body);
+      if (xhr.status === 401 && onUnauthorized) { try { onUnauthorized(); } catch { /* ignore */ } }
+      const fallback = xhr.status === 413 ? 'The file is larger than this server accepts.' : `Upload failed (${xhr.status}).`;
+      return reject(Object.assign(new Error(body?.error || fallback), { status: xhr.status }));
+    };
+    signal?.addEventListener('abort', () => xhr.abort(), { once: true });
+    xhr.send(file);
+  });
+}
+
 const jsonBody = (method, body) => ({
   method,
   headers: { 'content-type': 'application/json' },
@@ -81,7 +107,10 @@ export const api = {
   vocabulary: () => fetch('/api/vocabulary').then(json),
   importVocabulary: (text) => fetch('/api/vocabulary', jsonBody('PUT', { text })).then(json),
   speakerNames: (g) => fetch(`/api/guilds/${g}/speaker-names`).then(json),
-  setSpeakerName: (g, id, name) => fetch(`/api/guilds/${g}/speaker-names/${id}`, jsonBody('PUT', { name })).then(json),
+  setSpeakerName: (g, id, name) => fetch(`/api/guilds/${g}/speaker-names/${encodeURIComponent(id)}`, jsonBody('PUT', { name })).then(json),
+  // ── Recording import ──────────────────────────────────────────────────────
+  importCapability: () => fetch('/api/imports/capability').then(json),
+  importRecording: (g, file, params, options) => uploadRecording(g, file, params, options),
   providerModels: (provider, refresh = false) => fetch(`/api/providers/${provider}/models${refresh ? '?refresh=1' : ''}`).then(json),
   setProviderKey: (provider, key) => fetch(`/api/providers/${provider}/key`, jsonBody('PUT', { key })).then(json),
   systemStatus: () => fetch('/api/system/status').then(json),

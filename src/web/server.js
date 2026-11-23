@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { apiRouter } from './api.js';
+import { IMPORT_REQUEST_TIMEOUT_MS } from './import-routes.js';
 import { installUsers } from '../store/users.js';
 import { authRouter, attachUser, requireAuth, requirePasswordChanged, sameOrigin } from './auth.js';
 
@@ -70,6 +71,8 @@ export async function startWebServer({ db, bot = null, client = null, sidecar = 
   const users = installUsers(db);
   const app = createWebServer({ db, bot, client, sidecar, users });
   const server = await listenWithFallback(app, port, host, maxAttempts);
+  // Recording imports stream large request bodies (see import-routes.js).
+  server.requestTimeout = IMPORT_REQUEST_TIMEOUT_MS;
   const purge = setInterval(() => {
     try { users.purgeExpiredSessions(); } catch (e) { console.warn('[web] session purge failed:', e.message); }
   }, SESSION_PURGE_INTERVAL_MS).unref();

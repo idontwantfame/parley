@@ -71,6 +71,74 @@ export function transcriptLines({ text = '', words = [], segments } = {}) {
   return [{ start: 0, end: lastEnd, text: clean }];
 }
 
+// ── Diarized results (imported recordings) ─────────────────────────────────
+// One file holds every speaker; the sidecar labels each word and segment with
+// a speaker ("SPEAKER_00", or null when it couldn't tell).
+
+const speakerLabel = (x) => (typeof x?.speaker === 'string' && x.speaker.trim() ? x.speaker : null);
+const byStart = (a, b) => a.start - b.start;
+
+// Each word's speaker, falling back to the segment its midpoint falls in.
+// Words and segments are both in time order, so one pass walks the segments.
+function withSegmentSpeakers(words, segments) {
+  let i = 0;
+  return words.map((w) => {
+    const own = speakerLabel(w);
+    if (own !== null) return { ...w, speaker: own };
+    const mid = (w.start + w.end) / 2;
+    while (i < segments.length && segments[i].end < mid) i++;
+    const segment = segments[i];
+    return { ...w, speaker: segment && segment.start <= mid ? speakerLabel(segment) : null };
+  });
+}
+
+// WhisperX leaves words outside every speaker turn unassigned (null). A stray
+// one belongs to the speaker around it (the previous word's, or the first
+// known speaker at the very start), not to an "Unknown speaker" line of its
+// own. If no word has a speaker at all, they all stay unknown.
+function fillUnassigned(words) {
+  let current = words.find((w) => w.speaker !== null)?.speaker ?? null;
+  return words.map((w) => {
+    if (w.speaker !== null) {
+      current = w.speaker;
+      return w;
+    }
+    return { ...w, speaker: current };
+  });
+}
+
+// Consecutive words by the same speaker: [{ speaker, words }].
+function speakerRuns(words) {
+  const runs = [];
+  for (const w of words) {
+    const last = runs[runs.length - 1];
+    if (last && last.speaker === w.speaker) last.words.push(w);
+    else runs.push({ speaker: w.speaker, words: [w] });
+  }
+  return runs;
+}
+
+/**
+ * Split a diarized STT result into timed lines (seconds from the file start),
+ * each tagged with its speaker label (null = unknown): words split at every
+ * speaker change, then into sentences like transcriptLines. Without word
+ * timings each segment is a line; failing that, the whole text is one.
+ */
+export function diarizedLines({ text = '', words = [], segments = [] } = {}) {
+  const timedSegments = (Array.isArray(segments) ? segments : []).filter(isTimed).sort(byStart);
+  const timedWords = (Array.isArray(words) ? words : [])
+    .filter((w) => isTimed(w) && typeof w.word === 'string' && w.word.trim()).sort(byStart);
+  if (timedWords.length) {
+    return speakerRuns(fillUnassigned(withSegmentSpeakers(timedWords, timedSegments)))
+      .flatMap(({ speaker, words: run }) => groupWords(run).map((line) => ({ ...line, speaker })));
+  }
+  const fromSegments = timedSegments
+    .map((seg) => ({ start: seg.start, end: seg.end, text: String(seg.text ?? '').trim(), speaker: speakerLabel(seg) }))
+    .filter((line) => line.text);
+  if (fromSegments.length) return fromSegments;
+  return transcriptLines({ text, words }).map((line) => ({ ...line, speaker: null }));
+}
+
 // Transcribes each track through a small worker pool instead of one at a
 // time. Cloud STT (openai) tolerates much higher concurrency than the local
 // sidecar, which is why the default differs by provider (S3 in the speed

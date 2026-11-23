@@ -23,6 +23,7 @@ const Search = lazy(() => import('./pages/Search.jsx'));
 const Commands = lazy(() => import('./pages/Commands.jsx'));
 const Setup = lazy(() => import('./pages/Setup.jsx'));
 const Account = lazy(() => import('./pages/Account.jsx'));
+const Import = lazy(() => import('./pages/Import.jsx'));
 const NotFound = lazy(() => import('./pages/NotFound.jsx'));
 
 function Spinner() {
@@ -78,6 +79,7 @@ function Shell() {
               <Route path="/live" element={<Live />} />
               <Route path="/meetings" element={<Meetings />} />
               <Route path="/meetings/:id" element={<Reading />} />
+              <Route path="/import" element={<Import />} />
               <Route path="/campaigns" element={<Campaigns />} />
               <Route path="/campaigns/:id" element={<Campaign />} />
               <Route path="/action-items" element={<ActionItems />} />

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api.js';
 import Field from '../components/Field.jsx';
+import { LANGS, SUMMARY_LANGS } from '../lib/languages.js';
 import { useGuild } from '../GuildContext.jsx';
 import { useAuth, useIsAdmin } from '../AuthContext.jsx';
 import { useSystem } from '../SystemContext.jsx';
@@ -10,9 +11,6 @@ import { ModelPicker } from '../components/ModelPicker.jsx';
 import { ConnectionForm, BotStatusBadge } from '../components/Connection.jsx';
 
 const WHISPER = ['tiny', 'base', 'small', 'medium', 'large-v3', 'large-v3-turbo'];
-const LANGS = [['auto', 'Auto-detect'], ['en', 'English'], ['de', 'German'], ['es', 'Spanish'], ['fr', 'French'],
-  ['it', 'Italian'], ['pt', 'Portuguese'], ['nl', 'Dutch'], ['pl', 'Polish'], ['ru', 'Russian'], ['ja', 'Japanese'], ['zh', 'Chinese']];
-const SUMMARY_LANGS = [['match', 'Match transcription'], ...LANGS.filter(([c]) => c !== 'auto')];
 
 // Model defaults come from the server (adapters/summarizer/models.js) so the
 // dashboard, /setup and the adapters can't drift apart.

@@ -45,7 +45,7 @@ export function mountCampaignRoutes(r, { db, liveClient }) {
     const byId = new Map();
     const rows = db.sql.prepare(
       `SELECT channel_id, channel_name FROM meetings WHERE guild_id = ? AND channel_id IS NOT NULL
-        GROUP BY channel_id ORDER BY MAX(started_at) DESC`
+        AND source IS NOT 'import' GROUP BY channel_id ORDER BY MAX(started_at) DESC`
     ).all(req.params.g);
     for (const r0 of rows) byId.set(r0.channel_id, { id: r0.channel_id, name: r0.channel_name || r0.channel_id });
     const guild = liveClient()?.guilds?.cache?.get(req.params.g);

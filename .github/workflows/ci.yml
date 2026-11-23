@@ -50,5 +50,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run pytest
-        # Tests inject a FakeModel, so no whisper model is downloaded.
-        run: python -m pytest test_server.py -q
+        # Tests inject a FakeModel, so no whisper model is downloaded, and fake
+        # whisperx/torch: speaker detection (requirements-diarize.txt) is
+        # deliberately NOT installed, so this also proves the default image works.
+        run: python -m pytest -q

@@ -32,6 +32,7 @@ import {
   ADMIN_CONFIG_FIELDS, MEETING_PAGE_MAX, configInputError, intQuery, isSingleQuery, questionOf,
 } from './api-input.js';
 import { mountCampaignRoutes } from './campaign-routes.js';
+import { mountImportRoutes } from './import-routes.js';
 
 function audioDir(id) {
   return join(env.dataDir, 'audio', String(id));
@@ -59,7 +60,10 @@ function requireAdminForFields(fields) {
 
 const artifactDirs = () => ({ dataDir: env.dataDir, exportDir: env.exportDir });
 
-export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAudio = ensureMixedWav }) {
+// A Discord user id, or a speaker of an imported recording (import-<meeting>-<n>).
+const SPEAKER_ID = /^(?:[1-9]\d{16,19}|import-[1-9]\d{0,15}-\d{1,3})$/;
+
+export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAudio = ensureMixedWav, imports = {} }) {
   const r = Router();
   // Meeting ids with a summary regeneration in flight (guards double-submits).
   const regeneration = new Map();
@@ -183,7 +187,8 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
     const plan = retryPlan(loaded, id, { dataDir: env.dataDir, exists: listAudio });
     const regen = regeneratePlan(loaded, id);
     const cfg = getGuildConfig(db, meeting.guild_id);
-    const channelId = cfg.notesChannelId || meeting.channel_id;
+    // An import has no Discord channel of its own; only a notes channel can take it.
+    const channelId = cfg.notesChannelId || (meeting.source === 'import' ? null : meeting.channel_id);
     const channel = liveClient()?.channels?.cache?.get(channelId);
     const hasAudio = meeting.status === 'done' && !!meeting.audio_retained && audioFiles !== null;
     res.json({
@@ -458,8 +463,8 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
   r.put('/guilds/:g/speaker-names/:userId', requireAdmin, (req, res) => {
     const { g, userId } = req.params;
     const name = typeof req.body?.name === 'string' ? req.body.name.trim() : req.body?.name;
-    if (!/^[1-9]\d{16,19}$/.test(userId) || !(name === null || (typeof name === 'string' && name.length <= 80 && !/[\x00-\x1f\x7f]/.test(name)))) {
-      return res.status(400).json({ error: 'Enter a valid Discord user ID and a display name of up to 80 characters.' });
+    if (!SPEAKER_ID.test(userId) || !(name === null || (typeof name === 'string' && name.length <= 80 && !/[\x00-\x1f\x7f]/.test(name)))) {
+      return res.status(400).json({ error: 'Enter a valid speaker ID and a display name of up to 80 characters.' });
     }
     db.setSpeakerName(g, userId, name || null);
     res.json({ name: name || null });
@@ -682,6 +687,8 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
   });
 
   mountCampaignRoutes(r, { db, liveClient });
+  // `imports` overrides the import routes' sidecar check, runner and limits (tests).
+  mountImportRoutes(r, { db, liveClient, ...imports });
 
   return r;
 }

@@ -34,6 +34,10 @@ import { retainRecording } from '../voice/recording-archive.js';
 // run (and the API hides Retry while progress exists).
 export const RETRYABLE_STATUSES = new Set(['transcription_failed', 'summary_failed', 'processing']);
 
+// An imported recording has no per-speaker PCM to re-transcribe from.
+export const REIMPORT_REASON = 'Re-import the recording to retry transcription.';
+const isImport = (meeting) => meeting?.source === 'import';
+
 /**
  * Whether to offer Retry for a meeting, given its retryPlan. Besides failed
  * meetings, a finished one whose transcript is known to be partial (some
@@ -113,6 +117,20 @@ async function regenerateSavedSummary(db, meetingId) {
   return { ok: true, status: 'done', modelUsed };
 }
 
+// After a re-summarize: archive the audio when the guild keeps recordings,
+// else let the caller drop it. Returns whether a recording is kept. An
+// import's recording IS the meeting's audio and is always kept as it is.
+async function settleRetriedAudio(db, meeting, cfg, audioDir, progress) {
+  if (isImport(meeting)) return !!meeting.audio_retained;
+  let hasAudio = false;
+  if (cfg.keepAudio) {
+    progress.stage = 'archiving';
+    hasAudio = await retainRecording(audioDir, meeting.transcription_complete === 1, meeting.id);
+  }
+  db.setAudioRetained(meeting.id, hasAudio);
+  return hasAudio;
+}
+
 /** Decide what a retry would do, without doing it (for enabling UI + messaging). */
 export function retryPlan(db, meetingId, { dataDir, exists = readdirSync } = {}) {
   const meeting = db.getMeeting(meetingId);
@@ -126,6 +144,7 @@ export function retryPlan(db, meetingId, { dataDir, exists = readdirSync } = {})
   }
   if (hasUtterances) return { ok: true, action: 'resummarize', meeting };
   if (pcmCount > 0) return { ok: true, action: 'retranscribe', meeting };
+  if (isImport(meeting)) return { ok: false, action: 'none', meeting, reason: REIMPORT_REASON };
   return { ok: false, action: 'none', meeting,
     reason: 'No transcript and no saved audio remain for this meeting, so it cannot be retried.' };
 }
@@ -143,6 +162,7 @@ export async function retryMeeting(db, meetingId, { dataDir, deliver = null } = 
 
   if (plan.action === 'resummarize') return withMeetingProgress(meetingId, null, async (progress) => {
     db.setMeetingStatus(meetingId, 'processing');
+    if (isImport(meeting)) db.setImportError(meetingId, null);
     let result;
     try {
       result = await summarizeStored(db, meeting, cfg);
@@ -155,16 +175,14 @@ export async function retryMeeting(db, meetingId, { dataDir, deliver = null } = 
     const { notes, talktime, meta, modelUsed } = result;
     db.replaceSummary(meetingId, meeting.guild_id, notes, talktime, modelUsed, meeting.started_at);
     const audioDir = join(dataDir, 'audio', String(meetingId));
-    let hasAudio = false;
-    if (cfg.keepAudio) {
-      progress.stage = 'archiving';
-      hasAudio = await retainRecording(audioDir, meeting.transcription_complete === 1, meetingId);
-    }
-    db.setAudioRetained(meetingId, hasAudio);
+    const hasAudio = await settleRetriedAudio(db, meeting, cfg, audioDir, progress);
     db.setMeetingStatus(meetingId, 'done', new Date().toISOString());
     if (!hasAudio) await rm(audioDir, { recursive: true, force: true }).catch(() => {});
     const exportResult = await autoExportMeeting(db, meetingId);
-    if (deliver) await deliverSavedNotes(db, meetingId, (savedNotes, savedTalktime) => deliver(savedNotes, savedTalktime, meta));
+    // An import is posted only when asked at upload (or via Post to Discord).
+    if (deliver && !isImport(meeting)) {
+      await deliverSavedNotes(db, meetingId, (savedNotes, savedTalktime) => deliver(savedNotes, savedTalktime, meta));
+    }
     // A session that failed earlier never reached its campaign journal.
     if (meeting.campaign_id) progress.stage = 'journal';
     await foldMeetingIntoJournal(db, meetingId, { cfg })

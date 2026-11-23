@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `npm start` — run the bot (src/index.js). Requires the STT sidecar running too.
 - `npm test` — run all unit tests (`node --test`).
 - `npm run sidecar` — start the Python faster-whisper STT sidecar (stt_sidecar/server.py).
-- Sidecar tests: `cd stt_sidecar && .venv/bin/python -m pytest test_server.py -q` (create the venv first: `python3 -m venv stt_sidecar/.venv && stt_sidecar/.venv/bin/pip install -r stt_sidecar/requirements.txt`).
+- Sidecar tests: `cd stt_sidecar && .venv/bin/python -m pytest -q` (all test files; whisperx/torch are faked, so the default requirements suffice) (create the venv first: `python3 -m venv stt_sidecar/.venv && stt_sidecar/.venv/bin/pip install -r stt_sidecar/requirements.txt`).
 - If npm refuses install scripts (strict allow-scripts), `npm ci --ignore-scripts` is enough for the tests; `postinstall` applies scripts/patch-discord-voice.mjs.
 - Run a single Node test file: `node --test test/<name>.test.js`.
 - Requires Node >= 22.5 (uses the built-in `node:sqlite`).
@@ -27,6 +27,8 @@ Pluggable summarizer (src/adapters/summarizer/): gemini (default), ollama, opena
 Storage: src/store/db.js (node:sqlite, FTS5 for /search). Per-guild runtime config in src/store/config.js.
 
 Campaigns (src/campaign/): cross-session memory. A campaign groups meetings (meetings.campaign_id); voice channels link to one via campaign_channels, so createMeeting files new recordings automatically. After a campaign session is summarized, the orchestrator folds its transcript into the campaign journal (one LLM-rewritten Markdown doc of world state, via the adapter's ask(); meetings.journaled_at marks folded sessions; per-campaign lock + shrinkage guard in journal.js). The journal is passed to summarize() as meta.campaignContext (appended in notes.js summaryPrompt). /ask and /recap (ask.js) build context from journal + numbered session notes + FTS5-matched transcript excerpts — never whole transcripts.
+
+Imports (src/pipeline/import.js, src/web/import-routes.js): admins upload a recording made outside Discord (raw request body, streamed to DATA_DIR/imports); ffmpeg converts it to the meeting's mixed.mp3 (+ mixed.json origin) and the sidecar transcribes it. Speaker detection is optional: the sidecar's `-full` image (WITH_DIARIZATION=1) runs WhisperX alignment + pyannote community-1 when HF_TOKEN is set (stt_sidecar/whisperx_backend.py, diarize.py); otherwise every line is "Speaker 1". Speakers get per-meeting ids `import-<meetingId>-<n>`, renamed via speaker_names. Transcript lines are sentence-level with epoch start_ms; the meeting page player seeks to start_ms - audioOriginMs.
 
 Slash commands: /join /leave /summary /history /search /ask /recap /journal /campaign /setup (src/commands/). Auto-join when >1 human, auto-leave when ≤1 (src/voice/decisions.js).
 

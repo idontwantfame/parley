@@ -63,6 +63,7 @@ export function LiveCard({ session }) {
 export function ProgressText({ progress }) {
   if (!progress) return 'Preparing transcription…';
   if (progress.stage === 'summarizing') return 'Generating notes…';
+  if (progress.stage === 'importing') return 'Transcribing and detecting speakers…';
   if (progress.stage === 'archiving') return 'Saving the recording…';
   if (progress.stage === 'journal') return 'Updating the campaign journal…';
   const { completed, total, failed, etaSeconds } = progress;

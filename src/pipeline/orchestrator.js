@@ -62,7 +62,6 @@ export function processMeeting(db, meetingId, opts) {
 }
 
 async function runMeeting(db, meetingId, opts, progress) {
-  const meeting = db.getMeeting(meetingId);
   const transcribe = opts.transcribe || ((tracks, cfg) => transcribeTracks(tracks, cfg, {
     onTrackDone: ({ failed }) => {
       progress.completed++;
@@ -85,54 +84,89 @@ async function runMeeting(db, meetingId, opts, progress) {
     return { notes: null, talktime: [], empty: true };
   }
 
-  const speakers = db.listUtterances(meetingId).map((u) => ({
+  return finishMeeting(db, meetingId, {
+    cfg: opts.cfg, summarizer, deliver: opts.deliver, progress,
+    timings: { transcribeMs, tracks: opts.tracks.length },
+    retainAudio: async () => {
+      if (!opts.cfg.keepAudio || opts.tracks.length === 0) return false;
+      progress.stage = 'archiving';
+      return retainRecording(dirname(opts.tracks[0].pcmPath), failures.length === 0, meetingId);
+    },
+  });
+}
+
+// What the summarizer is given: the merged transcript plus meeting context.
+function summaryInput(db, meeting, cfg) {
+  const speakers = db.listUtterances(meeting.id).map((u) => ({
     userId: u.user_id, displayName: u.display_name, startMs: u.start_ms, endMs: u.end_ms, text: u.text,
   }));
-  const transcript = buildTranscript(speakers);
-  const talktime = computeTalkTime(speakers);
-  const attendees = db.listAttendees(meetingId).map((a) => a.display_name);
   const meta = {
     channelName: meeting.channel_name,
     date: meeting.started_at,
-    attendees,
-    summaryLanguage: resolveSummaryLanguage(opts.cfg),
-    summaryPrompt: opts.cfg.summaryPrompt,
+    attendees: db.listAttendees(meeting.id).map((a) => a.display_name),
+    summaryLanguage: resolveSummaryLanguage(cfg),
+    summaryPrompt: cfg.summaryPrompt,
     campaignContext: campaignContextFor(db, meeting),
   };
+  return { transcript: buildTranscript(speakers), talktime: computeTalkTime(speakers), meta };
+}
 
-  let notes;
-  progress.stage = 'summarizing';
-  const summarizeStart = Date.now();
+async function summarizeOrFail(db, meetingId, summarizer, { transcript, meta }, cfg) {
   try {
-    notes = await summarizer.summarize(transcript, meta);
+    return await summarizer.summarize(transcript, meta);
   } catch (err) {
     db.setMeetingStatus(meetingId, 'summary_failed');
     // A failed summary must not stop the transcript archive.
     await autoExportMeeting(db, meetingId);
     // FallbackSummarizer already composed a message naming both attempts; don't
     // overwrite it with one that only mentions the primary provider.
-    err.userMessage ??= describeSummarizerError(err, opts.cfg.summarizerProvider);
+    err.userMessage ??= describeSummarizerError(err, cfg.summarizerProvider);
     throw err;
   }
-  const summarizeMs = Date.now() - summarizeStart;
+}
 
-  const timings = { transcribeMs, summarizeMs, tracks: opts.tracks.length };
-  console.log(`[pipeline] meeting ${meetingId}: transcribe ${transcribeMs}ms (${opts.tracks.length} tracks), summarize ${summarizeMs}ms`);
+// Campaign sessions also update the campaign journal. Best-effort and last:
+// the notes are already saved and delivered, and a journal failure can be
+// retried from the Campaigns page ("Update journal").
+async function foldIntoCampaign(db, meeting, { cfg, summarizer, progress }) {
+  if (!meeting.campaign_id) return null;
+  progress.stage = 'journal';
+  try {
+    return await foldMeetingIntoJournal(db, meeting.id, { cfg, summarizer });
+  } catch (err) {
+    console.error(`[pipeline] meeting ${meeting.id}: campaign journal update failed: ${err.message}`);
+    return { error: err.message };
+  }
+}
+
+/**
+ * Summarize a meeting whose transcript is already stored, then save the notes
+ * and todos, settle its audio (`retainAudio` resolves to whether a recording
+ * is kept), mark it done, export, deliver (when `deliver` is given) and fold
+ * it into its campaign journal. Shared by recorded and imported meetings.
+ * Throws with a userMessage (status summary_failed) when summarizing fails.
+ */
+export async function finishMeeting(db, meetingId, { cfg, summarizer, deliver = null, progress, timings = {}, retainAudio }) {
+  const meeting = db.getMeeting(meetingId);
+  const input = summaryInput(db, meeting, cfg);
+  progress.stage = 'summarizing';
+  const summarizeStart = Date.now();
+  const notes = await summarizeOrFail(db, meetingId, summarizer, input, cfg);
+  const summarizeMs = Date.now() - summarizeStart;
+  const { transcribeMs, ...rest } = timings;
+  console.log(`[pipeline] meeting ${meetingId}: transcribe ${transcribeMs}ms (${rest.tracks} tracks), summarize ${summarizeMs}ms`);
 
   // summarizer.lastUsed is set by FallbackSummarizer to whichever provider
   // actually produced these notes; plain adapters leave it undefined.
-  const modelUsed = summarizer.lastUsed ?? `${opts.cfg.summarizerProvider}:${opts.cfg.summarizerModel || ''}`;
+  const modelUsed = summarizer.lastUsed ?? `${cfg.summarizerProvider}:${cfg.summarizerModel || ''}`;
   // Swap summary + todos in one transaction (like retry/regenerate): a re-run
   // after a crash must drop stale todos and keep the ones already ticked off.
   // Todos are dated from the MEETING, not now(): a pipeline that runs long
   // would otherwise stamp today onto a meeting that started hours ago, so the
   // action items collapse onto the wrong day in the timeline view.
-  db.replaceSummary(meetingId, meeting.guild_id, notes, talktime, modelUsed, meeting.started_at, timings);
-  let audioRetained = false;
-  if (opts.cfg.keepAudio && opts.tracks.length > 0) {
-    progress.stage = 'archiving';
-    audioRetained = await retainRecording(dirname(opts.tracks[0].pcmPath), failures.length === 0, meetingId);
-  }
+  db.replaceSummary(meetingId, meeting.guild_id, notes, input.talktime, modelUsed, meeting.started_at,
+    { transcribeMs, summarizeMs, ...rest });
+  const audioRetained = await retainAudio();
   db.setAudioRetained(meetingId, audioRetained);
   db.setMeetingStatus(meetingId, 'done', new Date().toISOString());
   const exportResult = await autoExportMeeting(db, meetingId);
@@ -142,22 +176,9 @@ async function runMeeting(db, meetingId, opts, progress) {
   // finished meeting or flip it back to a failed state — the notes already live
   // in the dashboard. Surface it via `delivered` + `deliveryError` so callers can
   // log it or offer a re-post, without treating the meeting as failed.
-  const { delivered = false, deliveryError = null } = opts.deliver
-    ? await deliverSavedNotes(db, meetingId, (savedNotes, savedTalktime) => opts.deliver(savedNotes, savedTalktime, meta))
+  const { delivered = false, deliveryError = null } = deliver
+    ? await deliverSavedNotes(db, meetingId, (savedNotes, savedTalktime) => deliver(savedNotes, savedTalktime, input.meta))
     : {};
-
-  // Campaign sessions also update the campaign journal. Best-effort and last:
-  // the notes are already saved and delivered, and a journal failure can be
-  // retried from the Campaigns page ("Update journal").
-  let journal = null;
-  if (meeting.campaign_id) {
-    progress.stage = 'journal';
-    try {
-      journal = await foldMeetingIntoJournal(db, meetingId, { cfg: opts.cfg, summarizer });
-    } catch (err) {
-      journal = { error: err.message };
-      console.error(`[pipeline] meeting ${meetingId}: campaign journal update failed: ${err.message}`);
-    }
-  }
-  return { notes, talktime, delivered, deliveryError, journal, audioRetained, ...exportResult };
+  const journal = await foldIntoCampaign(db, meeting, { cfg, summarizer, progress });
+  return { notes, talktime: input.talktime, delivered, deliveryError, journal, audioRetained, ...exportResult };
 }

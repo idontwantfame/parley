@@ -34,6 +34,20 @@ def test_transcribe_returns_text(monkeypatch):
 def reset_state():
     _state.update(model=None, model_name=None, device=None, compute=None)
 
+def test_cuda_preload_skips_nvblas_which_would_hijack_cpu_blas(monkeypatch):
+    # libnvblas (shipped in nvidia-cublas-cu12) interposes the BLAS symbols of
+    # every library once loaded RTLD_GLOBAL; without an nvblas.conf, torch's
+    # CPU matmuls (speaker detection) then segfault. ctranslate2 never needs it.
+    import server
+    libs = ["/sp/nvidia/cublas/lib/libcublas.so.12", "/sp/nvidia/cublas/lib/libnvblas.so.12",
+            "/sp/nvidia/cudnn/lib/libcudnn.so.9"]
+    loaded = []
+    monkeypatch.setattr(server.glob, "glob", lambda pattern: list(libs))
+    monkeypatch.setattr(server.ctypes, "CDLL", lambda path, mode=0: loaded.append(path))
+    server._preload_cuda_libs()
+    assert loaded == [libs[0], libs[2]]
+
+
 def test_auto_falls_back_to_cpu_when_cuda_fails(monkeypatch):
     reset_state()
     attempts = []
@@ -272,3 +286,181 @@ def test_transcribe_returns_sentence_segments(monkeypatch):
     client = TestClient(app)
     r = client.post("/transcribe", files={"file": ("a.wav", make_silent_wav(), "audio/wav")})
     assert r.json()["segments"] == [{"start": 0.0, "end": 1.0, "text": "hello world"}]
+
+
+# ── speaker detection (diarize=true) ─────────────────────────────────────────
+import copy
+import numpy as np
+import pytest
+import diarize
+
+DIARIZE_PREFIX = "Speaker detection is not enabled on this sidecar: "
+
+
+class FakeDiarizationBackend:
+    """Stands in for WhisperX: labels by overlap with `turns`, leaving words and
+    segments that overlap no turn unlabelled (as whisperx.assign_word_speakers does)."""
+    def __init__(self, reason=None, turns=(), load_error=None):
+        self.reason, self.turns, self.load_error = reason, list(turns), load_error
+        self.loads, self.calls = 0, []
+
+    def unavailable_reason(self):
+        return self.reason
+
+    def _speaker(self, item):
+        hits = [(min(item["end"], e) - max(item["start"], s), spk) for s, e, spk in self.turns
+                if min(item["end"], e) > max(item["start"], s)]
+        return max(hits)[1] if hits else None
+
+    def _label(self, item):
+        speaker = self._speaker(item)
+        return {**item, "speaker": speaker} if speaker else dict(item)
+
+    def load(self):
+        self.loads += 1
+        if self.load_error:
+            raise self.load_error
+        def label(segments, audio, language, min_speakers, max_speakers):
+            self.calls.append((copy.deepcopy(segments), audio, language, min_speakers, max_speakers))
+            return [{**self._label(seg), "words": [self._label(w) for w in seg["words"]]} for seg in segments]
+        return label
+
+
+class TwoSpeakerModel:
+    """Alice says 'hi there' (0-1 s), Bob answers 'hello' (2-3 s)."""
+    def __init__(self):
+        self.inputs = []
+
+    def transcribe(self, audio, **kwargs):
+        self.inputs.append(audio)
+        W = lambda word, start, end: type("W", (), {"word": word, "start": start, "end": end})()
+        S = lambda text, start, end, words: type("S", (), {"text": text, "start": start, "end": end, "words": words})()
+        segs = [S(" hi there", 0.0, 1.0, [W(" hi", 0.0, 0.4), W(" there", 0.5, 1.0)]),
+                S(" hello", 2.0, 3.0, [W(" hello", 2.0, 3.0)])]
+        return segs, type("I", (), {"language": "en"})()
+
+
+@pytest.fixture
+def speaker_env(monkeypatch):
+    import server
+    diarize._state.update(labeller=None, error=None)
+    model = TwoSpeakerModel()
+    monkeypatch.setattr(server, "get_model", lambda name: model)
+    monkeypatch.setattr(server, "get_batched", lambda m: None)
+    def with_backend(backend):
+        monkeypatch.setattr(diarize, "BACKEND", backend)
+        return backend
+    yield model, with_backend
+    diarize._state.update(labeller=None, error=None)
+
+
+def post_wav(data=None):
+    return TestClient(app).post("/transcribe", files={"file": ("a.wav", make_silent_wav(), "audio/wav")},
+                                data=data or {})
+
+
+def test_health_reports_whether_speaker_detection_is_available(speaker_env):
+    _, with_backend = speaker_env
+    with_backend(FakeDiarizationBackend(reason="HF_TOKEN is not set"))
+    body = TestClient(app).get("/health").json()
+    assert body["diarization"] == {"available": False, "reason": "HF_TOKEN is not set"}
+    backend = with_backend(FakeDiarizationBackend())
+    assert TestClient(app).get("/health").json()["diarization"] == {"available": True, "reason": None}
+    assert backend.loads == 0  # /health stays cheap
+
+
+def test_default_sidecar_reports_speaker_detection_unavailable():
+    # No whisperx in the default image (nor in CI), and no HF_TOKEN in either
+    # image by default: /health says why, it doesn't fail.
+    body = TestClient(app).get("/health").json()
+    assert body["diarization"]["available"] is False
+    assert body["diarization"]["reason"]
+
+
+@pytest.mark.parametrize("data", [{}, {"diarize": "false"}])
+def test_without_diarize_the_response_is_unchanged(speaker_env, data):
+    model, with_backend = speaker_env
+    backend = with_backend(FakeDiarizationBackend(turns=[(0.0, 3.0, "SPEAKER_00")]))
+    r = post_wav(data)
+    assert r.status_code == 200
+    assert r.json() == {
+        "text": "hi there hello",
+        "words": [{"word": " hi", "start": 0.0, "end": 0.4}, {"word": " there", "start": 0.5, "end": 1.0},
+                  {"word": " hello", "start": 2.0, "end": 3.0}],
+        "segments": [{"start": 0.0, "end": 1.0, "text": "hi there"}, {"start": 2.0, "end": 3.0, "text": "hello"}],
+        "language": "en"}
+    assert isinstance(model.inputs[0], str)  # the uploaded file path, as before
+    assert backend.loads == 0 and backend.calls == []
+
+
+def test_diarize_labels_words_and_segments_and_lists_speakers(speaker_env):
+    model, with_backend = speaker_env
+    backend = with_backend(FakeDiarizationBackend(
+        turns=[(0.0, 1.1, "SPEAKER_01"), (1.9, 3.0, "SPEAKER_00")]))
+    r = post_wav({"diarize": "true"})
+    assert r.status_code == 200
+    body = r.json()
+    assert [(w["word"], w["speaker"]) for w in body["words"]] == [
+        (" hi", "SPEAKER_01"), (" there", "SPEAKER_01"), (" hello", "SPEAKER_00")]
+    assert body["segments"] == [
+        {"start": 0.0, "end": 1.0, "text": "hi there", "speaker": "SPEAKER_01"},
+        {"start": 2.0, "end": 3.0, "text": "hello", "speaker": "SPEAKER_00"}]
+    assert body["speakers"] == ["SPEAKER_01", "SPEAKER_00"]  # order of first appearance
+    assert body["text"] == "hi there hello" and body["language"] == "en"
+    # Decoded once to 16 kHz mono: Whisper and WhisperX get the same samples,
+    # plus Whisper's nested segments and detected language.
+    segments, audio, language, _, _ = backend.calls[0]
+    assert isinstance(audio, np.ndarray) and audio.dtype == np.float32 and audio.shape == (16000,)
+    assert model.inputs[0] is audio
+    assert language == "en"
+    assert segments[0] == {"start": 0.0, "end": 1.0, "text": " hi there",
+                           "words": [{"word": " hi", "start": 0.0, "end": 0.4},
+                                     {"word": " there", "start": 0.5, "end": 1.0}]}
+
+
+def test_words_and_segments_without_a_speaker_get_null(speaker_env):
+    _, with_backend = speaker_env
+    with_backend(FakeDiarizationBackend(turns=[(0.0, 0.9, "SPEAKER_00")]))
+    body = post_wav({"diarize": "true"}).json()
+    assert [w["speaker"] for w in body["words"]] == ["SPEAKER_00", "SPEAKER_00", None]
+    assert body["segments"][1]["speaker"] is None
+    assert body["speakers"] == ["SPEAKER_00"]
+
+
+def test_speaker_count_bounds_reach_the_backend(speaker_env):
+    _, with_backend = speaker_env
+    backend = with_backend(FakeDiarizationBackend())
+    assert post_wav({"diarize": "true", "min_speakers": "2", "max_speakers": "3"}).status_code == 200
+    assert post_wav({"diarize": "true", "max_speakers": "4"}).status_code == 200
+    assert [(lo, hi) for *_, lo, hi in backend.calls] == [(2, 3), (None, 4)]
+
+
+@pytest.mark.parametrize("data", [
+    {"min_speakers": "0"}, {"max_speakers": "21"}, {"min_speakers": "4", "max_speakers": "2"}])
+def test_invalid_speaker_count_bounds_are_a_client_error(speaker_env, data):
+    model, with_backend = speaker_env
+    backend = with_backend(FakeDiarizationBackend())
+    r = post_wav({"diarize": "true", **data})
+    assert r.status_code == 400
+    assert "speakers" in r.json()["detail"]
+    assert model.inputs == [] and backend.loads == 0
+
+
+def test_diarize_when_unavailable_is_a_400_before_any_transcription(speaker_env):
+    model, with_backend = speaker_env
+    with_backend(FakeDiarizationBackend(reason="HF_TOKEN is not set"))
+    r = post_wav({"diarize": "true"})
+    assert r.status_code == 400
+    assert r.json()["detail"] == DIARIZE_PREFIX + "HF_TOKEN is not set"
+    assert model.inputs == []
+
+
+def test_diarization_model_load_failure_is_a_400(speaker_env):
+    model, with_backend = speaker_env
+    with_backend(FakeDiarizationBackend(load_error=RuntimeError("terms not accepted")))
+    r = post_wav({"diarize": "true"})
+    assert r.status_code == 400
+    assert r.json()["detail"].startswith(DIARIZE_PREFIX)
+    assert "terms not accepted" in r.json()["detail"]
+    assert model.inputs == []  # the model load is checked before transcribing
+    assert "terms not accepted" in TestClient(app).get("/health").json()["diarization"]["reason"]

@@ -38,6 +38,25 @@ export function validateEnv(env = process.env) {
   return true;
 }
 
+// Imported recordings (dashboard upload → local sidecar). Uploads wait in
+// DATA_DIR/imports/ until converted; anything left there at boot is stale.
+export const IMPORT_UPLOADS_DIR = 'imports';
+export const DEFAULT_IMPORT_MAX_BYTES = 2 * 1024 ** 3; // 2 GiB
+export const DEFAULT_IMPORT_STT_TIMEOUT_MS = 3 * 60 * 60 * 1000; // 3 hours
+
+function positiveInt(value, fallback) {
+  const text = String(value ?? '').trim();
+  const n = Number(text);
+  return /^\d+$/.test(text) && Number.isSafeInteger(n) && n > 0 ? n : fallback;
+}
+
+export function resolveImportLimits(env = process.env) {
+  return {
+    importMaxBytes: positiveInt(env.IMPORT_MAX_BYTES, DEFAULT_IMPORT_MAX_BYTES),
+    importSttTimeoutMs: positiveInt(env.IMPORT_STT_TIMEOUT_MS, DEFAULT_IMPORT_STT_TIMEOUT_MS),
+  };
+}
+
 const retention = process.env.AUDIO_RETENTION_DAYS?.trim();
 const meetingRetention = process.env.MEETING_RETENTION_DAYS?.trim();
 export const config = {
@@ -56,4 +75,5 @@ export const config = {
   opencode: { apiKey: process.env.OPENCODE_API_KEY, baseUrl: process.env.OPENCODE_BASE_URL || 'https://opencode.ai/zen/go/v1' },
   openrouter: { apiKey: process.env.OPENROUTER_API_KEY, baseUrl: process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1' },
   ollama: { url: (process.env.OLLAMA_URL || DEFAULT_OLLAMA_URL).replace(/\/+$/, '') },
+  ...resolveImportLimits(),
 };

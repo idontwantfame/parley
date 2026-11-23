@@ -5,6 +5,8 @@ import { dashboardQueries } from './dashboard-queries.js';
 // load an entire guild's history.
 const TODO_LIST_LIMIT = 1000;
 // Utterance rows with per-guild speaker renames applied (append WHERE/ORDER).
+// Speakers of an imported recording are per-recording ids (import-<meeting>-<n>).
+const NOT_IMPORT_SPEAKER = (column) => `${column} NOT LIKE 'import-%'`;
 const NAMED_UTTERANCES = `SELECT u.id, u.meeting_id, u.user_id, COALESCE(n.display_name, u.display_name) AS display_name,
     u.start_ms, u.end_ms, u.text
   FROM utterances u JOIN meetings m ON m.id = u.meeting_id
@@ -113,7 +115,9 @@ export function openDb(path) {
   // Migration: track whether every submitted audio track transcribed. NULL is
   // intentionally preserved for legacy meetings whose completeness is unknown.
   const meetingCols = sql.prepare(`PRAGMA table_info(meetings)`).all();
-  for (const column of ['delivery_status', 'delivery_error', 'delivery_summary_at']) {
+  // source: 'import' for a recording uploaded from the dashboard, NULL for a
+  // Discord capture. import_error: why an import failed, for the dashboard.
+  for (const column of ['delivery_status', 'delivery_error', 'delivery_summary_at', 'source', 'import_error']) {
     if (!meetingCols.some((c) => c.name === column)) sql.exec(`ALTER TABLE meetings ADD COLUMN ${column} TEXT`);
   }
   if (!meetingCols.some((c) => c.name === 'transcription_complete')) {
@@ -192,6 +196,21 @@ export function openDb(path) {
       ).run(guildId, channelId, channelName, startedAt, link?.campaign_id ?? null);
       return r.lastInsertRowid;
     },
+    // A recording uploaded from the dashboard: no voice channel, no campaign
+    // link, and straight into 'processing' (there is nothing to capture).
+    createImportedMeeting({ guildId, title, startedAt }) {
+      const r = sql.prepare(
+        `INSERT INTO meetings (guild_id, channel_id, channel_name, started_at, status, source)
+         VALUES (?, 'import', ?, ?, 'processing', 'import')`
+      ).run(guildId, title, startedAt);
+      return Number(r.lastInsertRowid);
+    },
+    setImportError(id, message) {
+      sql.prepare(`UPDATE meetings SET import_error = ? WHERE id = ?`).run(message ?? null, id);
+    },
+    setMeetingEndedAt(id, endedAt) {
+      sql.prepare(`UPDATE meetings SET ended_at = ? WHERE id = ?`).run(endedAt, id);
+    },
     getMeeting(id) { return sql.prepare(`SELECT * FROM meetings WHERE id = ?`).get(id); },
     // Finished meetings (completed, failed or empty) outside campaigns that
     // ended before the cutoff. Never recording/processing ones.
@@ -229,6 +248,8 @@ export function openDb(path) {
         sql.prepare(`DELETE FROM attendees WHERE meeting_id = ?`).run(id);
         sql.prepare(`DELETE FROM summaries WHERE meeting_id = ?`).run(id);
         sql.prepare(`DELETE FROM todos WHERE meeting_id = ?`).run(id);
+        // An import's speakers exist only in that recording; drop their renames.
+        sql.prepare(`DELETE FROM speaker_names WHERE user_id LIKE ?`).run(`import-${Number(id)}-%`);
         sql.prepare(`DELETE FROM meetings WHERE id = ?`).run(id);
         sql.exec('COMMIT');
       } catch (e) {
@@ -338,9 +359,11 @@ export function openDb(path) {
         WITH recent AS (
           SELECT a.user_id, a.display_name,
             ROW_NUMBER() OVER (PARTITION BY a.user_id ORDER BY m.id DESC) AS position
-          FROM attendees a JOIN meetings m ON m.id = a.meeting_id WHERE m.guild_id = ?
+          FROM attendees a JOIN meetings m ON m.id = a.meeting_id
+          WHERE m.guild_id = ? AND ${NOT_IMPORT_SPEAKER('a.user_id')}
         ), known AS (
-          SELECT user_id FROM recent UNION SELECT user_id FROM speaker_names WHERE guild_id = ?
+          SELECT user_id FROM recent
+          UNION SELECT user_id FROM speaker_names WHERE guild_id = ? AND ${NOT_IMPORT_SPEAKER('user_id')}
         )
         SELECT k.user_id, r.display_name, n.display_name AS override
         FROM known k

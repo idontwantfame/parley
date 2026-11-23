@@ -100,6 +100,7 @@ A fully self-hosted alternative to Otter/Fathom/Fireflies, built for Discord. Au
 - [Commands](#-commands)
 - [Configuration](#-configuration)
 - [Supported summarizers](#-supported-summarizers)
+- [Importing recordings](#-importing-recordings)
 - [Privacy & consent](#-privacy--consent)
 - [Development](#-development)
 - [Contributing](#-contributing)
@@ -382,6 +383,27 @@ Speech-to-text is pluggable per server. The default needs no API key; the cloud 
 Every backend returns the same `{ text, words }` shape with word-level timestamps, so per-speaker attribution and talk-time stats work the same way regardless of provider. Switch in **Settings → Transcription** or with `/setup stt_provider:…`.
 
 > Want to try it before wiring up a meeting? `node scripts/try-stt.mjs --provider openai` transcribes a recorded `.pcm` track (or any `--file`) and prints the text + timing.
+
+## 📥 Importing recordings
+
+Transcribe and summarize a meeting recorded **outside Discord** — an in-person meeting on one microphone, a phone recording, a video call file. Admins open **Meetings → Import recording**, pick an audio or video file (MP3, M4A, WAV, OGG, MP4…), and Parley converts it, transcribes it on your sidecar, and summarizes it like any other meeting: notes, action items, search, the seekable transcript and player, campaigns. Notes can optionally be posted to the server's notes channel.
+
+**Speaker detection is optional.** Without it, an import works as-is and every line is attributed to one speaker you can rename. With it, [WhisperX](https://github.com/m-bain/whisperX) aligns the words and labels each voice (Speaker 1, Speaker 2…); name them on the meeting page and regenerate the notes to use the names. Giving the number of speakers on the import form helps it a lot.
+
+One-time setup for speaker detection (about two minutes):
+
+1. Create a free [Hugging Face](https://huggingface.co) account and accept the terms on [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) — the model WhisperX uses. That single page is enough.
+2. Create a **read** token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
+3. Run the **full** sidecar image with the token, keeping `/models` on a volume:
+   ```bash
+   docker run -d --gpus all -p 8000:8000 -e HF_TOKEN=hf_... -v whisper-models:/models \
+     ghcr.io/idontwantfame/parley-sidecar:latest-full
+   ```
+   or build it yourself: `docker build -f stt_sidecar/Dockerfile --build-arg WITH_DIARIZATION=1 -t parley-sidecar:full .` (amd64; several GB, because it includes PyTorch). The regular image stays small and simply reports speaker detection as off.
+
+**Fully local.** Hugging Face is only contacted to download the models once; they're cached in the `/models` volume (alignment models download per language on first use and need no token). After the first import you can set `HF_HUB_OFFLINE=1` on the sidecar: from then on it makes no network calls and the token isn't needed. Audio never leaves the machine running the sidecar — pair it with the Ollama summarizer and nothing leaves your network.
+
+Limits: `IMPORT_MAX_BYTES` (default 2 GiB) caps the upload and `IMPORT_STT_TIMEOUT_MS` (default 3 hours) bounds transcription. ffmpeg must be installed where the bot runs (the Docker image has it). Behind a reverse proxy, raise its request body size and timeout to match. Imported audio follows `AUDIO_RETENTION_DAYS` like other kept recordings.
 
 ## 🔒 Privacy & consent
 

@@ -52,6 +52,7 @@ function RetryBanner({ meeting, retry, outcome, onStarted }) {
         <div className="min-w-0 flex-1">
           <p className="text-[15px] font-semibold text-ink">{copy.title}</p>
           <p className="text-[13.5px] text-muted leading-relaxed mt-1">{copy.body}</p>
+          {meeting.import_error && <p className="text-[13px] text-error mt-2">{meeting.import_error}</p>}
           {!retry?.eligible && retry?.reason && <p className="text-[13px] text-error mt-2">{retry.reason}</p>}
           {retry?.eligible && !isAdmin && <p className="text-[13px] text-muted mt-2">Ask an admin to retry this meeting.</p>}
           {outcome && <p className="text-[13px] text-error mt-2" role="alert">{outcome}</p>}
@@ -409,6 +410,57 @@ function MeetingNav({ neighbors }) {
   );
 }
 
+/* ── speakers of an imported recording ──────────────────────────────── */
+// Imported recordings label voices "Speaker 1", "Speaker 2"…; naming them here
+// applies to this recording only. Regenerating the summary puts the names
+// into the notes too.
+function SpeakerNamesPanel({ meeting, attendees, canRegenerate, onRegenerate, onReload }) {
+  const [drafts, setDrafts] = useState(() => Object.fromEntries(attendees.map((a) => [a.user_id, a.display_name])));
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [err, setErr] = useState(null);
+
+  async function save(event) {
+    event.preventDefault();
+    setBusy(true); setErr(null);
+    try {
+      const changed = attendees.filter((a) => (drafts[a.user_id] ?? '').trim() !== a.display_name);
+      for (const a of changed) await api.setSpeakerName(meeting.guild_id, a.user_id, (drafts[a.user_id] ?? '').trim());
+      if (changed.length) { setSaved(true); onReload?.(); }
+    } catch (e) {
+      setErr(e?.message || 'Could not save the names.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="mt-8 card p-5" aria-label="Speakers">
+      <h2 className="flex items-center gap-2 text-sm font-bold text-ink mb-1"><Icon.Users width={16} height={16} />Speakers</h2>
+      <p className="text-xs text-muted mb-4">Detected automatically. Name them to make the transcript readable; clear a name to go back to the label.</p>
+      <form onSubmit={save} className="space-y-2.5">
+        {attendees.map((a, i) => (
+          <label key={a.user_id} className="flex items-center gap-3">
+            <Avatar name={a.display_name} size={24} />
+            <span className="text-xs text-muted w-20 shrink-0">Voice {i + 1}</span>
+            <input className="input flex-1 !py-1.5" value={drafts[a.user_id] ?? ''} disabled={busy}
+              onChange={(e) => setDrafts((d) => ({ ...d, [a.user_id]: e.target.value }))} aria-label={`Name for voice ${i + 1}`} />
+          </label>
+        ))}
+        <div className="flex items-center gap-2 pt-1">
+          <button type="submit" className="btn btn-primary !py-1.5" disabled={busy}>{busy ? 'Saving…' : 'Save names'}</button>
+          {saved && canRegenerate && (
+            <button type="button" className="btn btn-ghost !py-1.5" onClick={onRegenerate}>
+              <Icon.Refresh width={14} height={14} />Regenerate notes with these names
+            </button>
+          )}
+        </div>
+        {err && <p className="text-xs text-error" role="alert">{err}</p>}
+      </form>
+    </section>
+  );
+}
+
 /* ── note document ────────────────────────────────────────────────────── */
 const PROGRESS_POLL_MS = 2500;
 // Polls with no progress and an unchanged status before giving up (~20 s): a
@@ -477,6 +529,7 @@ function Note({ data, onReload }) {
   const { progress, watching, outcome, watchRetry } = useMeetingProgress(meeting, data.progress, onReload);
   const lines = useMemo(() => [...(utterances ?? [])].sort((a, b) => a.start_ms - b.start_ms), [utterances]);
   const playable = data.hasAudio && data.audioOriginMs != null;
+  const isAdmin = useIsAdmin();
   const sync = useRecordingSync(lines, playable ? data.audioOriginMs : null);
   const running = !!progress;
   const isFailed = !running && !watching && ['transcription_failed', 'summary_failed', 'processing'].includes(meeting.status);
@@ -528,7 +581,11 @@ function Note({ data, onReload }) {
         <div className="flex items-start justify-between gap-3">
           <div>
             <div className="flex items-center gap-2 mb-2">
-              <span className="chip"><Icon.Hash width={12} height={12} />{meeting.channel_name}</span>
+              <span className="chip">
+                {meeting.source === 'import' ? <Icon.Upload width={12} height={12} /> : <Icon.Hash width={12} height={12} />}
+                {meeting.channel_name}
+              </span>
+              {meeting.source === 'import' && <span className="chip">Imported</span>}
             </div>
             <h1 className="font-display text-[30px] font-extrabold text-ink leading-tight tracking-tight">{fmtDateLong(meeting.started_at)}</h1>
             <p className="text-sm text-muted mt-1.5 flex items-center gap-3 flex-wrap">
@@ -547,6 +604,11 @@ function Note({ data, onReload }) {
         )}
       </header>
 
+      {meeting.source === 'import' && isAdmin && attendees?.length > 0 && (
+        <SpeakerNamesPanel key={attendees.map((a) => `${a.user_id}=${a.display_name}`).join('|')}
+          meeting={meeting} attendees={attendees} canRegenerate={!!data.regenerate?.eligible && !regen.busy}
+          onRegenerate={regenerateSummary} onReload={onReload} />
+      )}
       {isFailed && <RetryBanner meeting={meeting} retry={retry} outcome={outcome} onStarted={watchRetry} />}
       {running && !regen.busy && <p className="card p-4 mt-8 text-sm text-muted" role="status"><ProgressText progress={progress} /></p>}
       {watching && !running && <p className="card p-4 mt-8 text-sm text-muted" role="status">Retry queued…</p>}

@@ -1,0 +1,12 @@
+# Optional speaker detection for imported recordings: WhisperX alignment +
+# pyannote diarization (torch, several GB). Installed only in the *-full
+# sidecar image (Dockerfile build arg WITH_DIARIZATION=1), or locally with
+#   pip install -r requirements-diarize.txt
+# It also needs HF_TOKEN; see whisperx_backend.py.
+-r requirements.txt
+# 3.8.x API used by whisperx_backend.py: whisperx.diarize.DiarizationPipeline(
+# model_name, token, device) on pyannote.audio 4 (speaker-diarization-community-1),
+# assign_word_speakers(df, result), load_align_model(language_code, device),
+# align(...). whisperx pins torch~=2.8 and huggingface-hub<1.0 itself; both fit
+# faster-whisper's requirements.
+whisperx>=3.8.6,<3.9

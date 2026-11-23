@@ -25,6 +25,12 @@ jobs:
             dockerfile: Dockerfile
           - package: parley-sidecar
             dockerfile: stt_sidecar/Dockerfile
+          # Optional speaker detection (WhisperX + torch, several GB) gets its
+          # own tags (:latest-full, :sha-<sha>-full) so the default stays small.
+          - package: parley-sidecar
+            dockerfile: stt_sidecar/Dockerfile
+            tag_suffix: -full
+            build_arg: WITH_DIARIZATION=1
     steps:
       - uses: actions/checkout@v6
         with:
@@ -33,16 +39,24 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Free disk space for the large image
+        # The torch/CUDA wheels need more room than a fresh runner leaves free.
+        if: matrix.tag_suffix == '-full'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - name: Build and publish
         env:
           PACKAGE: ${{ matrix.package }}
           DOCKERFILE: ${{ matrix.dockerfile }}
+          TAG_SUFFIX: ${{ matrix.tag_suffix }}
+          BUILD_ARG: ${{ matrix.build_arg }}
         run: |
           set -euo pipefail
           image="ghcr.io/idontwantfame/$PACKAGE"
-          docker build --file "$DOCKERFILE" \
+          build_args=()
+          if [ -n "$BUILD_ARG" ]; then build_args+=(--build-arg "$BUILD_ARG"); fi
+          docker build --file "$DOCKERFILE" "${build_args[@]}" \
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
-            --tag "$image:sha-$GITHUB_SHA" --tag "$image:latest" .
-          docker push "$image:sha-$GITHUB_SHA"
-          docker push "$image:latest"
+            --tag "$image:sha-$GITHUB_SHA$TAG_SUFFIX" --tag "$image:latest$TAG_SUFFIX" .
+          docker push "$image:sha-$GITHUB_SHA$TAG_SUFFIX"
+          docker push "$image:latest$TAG_SUFFIX"

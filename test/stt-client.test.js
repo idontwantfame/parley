@@ -83,7 +83,7 @@ test('transcribeFile reports the sidecar error detail and drains the response bo
   });
   await assert.rejects(
     transcribeFile('/tmp/a.wav', {}, { baseUrl: 'http://x', fetchImpl, readFile: fakeRead, retries: 1, backoffMs: 0 }),
-    /STT sidecar HTTP 400: \{"detail":"Unsupported model: huge"\}/,
+    /STT sidecar HTTP 400: Unsupported model: huge$/,
   );
   assert.equal(drained, 1);
 });

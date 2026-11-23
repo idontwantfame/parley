@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useLocation } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import { api } from '../api.js';
 import { useGuild } from '../GuildContext.jsx';
+import { useIsAdmin } from '../AuthContext.jsx';
 import { Page, PageHead } from '../components/Page.jsx';
 import { MeetingCard, MeetingRow } from '../components/MeetingCard.jsx';
 import { Icon, Empty } from '../components/ui.jsx';
@@ -39,6 +40,7 @@ function GridSkeleton({ view }) {
 
 export default function Meetings() {
   const { guildId } = useGuild();
+  const isAdmin = useIsAdmin();
   const { key: navigationKey } = useLocation();
   const [meetings, setMeetings] = useState(null);
   const [error, setError] = useState(null);
@@ -111,14 +113,21 @@ export default function Meetings() {
         title="Meetings"
         subtitle={meetings ? `${filtered.length}${cursor ? '+' : ''} meeting${filtered.length === 1 && !cursor ? '' : 's'}` : 'Loading…'}
         actions={
-          <Toggle
-            value={view}
-            onChange={setView}
-            options={[
-              { value: 'grid', label: 'Grid', icon: <Icon.Meetings width={14} height={14} /> },
-              { value: 'list', label: 'List', icon: <Icon.Doc width={14} height={14} /> },
-            ]}
-          />
+          <div className="flex items-center gap-2">
+            {isAdmin && (
+              <Link to="/import" className="btn btn-ghost !py-1.5 no-underline">
+                <Icon.Upload width={15} height={15} />Import recording
+              </Link>
+            )}
+            <Toggle
+              value={view}
+              onChange={setView}
+              options={[
+                { value: 'grid', label: 'Grid', icon: <Icon.Meetings width={14} height={14} /> },
+                { value: 'list', label: 'List', icon: <Icon.Doc width={14} height={14} /> },
+              ]}
+            />
+          </div>
         }
       />
 

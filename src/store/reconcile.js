@@ -13,12 +13,48 @@
 // Pure-ish: fs access is injectable for tests.
 import { readdirSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { IMPORT_UPLOADS_DIR } from '../config/env.js';
+
+export const IMPORT_INTERRUPTED = 'Parley restarted while this recording was being imported.';
+
+// An import cut off by a restart: say so, and drop its partial audio unless a
+// transcript was already saved (then a retry can still re-summarize it).
+async function reconcileImport(db, meeting, audioRoot, { remove, log }) {
+  db.setImportError(meeting.id, IMPORT_INTERRUPTED);
+  if (db.listUtterances(meeting.id).length > 0) return;
+  db.setAudioRetained(meeting.id, false);
+  try {
+    await remove(join(audioRoot, String(meeting.id)), { recursive: true, force: true });
+  } catch (error) {
+    log.warn?.(`[reconcile] could not remove audio for import ${meeting.id}: ${error.message}`);
+  }
+}
+
+// Uploads still waiting at boot belong to requests that never finished.
+async function sweepUploads(importsRoot, { readdir, remove, log }) {
+  let names = [];
+  try { names = readdir(importsRoot); } catch { return 0; } // no uploads folder yet
+  let swept = 0;
+  for (const name of names) {
+    try {
+      await remove(join(importsRoot, name), { recursive: true, force: true });
+      swept += 1;
+    } catch (error) {
+      log.warn?.(`[reconcile] could not remove stale upload ${name}: ${error.message}`);
+    }
+  }
+  if (swept > 0) log.log?.(`[reconcile] removed ${swept} interrupted upload(s).`);
+  return swept;
+}
 
 // Statuses whose meeting still needs its audio (a retry may retranscribe from PCM).
 const KEEP_AUDIO_STATUSES = new Set(['recording', 'processing', 'transcription_failed', 'summary_failed']);
 
-export async function reconcileOnBoot(db, audioRoot, { readdir = readdirSync, remove = rm, log = console, retentionDays = 30 } = {}) {
+export async function reconcileOnBoot(db, audioRoot, {
+  readdir = readdirSync, remove = rm, log = console, retentionDays = 30,
+  importsRoot = join(dirname(audioRoot), IMPORT_UPLOADS_DIR),
+} = {}) {
   let orphanMeetings = 0;
   db.interruptDeliveries();
   // Journal updates run in-process, so none can still be running at boot.
@@ -27,12 +63,14 @@ export async function reconcileOnBoot(db, audioRoot, { readdir = readdirSync, re
   // 1) Orphaned meetings from a crash mid-pipeline.
   for (const m of db.findOrphanedMeetings()) {
     db.setMeetingStatus(m.id, 'transcription_failed');
+    if (m.source === 'import') await reconcileImport(db, m, audioRoot, { remove, log });
     orphanMeetings += 1;
     log.warn?.(`[reconcile] meeting ${m.id} was mid-pipeline at last shutdown → transcription_failed (retry from the dashboard).`);
   }
 
   const sweptDirs = await sweepAudio(db, audioRoot, { readdir, remove, log, retentionDays });
-  return { orphanMeetings, sweptDirs };
+  const sweptUploads = await sweepUploads(importsRoot, { readdir, remove, log });
+  return { orphanMeetings, sweptDirs, sweptUploads };
 }
 
 export async function sweepAudio(db, audioRoot, { readdir = readdirSync, remove = rm, log = console, retentionDays = 30 } = {}) {
