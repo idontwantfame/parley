@@ -6,7 +6,7 @@ import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { ensureMixedWav, recordingOriginMs } from '../voice/mix.js';
 import { MP3_NAME } from '../voice/recording-archive.js';
-import { getGuildConfig, setGuildConfig } from '../store/config.js';
+import { anyGuildUsesSidecar, getGuildConfig, setGuildConfig } from '../store/config.js';
 import { getVocabulary, setVocabulary } from '../store/vocabulary.js';
 import { validateSetup, availableProviders } from '../commands/setup-logic.js';
 import { config as env } from '../config/env.js';
@@ -20,6 +20,8 @@ import { listModels, clearModelCache, DEFAULT_MODELS, CATALOG_PROVIDERS } from '
 import { secretStatus, setProviderKey, isSecretProvider, connectionStatus, setConnection, redactUrl } from '../store/secrets.js';
 import { COMMAND_CATALOG } from '../commands/definitions.js';
 import { retryMeeting, retryPlan, retryEligible, regeneratePlan, regenerateSummary } from '../pipeline/retry.js';
+import { finishReviewedMeeting } from '../pipeline/orchestrator.js';
+import { sharedSpeakerPrefix } from '../pipeline/transcribe.js';
 import { availableSttProviders } from '../adapters/stt/index.js';
 import { isAdminRequest, requireAdmin } from './auth.js';
 import { readMeetingExport, meetingExportBasename, renderMeetingMarkdown, autoExportMeeting } from '../delivery/meeting-export.js';
@@ -44,16 +46,6 @@ function guildName(client, id, dbNames = {}) {
   return client?.guilds?.cache?.get(id)?.name || dbNames[id] || id;
 }
 
-// Does any configured guild still use the local sidecar for transcription?
-// Default provider is 'sidecar', so an unconfigured guild counts as sidecar.
-function anyGuildUsesSidecar(db) {
-  try {
-    const rows = db.sql.prepare(`SELECT stt_provider FROM guild_config`).all();
-    if (rows.length === 0) return true;
-    return rows.some((row) => (row.stt_provider ?? 'sidecar') === 'sidecar');
-  } catch { return true; }
-}
-
 // Guard middleware: admin-only when the body touches any of `fields`.
 function requireAdminForFields(fields) {
   return (req, res, next) => (fields.some((field) => req.body?.[field] !== undefined)
@@ -67,6 +59,11 @@ export const PENDING_RETRY_MERGE =
 
 // A Discord user id, or a speaker of an imported recording (import-<meeting>-<n>).
 const SPEAKER_ID = /^(?:[1-9]\d{16,19}|import-[1-9]\d{0,15}-\d{1,3})$/;
+
+function canPlayRecording(meeting, req) {
+  return (meeting?.status === 'speaker_review' && isAdminRequest(req))
+    || (meeting?.status === 'done' && !!meeting.audio_retained);
+}
 
 export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAudio = ensureMixedWav, imports = {}, oidc = null, users = null }) {
   const r = Router();
@@ -197,7 +194,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
     // An import has no Discord channel of its own; only a notes channel can take it.
     const channelId = cfg.notesChannelId || (meeting.source === 'import' ? null : meeting.channel_id);
     const channel = liveClient()?.channels?.cache?.get(channelId);
-    const hasAudio = meeting.status === 'done' && !!meeting.audio_retained && audioFiles !== null;
+    const hasAudio = canPlayRecording(meeting, req) && audioFiles !== null;
     res.json({
       meeting,
       summary: db.getSummary(id),
@@ -227,6 +224,38 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
     res.json({ progress: meetingProgress(id), status: meeting.status });
   });
 
+  r.post('/meetings/:id/speaker-review', requireAdmin, (req, res) => {
+    const id = Number(req.params.id);
+    const meeting = db.getMeeting(id);
+    if (!meeting) return res.status(404).json({ error: 'Meeting not found.' });
+    if (meeting.status !== 'speaker_review' || busyReason(meeting)) {
+      return res.status(409).json({ error: 'This meeting is no longer waiting for speaker names.' });
+    }
+    const input = req.body?.names;
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      return res.status(400).json({ error: 'Send the speaker names as a JSON object.' });
+    }
+    const prefix = sharedSpeakerPrefix(id);
+    const speakers = new Set(db.listAttendees(id).map((a) => a.user_id)
+      .filter((userId) => userId.startsWith(prefix) && !userId.endsWith('-0')));
+    const names = Object.entries(input);
+    for (const [userId, name] of names) {
+      if (!speakers.has(userId) || typeof name !== 'string' || !name.trim() || name.length > 80 || /[\x00-\x1f\x7f]/.test(name)) {
+        return res.status(400).json({ error: 'Choose a detected speaker and enter a display name of up to 80 characters.' });
+      }
+    }
+    const cfg = getGuildConfig(db, meeting.guild_id);
+    if (!db.approveSpeakerReview(id, names.map(([userId, name]) => [userId, name.trim()]))) {
+      return res.status(409).json({ error: 'This meeting is no longer waiting for speaker names.' });
+    }
+    const c = liveClient();
+    const deliver = c ? (notes, talktime) => postNotes({ client: c, meeting, cfg, notes, talktime }) : null;
+    void finishReviewedMeeting(db, id, { cfg, audioDir: audioDir(id), deliver }).catch((err) => {
+      console.warn(`[speaker review] meeting ${id}: ${err.userMessage || err.message}`);
+    });
+    res.status(202).json({ state: 'processing' });
+  });
+
   r.post('/meetings/:id/repost', requireAdmin, async (req, res) => {
     const id = Number(req.params.id);
     const meeting = db.getMeeting(id);
@@ -246,7 +275,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
   r.get('/meetings/:id/audio', async (req, res) => {
     const id = Number(req.params.id);
     const meeting = db.getMeeting(id);
-    if (meeting?.status !== 'done' || !meeting.audio_retained) {
+    if (!canPlayRecording(meeting, req)) {
       return res.status(404).json({ error: 'No recording is available for this meeting.' });
     }
     const mp3 = join(audioDir(id), MP3_NAME);
@@ -548,9 +577,9 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
     // when a guild switches to the sidecar, and stop it when no guild needs it
     // anymore (switched everything to a cloud API). Best-effort, non-blocking.
     let sidecarStatus = sidecar ? sidecar.status() : null;
-    if (sidecar && sidecar.managed() && result.patch.sttProvider !== undefined) {
+    if (sidecar && sidecar.managed() && (result.patch.sttProvider !== undefined || result.patch.sharedMicUserIds !== undefined)) {
       try {
-        if (result.patch.sttProvider === 'sidecar') {
+        if (config.sttProvider === 'sidecar' || config.sharedMicUserIds.length > 0) {
           await sidecar.start();
         } else if (!anyGuildUsesSidecar(db)) {
           await sidecar.stop();
@@ -701,6 +730,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
     const id = Number(req.params.id);
     const meeting = db.getMeeting(id);
     if (!meeting) return res.status(404).json({ error: 'meeting not found' });
+    if (meeting.status === 'speaker_review') return res.status(409).json({ error: 'Review the speaker names before asking about this meeting.' });
     const question = questionOf(req.body);
     if (!question) return res.status(400).json({ error: 'question required' });
     const transcript = db.listUtterances(id).map((u) => `${u.display_name}: ${u.text}`).join('\n');

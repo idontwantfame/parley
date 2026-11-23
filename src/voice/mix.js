@@ -66,11 +66,12 @@ export async function recordingOriginMs(audioDir) {
  * Mix tracks [{ path, startMs }] into a WAV at outPath.
  * Returns outPath, or null when there is nothing to mix.
  */
-export async function mixTracksToWav(tracks, outPath) {
+export async function mixTracksToWav(tracks, outPath, { onOrigin } = {}) {
   const sized = await sizedTracks(tracks);
   if (sized.length === 0) return null;
 
   const t0 = earliestStart(sized);
+  onOrigin?.(t0);
   for (const t of sized) t.offsetBytes = (t.startMs - t0) * SAMPLES_PER_MS * BYTES_PER_SAMPLE;
   const totalBytes = Math.max(...sized.map((t) => t.offsetBytes + t.bytes));
 

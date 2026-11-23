@@ -131,6 +131,13 @@ export function validateSetup(input, env, current = null) {
     }
     patch.autoJoinChannelIds = ids === null ? null : [...new Set(ids)];
   }
+  if (input.sharedMicUserIds !== undefined) {
+    const ids = input.sharedMicUserIds;
+    if (!Array.isArray(ids) || ids.length > 50 || ids.some((id) => typeof id !== 'string' || !/^[1-9]\d{16,19}$/.test(id))) {
+      return { ok: false, error: 'Select up to 50 Discord accounts for shared microphones.' };
+    }
+    patch.sharedMicUserIds = [...new Set(ids)];
+  }
   if (input.language !== undefined) {
     if (!LANGUAGE_CODES.has(input.language)) {
       return { ok: false, error: `Invalid language. Use one of: ${[...LANGUAGE_CODES].join(', ')}.` };

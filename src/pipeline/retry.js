@@ -201,16 +201,16 @@ export async function retryMeeting(db, meetingId, { dataDir, deliver = null } = 
     })
     .sort((a, b) => a.startMs - b.startMs);
   try {
-    const { notes, empty, exported, exports, exportError, audioRetained } =
+    const { notes, empty, exported, exports, exportError, audioRetained, reviewPending } =
       await processMeeting(db, meetingId, { tracks, cfg, deliver });
     // Success (or a confirmed-empty meeting): the PCM has served its purpose, so
     // drop the audio dir — like the bot's finalize, only once the transcript is
     // complete; a still-partial one keeps it for another retry.
-    if (canDiscardAudio({ audioRetained }, db.getMeeting(meetingId))) {
+    if (canDiscardAudio({ audioRetained, reviewPending }, db.getMeeting(meetingId))) {
       await rm(audioDir, { recursive: true, force: true }).catch(() => {});
     }
     return { ok: true, action: 'retranscribe', status: db.getMeeting(meetingId)?.status,
-      empty: !notes || !!empty, exported, exports, exportError };
+      empty: !reviewPending && (!notes || !!empty), exported, exports, exportError };
   } catch (err) {
     // Keep the PCM on failure so a later retry can try again.
     const status = db.getMeeting(meetingId).status;

@@ -115,6 +115,7 @@ export function StatusPill({ status }) {
     done: { label: 'Done', color: 'var(--accent)', bg: 'var(--accent-soft)' },
     recording: { label: 'Recording', color: 'var(--error)', bg: 'var(--error-soft)' },
     processing: { label: 'Processing', color: 'var(--warn)', bg: 'var(--warn-soft)' },
+    speaker_review: { label: 'Name speakers', color: 'var(--warn)', bg: 'var(--warn-soft)' },
     transcription_failed: { label: 'Transcription failed', color: 'var(--error)', bg: 'var(--error-soft)' },
     summary_failed: { label: 'Summary failed', color: 'var(--error)', bg: 'var(--error-soft)' },
     empty: { label: 'No speech captured', color: 'var(--muted)', bg: 'var(--surface-3)' },

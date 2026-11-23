@@ -149,12 +149,13 @@ function Transcript({ lines, baseMs, activeId = null, onSeek = null }) {
  * and the transcript. The playing line lives here, not in the note, so a new
  * line re-renders only this part of the page.
  */
-export default function RecordingTranscript({ meetingId, lines, originMs = null }) {
+export default function RecordingTranscript({ meetingId, lines, originMs = null, beforeTranscript }) {
   const playable = originMs != null;
   const { audioRef, activeId, onTime, seek } = useRecordingSync(lines, originMs);
   return (
     <>
       {playable && <RecordingPlayer meetingId={meetingId} audioRef={audioRef} onTime={onTime} />}
+      {beforeTranscript?.(playable ? seek : null)}
       <Transcript lines={lines} baseMs={playable ? originMs : (lines[0]?.start_ms ?? 0)}
         activeId={playable ? activeId : null} onSeek={playable ? seek : null} />
     </>

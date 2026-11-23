@@ -403,6 +403,61 @@ function findTodo(todos, item) {
     ?? todos.find((t) => t.task === item.task) ?? null;
 }
 
+function SharedSpeakerReview({ meetingId, lines, seek, canApprove, onApproved }) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const speakers = new Map();
+  for (const line of lines) {
+    if (line.user_id.startsWith(`shared-${meetingId}-`) && !speakers.has(line.user_id)) {
+      speakers.set(line.user_id, line);
+    }
+  }
+
+  async function approve(event) {
+    event.preventDefault();
+    const names = Object.fromEntries([...new FormData(event.currentTarget)]
+      .map(([id, value]) => [id, value.trim()]).filter(([, value]) => value));
+    setSaving(true);
+    setError('');
+    try {
+      await api.approveSpeakers(meetingId, names);
+      await onApproved?.();
+    } catch (e) {
+      setError(e.message);
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="card mt-6 p-4" aria-labelledby="speaker-review-title">
+      <h2 id="speaker-review-title" className="text-base font-semibold text-ink">Who spoke on the shared microphones?</h2>
+      <p className="mt-1 text-sm text-muted">{canApprove
+        ? 'Listen to a sample and name each voice you recognize. Blank names keep the current speaker labels.'
+        : 'An admin needs to review the speakers before Parley generates the summary.'}</p>
+      {canApprove && (
+        <form onSubmit={approve} className="mt-4 space-y-3">
+          {[...speakers].map(([id, line]) => (
+            <div key={id} className="space-y-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <label htmlFor={id} className="text-sm font-medium">{line.display_name}</label>
+                {seek && <button type="button" className="btn btn-ghost text-xs" onClick={() => seek(line)}>Play sample</button>}
+              </div>
+              <p className="text-sm text-muted">{line.text}</p>
+              {id.endsWith('-0')
+                ? <p className="text-xs text-muted">This speech may contain several voices.</p>
+                : <input id={id} name={id} className="input max-w-sm" placeholder="Speaker name" maxLength={80} disabled={saving} />}
+            </div>
+          ))}
+          {error && <p role="alert" className="text-sm text-error">{error}</p>}
+          <button type="submit" className="btn btn-primary" disabled={saving}>
+            {saving ? 'Starting summary…' : 'Save names and generate summary'}
+          </button>
+        </form>
+      )}
+    </section>
+  );
+}
+
 function Note({ data, onReload }) {
   const { meeting, summary, attendees, utterances, retry } = data;
   const notes = summary?.notes;
@@ -412,6 +467,7 @@ function Note({ data, onReload }) {
   const lines = useMemo(() => [...(utterances ?? [])].sort((a, b) => a.start_ms - b.start_ms), [utterances]);
   const playable = data.hasAudio && data.audioOriginMs != null;
   const isAdmin = useIsAdmin();
+  const needsSpeakerReview = meeting.status === 'speaker_review';
   const running = !!progress;
   const isFailed = !running && !watching && ['transcription_failed', 'summary_failed', 'processing'].includes(meeting.status);
   const regen = useRegeneration(meeting, data.regenerate, onReload);
@@ -480,7 +536,7 @@ function Note({ data, onReload }) {
         </div>
       )}
 
-      {!notes && !isFailed && <p className="text-sm text-muted mt-8">No summary available — status: {meeting.status}.</p>}
+      {!notes && !isFailed && !needsSpeakerReview && <p className="text-sm text-muted mt-8">No summary available — status: {meeting.status}.</p>}
 
       {notes && (
         <>
@@ -566,7 +622,9 @@ function Note({ data, onReload }) {
         </section>
       )}
 
-      <RecordingTranscript meetingId={meeting.id} lines={lines} originMs={playable ? data.audioOriginMs : null} />
+      <RecordingTranscript meetingId={meeting.id} lines={lines} originMs={playable ? data.audioOriginMs : null}
+        beforeTranscript={needsSpeakerReview ? (seek) => <SharedSpeakerReview meetingId={meeting.id} lines={lines}
+          seek={seek} canApprove={isAdmin} onApproved={onReload} /> : undefined} />
       {meeting.guild_id && <AskBox guildId={meeting.guild_id} meetingId={meeting.id} />}
       <MeetingNav neighbors={data.neighbors} />
     </article>

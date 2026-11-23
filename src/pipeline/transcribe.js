@@ -1,5 +1,9 @@
 import { getSTT, resolveSttModel } from '../adapters/stt/index.js';
-import { unlink } from 'node:fs/promises';
+import { config } from '../config/env.js';
+import { mkdtemp, rm, unlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { mixTracksToWav } from '../voice/mix.js';
 
 // Speech-to-text engines only use a short hint: faster-whisper keeps ~223
 // hotword tokens and OpenAI the last 224 prompt tokens. ~800 characters is
@@ -70,7 +74,7 @@ export function transcriptLines({ text = '', words = [], segments } = {}) {
   return [{ start: 0, end: lastEnd, text: clean }];
 }
 
-// ── Diarized results (imported recordings) ─────────────────────────────────
+// ── Diarized results ────────────────────────────────────────────────────────
 // One file holds every speaker; the sidecar labels each word and segment with
 // a speaker ("SPEAKER_00", or null when it couldn't tell).
 
@@ -138,6 +142,58 @@ export function diarizedLines({ text = '', words = [], segments = [] } = {}) {
   return transcriptLines({ text, words }).map((line) => ({ ...line, speaker: null }));
 }
 
+export const sharedSpeakerPrefix = (meetingId) => `shared-${meetingId}-`;
+
+function attributeSharedTrack(lines, track, meetingId) {
+  const speakers = new Map();
+  return lines.map((line) => {
+    if (line.speaker !== null && !speakers.has(line.speaker)) {
+      speakers.set(line.speaker, speakers.size + 1);
+    }
+    const number = speakers.get(line.speaker) ?? 0;
+    return {
+      ...line,
+      userId: `${sharedSpeakerPrefix(meetingId)}${track.userId}-${number}`,
+      displayName: `${track.displayName} · ${number ? `Speaker ${number}` : 'Unidentified speech'}`,
+    };
+  });
+}
+
+// Discord opens a PCM file per speaking turn. Keep all turns from a shared
+// account in one diarization job so the labels stay consistent across turns.
+function transcriptionJobs(tracks, sharedMicIds) {
+  const shared = new Map();
+  const jobs = [];
+  for (const track of tracks) {
+    if (!sharedMicIds.has(track.userId)) {
+      jobs.push({ track });
+    } else if (shared.has(track.userId)) {
+      shared.get(track.userId).push(track);
+    } else {
+      const turns = [track];
+      shared.set(track.userId, turns);
+      jobs.push({ track, turns });
+    }
+  }
+  return jobs;
+}
+
+async function transcribeSharedMic(turns, diarize, options) {
+  const first = turns[0];
+  if (turns.length === 1) {
+    return { startMs: first.startMs, result: await diarize(first.pcmPath, options) };
+  }
+  const dir = await mkdtemp(join(tmpdir(), 'parley-shared-mic-'));
+  try {
+    let startMs;
+    const wav = await mixTracksToWav(turns.map(({ pcmPath, startMs }) => ({ path: pcmPath, startMs })),
+      join(dir, 'track.wav'), { onOrigin: (origin) => { startMs = origin; } });
+    return { startMs, result: wav ? await diarize(wav, options) : {} };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 // Transcribes each track through a small worker pool instead of one at a
 // time. Cloud STT (openai) tolerates much higher concurrency than the local
 // sidecar, which is why the default differs by provider (S3 in the speed
@@ -159,30 +215,45 @@ export async function transcribeTracks(tracks, cfg = {}, deps = {}) {
   const model = resolveSttModel(cfg);
   const vocabulary = vocabularyHint(cfg.transcriptionVocabulary);
   const stt = deps.stt || ((wav) => transcribe(wav, { model, language: cfg.language, vocabulary }));
+  const sharedMicIds = new Set(deps.meetingId == null ? [] : cfg.sharedMicUserIds);
+  const jobs = transcriptionJobs(tracks, sharedMicIds);
+  const diarize = sharedMicIds.size ? (deps.diarize || getSTT({ sttProvider: 'sidecar' }, deps.env, {
+    timeoutMs: config.importSttTimeoutMs, retries: 0, ...deps.sttDeps,
+  })) : null;
   const cleanup = deps.cleanup || (async (p) => { try { await unlink(p); } catch { /* ignore */ } });
   const concurrency = Math.max(1, deps.concurrency ?? (cfg.sttProvider === 'openai' ? 4 : 2));
 
   // Results are written by index so track order is preserved regardless of
   // which worker finishes first.
-  const results = new Array(tracks.length);
+  const results = new Array(jobs.length);
   const failures = [];
 
   let nextTrack = 0;
   async function worker() {
-    while (nextTrack < tracks.length) {
+    while (nextTrack < jobs.length) {
       const i = nextTrack++;
-      const t = tracks[i];
-      const wavPath = convert ? t.pcmPath.replace(/\.pcm$/, '.wav') : null;
+      const { track: t, turns } = jobs[i];
+      const wavPath = convert && !turns ? t.pcmPath.replace(/\.pcm$/, '.wav') : null;
       let failed = false;
       try {
-        if (convert) await convert(t.pcmPath, wavPath);
-        const lines = transcriptLines(await stt(wavPath ?? t.pcmPath, cfg));
+        if (wavPath) await convert(t.pcmPath, wavPath);
+        let lines;
+        let startMs = t.startMs;
+        if (turns) {
+          const shared = await transcribeSharedMic(turns, diarize, {
+            model: resolveSttModel(cfg, 'sidecar'), language: cfg.language, vocabulary, diarize: true,
+          });
+          startMs = shared.startMs;
+          lines = attributeSharedTrack(diarizedLines(shared.result), t, deps.meetingId);
+        } else {
+          lines = transcriptLines(await stt(wavPath ?? t.pcmPath, cfg));
+        }
         if (!lines.length) continue; // silent track — not a failure, just nothing said
         results[i] = lines.map((line) => ({
-          userId: t.userId,
-          displayName: t.displayName,
-          startMs: t.startMs + Math.round(line.start * 1000),
-          endMs: t.startMs + Math.round(line.end * 1000),
+          userId: line.userId ?? t.userId,
+          displayName: line.displayName ?? t.displayName,
+          startMs: startMs + Math.round(line.start * 1000),
+          endMs: startMs + Math.round(line.end * 1000),
           text: line.text,
         }));
       } catch (err) {
@@ -190,12 +261,12 @@ export async function transcribeTracks(tracks, cfg = {}, deps = {}) {
         failures.push({ userId: t.userId, displayName: t.displayName, error: err.message || String(err) });
       } finally {
         if (wavPath) await cleanup(wavPath);
-        deps.onTrackDone?.({ failed });
+        deps.onTrackDone?.({ failed, count: turns?.length ?? 1 });
       }
     }
   }
 
-  const workerCount = Math.min(concurrency, tracks.length);
+  const workerCount = Math.min(concurrency, jobs.length);
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
   // Track order is kept; each track contributes its lines in time order.

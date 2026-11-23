@@ -15,6 +15,7 @@ export const DEFAULTS = {
   autoJoin: true,
   autoJoinMinPeople: DEFAULT_AUTO_JOIN_MIN_PEOPLE,
   autoJoinChannelIds: null,
+  sharedMicUserIds: [],
   keepAudio: false,
   language: 'auto',
   summaryLanguage: 'en',
@@ -26,7 +27,7 @@ export const DEFAULTS = {
   botNickname: null,
 };
 
-function parseAutoJoinChannels(value) {
+function parseIdList(value) {
   if (value == null) return null;
   try {
     const ids = JSON.parse(value);
@@ -49,7 +50,8 @@ function fromRow(row) {
     useThread: row.use_thread == null ? DEFAULTS.useThread : !!row.use_thread,
     autoJoin: row.auto_join == null ? DEFAULTS.autoJoin : !!row.auto_join,
     autoJoinMinPeople: row.auto_join_min_people ?? DEFAULTS.autoJoinMinPeople,
-    autoJoinChannelIds: parseAutoJoinChannels(row.auto_join_channel_ids),
+    autoJoinChannelIds: parseIdList(row.auto_join_channel_ids),
+    sharedMicUserIds: parseIdList(row.shared_mic_user_ids) ?? [],
     keepAudio: !!row.keep_audio,
     language: row.language ?? DEFAULTS.language,
     summaryLanguage: row.summary_language ?? DEFAULTS.summaryLanguage,
@@ -64,6 +66,14 @@ export function getGuildConfig(db, guildId) {
   return { guildId, ...(row ? fromRow(row) : DEFAULTS) };
 }
 
+export function anyGuildUsesSidecar(db) {
+  try {
+    const rows = db.sql.prepare('SELECT stt_provider, shared_mic_user_ids FROM guild_config').all();
+    return rows.length === 0 || rows.some((row) => (row.stt_provider ?? 'sidecar') === 'sidecar'
+      || !!parseIdList(row.shared_mic_user_ids)?.length);
+  } catch { return true; }
+}
+
 export function setGuildConfig(db, guildId, patch) {
   const current = getGuildConfig(db, guildId);
   // Drop undefined keys (node:sqlite cannot bind undefined) and pin guildId so a
@@ -72,8 +82,8 @@ export function setGuildConfig(db, guildId, patch) {
   const merged = { ...current, ...safePatch, guildId };
   db.sql.prepare(
     `INSERT OR REPLACE INTO guild_config
-       (guild_id, summarizer_provider, summarizer_model, summarizer_fallback_provider, summarizer_fallback_model, stt_provider, stt_model, whisper_model, notes_channel_id, use_thread, auto_join, auto_join_min_people, auto_join_channel_ids, language, summary_language, summary_prompt, overview_prompt, keep_audio, bot_nickname)
-     VALUES (@guildId, @summarizerProvider, @summarizerModel, @summarizerFallbackProvider, @summarizerFallbackModel, @sttProvider, @sttModel, @whisperModel, @notesChannelId, @useThread, @autoJoin, @autoJoinMinPeople, @autoJoinChannelIds, @language, @summaryLanguage, @summaryPrompt, @overviewPrompt, @keepAudio, @botNickname)`
+       (guild_id, summarizer_provider, summarizer_model, summarizer_fallback_provider, summarizer_fallback_model, stt_provider, stt_model, whisper_model, notes_channel_id, use_thread, auto_join, auto_join_min_people, auto_join_channel_ids, shared_mic_user_ids, language, summary_language, summary_prompt, overview_prompt, keep_audio, bot_nickname)
+     VALUES (@guildId, @summarizerProvider, @summarizerModel, @summarizerFallbackProvider, @summarizerFallbackModel, @sttProvider, @sttModel, @whisperModel, @notesChannelId, @useThread, @autoJoin, @autoJoinMinPeople, @autoJoinChannelIds, @sharedMicUserIds, @language, @summaryLanguage, @summaryPrompt, @overviewPrompt, @keepAudio, @botNickname)`
   ).run({
     guildId,
     summarizerProvider: merged.summarizerProvider,
@@ -88,6 +98,7 @@ export function setGuildConfig(db, guildId, patch) {
     autoJoin: merged.autoJoin ? 1 : 0,
     autoJoinMinPeople: merged.autoJoinMinPeople,
     autoJoinChannelIds: merged.autoJoinChannelIds === null ? null : JSON.stringify(merged.autoJoinChannelIds),
+    sharedMicUserIds: JSON.stringify(merged.sharedMicUserIds),
     language: merged.language,
     summaryLanguage: merged.summaryLanguage,
     summaryPrompt: merged.summaryPrompt,

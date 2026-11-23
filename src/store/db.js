@@ -5,8 +5,7 @@ import { dashboardQueries } from './dashboard-queries.js';
 // load an entire guild's history.
 const TODO_LIST_LIMIT = 1000;
 // Utterance rows with per-guild speaker renames applied (append WHERE/ORDER).
-// Speakers of an imported recording are per-recording ids (import-<meeting>-<n>).
-const NOT_IMPORT_SPEAKER = (column) => `${column} NOT LIKE 'import-%'`;
+const GUILD_SPEAKER = (column) => `${column} NOT LIKE 'import-%' AND ${column} NOT LIKE 'shared-%'`;
 const NAMED_UTTERANCES = `SELECT u.id, u.meeting_id, u.user_id, COALESCE(n.display_name, u.display_name) AS display_name,
     u.start_ms, u.end_ms, u.text
   FROM utterances u JOIN meetings m ON m.id = u.meeting_id
@@ -160,6 +159,9 @@ export function openDb(path) {
   }
   if (!cols.some((c) => c.name === 'auto_join_channel_ids')) {
     sql.exec(`ALTER TABLE guild_config ADD COLUMN auto_join_channel_ids TEXT`);
+  }
+  if (!cols.some((c) => c.name === 'shared_mic_user_ids')) {
+    sql.exec('ALTER TABLE guild_config ADD COLUMN shared_mic_user_ids TEXT');
   }
   // Migration: add cloud STT columns to dbs created before they existed.
   if (!cols.some((c) => c.name === 'stt_provider')) {
@@ -360,10 +362,10 @@ export function openDb(path) {
           SELECT a.user_id, a.display_name,
             ROW_NUMBER() OVER (PARTITION BY a.user_id ORDER BY m.id DESC) AS position
           FROM attendees a JOIN meetings m ON m.id = a.meeting_id
-          WHERE m.guild_id = ? AND ${NOT_IMPORT_SPEAKER('a.user_id')}
+          WHERE m.guild_id = ? AND ${GUILD_SPEAKER('a.user_id')}
         ), known AS (
           SELECT user_id FROM recent
-          UNION SELECT user_id FROM speaker_names WHERE guild_id = ? AND ${NOT_IMPORT_SPEAKER('user_id')}
+          UNION SELECT user_id FROM speaker_names WHERE guild_id = ? AND ${GUILD_SPEAKER('user_id')}
         )
         SELECT k.user_id, r.display_name, n.display_name AS override
         FROM known k
@@ -388,7 +390,7 @@ export function openDb(path) {
       sql.prepare(`UPDATE meetings SET transcription_complete = ? WHERE id = ?`)
         .run(complete == null ? null : (complete ? 1 : 0), meetingId);
     },
-    replaceUtterances(meetingId, utterances, { complete }) {
+    replaceUtterances(meetingId, utterances, { complete, sharedSpeakers }) {
       const insert = sql.prepare(
         `INSERT INTO utterances (meeting_id, user_id, display_name, start_ms, end_ms, text)
          VALUES (?, ?, ?, ?, ?, ?)`
@@ -396,11 +398,18 @@ export function openDb(path) {
       sql.exec('BEGIN');
       try {
         sql.prepare(`DELETE FROM utterances WHERE meeting_id = ?`).run(meetingId);
+        if (sharedSpeakers) {
+          sql.prepare(`DELETE FROM attendees WHERE meeting_id = ? AND user_id LIKE ?`).run(meetingId, `shared-${meetingId}-%`);
+          for (const [userId, name] of sharedSpeakers) this.addAttendee(meetingId, userId, name);
+        }
         for (const u of utterances) {
           insert.run(meetingId, u.userId, u.displayName, u.startMs, u.endMs, u.text);
         }
         sql.prepare(`UPDATE meetings SET transcription_complete = ? WHERE id = ?`)
           .run(complete ? 1 : 0, meetingId);
+        if (sharedSpeakers?.size) {
+          sql.prepare(`UPDATE meetings SET status = 'speaker_review' WHERE id = ?`).run(meetingId);
+        }
         sql.exec('COMMIT');
       } catch (err) {
         try { sql.exec('ROLLBACK'); } catch { /* SQLite may have auto-rolled back */ }
@@ -409,6 +418,25 @@ export function openDb(path) {
     },
     listUtterances(meetingId) {
       return sql.prepare(`${NAMED_UTTERANCES} WHERE u.meeting_id = ? ORDER BY u.start_ms`).all(meetingId);
+    },
+    approveSpeakerReview(meetingId, names) {
+      sql.exec('BEGIN IMMEDIATE');
+      try {
+        const claim = sql.prepare(`UPDATE meetings SET status = 'processing' WHERE id = ? AND status = 'speaker_review'`).run(meetingId);
+        if (claim.changes) {
+          const renameUtterances = sql.prepare('UPDATE utterances SET display_name = ? WHERE meeting_id = ? AND user_id = ?');
+          const renameAttendee = sql.prepare('UPDATE attendees SET display_name = ? WHERE meeting_id = ? AND user_id = ?');
+          for (const [userId, name] of names) {
+            renameUtterances.run(name, meetingId, userId);
+            renameAttendee.run(name, meetingId, userId);
+          }
+        }
+        sql.exec('COMMIT');
+        return !!claim.changes;
+      } catch (error) {
+        sql.exec('ROLLBACK');
+        throw error;
+      }
     },
     // Does the meeting have any transcript line? (Existence only — cheap.)
     hasUtterances(meetingId) {

@@ -5,6 +5,7 @@
 import { join } from 'node:path';
 import { config, hasDiscordCreds } from './config/env.js';
 import { openDb } from './store/db.js';
+import { anyGuildUsesSidecar } from './store/config.js';
 import { reconcileOnBoot, sweepAudio } from './store/reconcile.js';
 import { BotController, createShutdown } from './bot-controller.js';
 import { SidecarController } from './sidecar-controller.js';
@@ -95,16 +96,6 @@ if (sidecar.managed() && anyGuildUsesSidecar(db)) {
     if (r.ok) console.log(`[stt] local sidecar ${r.external ? 'detected' : 'started'} at ${config.sttUrl}`);
     else console.log(`[stt] sidecar not started: ${r.error}`);
   });
-}
-
-function anyGuildUsesSidecar(database) {
-  // Default provider is 'sidecar', so a guild with no row (or an explicit
-  // sidecar row) counts. Treat "no configured guilds yet" as sidecar too.
-  try {
-    const rows = database.sql.prepare(`SELECT stt_provider FROM guild_config`).all();
-    if (rows.length === 0) return true;
-    return rows.some((r) => (r.stt_provider ?? 'sidecar') === 'sidecar');
-  } catch { return true; }
 }
 
 if (hasDiscordCreds()) {

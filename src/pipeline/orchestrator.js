@@ -1,4 +1,4 @@
-import { transcribeTracks } from './transcribe.js';
+import { sharedSpeakerPrefix, transcribeTracks } from './transcribe.js';
 import { STT_PROVIDER_LABELS } from '../adapters/stt/index.js';
 import { buildTranscript, computeTalkTime } from './summarize.js';
 import { getSummarizer } from '../adapters/summarizer/index.js';
@@ -10,6 +10,7 @@ import { campaignContextFor, foldMeetingIntoJournal } from '../campaign/journal.
 import { withMeetingProgress } from './progress.js';
 import { deliverSavedNotes } from '../delivery/status.js';
 import { dirname } from 'node:path';
+import { rm } from 'node:fs/promises';
 import { retainRecording } from '../voice/recording-archive.js';
 
 // Provider-neutral: the STT provider may be the local sidecar or a cloud API.
@@ -43,18 +44,28 @@ async function transcribeAndStore(db, meetingId, opts, transcribe) {
   if (failures.length > 0) {
     console.warn(`[orchestrator] ${failures.length} track(s) failed transcription for meeting ${meetingId}`);
   }
+  const sharedMicFailure = failures.find(({ userId }) => opts.cfg.sharedMicUserIds?.includes(userId));
+  if (sharedMicFailure) {
+    const err = new Error(`Could not separate voices on ${sharedMicFailure.displayName}'s shared mic: ${sharedMicFailure.error}`);
+    throw failTranscription(db, meetingId, err, { sttProvider: 'sidecar' });
+  }
   if (utterances.length === 0 && failures.length > 0) {
     const err = new Error(`All ${failures.length} track(s) failed transcription. First error: ${failures[0].error}`);
     throw failTranscription(db, meetingId, err, opts.cfg);
   }
+  const prefix = sharedSpeakerPrefix(meetingId);
+  const sharedSpeakers = new Map();
+  for (const { userId, displayName } of utterances) {
+    if (userId.startsWith(prefix)) sharedSpeakers.set(userId, displayName);
+  }
   try {
-    db.replaceUtterances(meetingId, utterances, { complete: failures.length === 0 });
+    db.replaceUtterances(meetingId, utterances, { complete: failures.length === 0, sharedSpeakers });
   } catch (err) {
     db.setMeetingStatus(meetingId, 'transcription_failed');
     err.userMessage = `Transcription could not be saved safely. (${err.message})`;
     throw err;
   }
-  return { utterances, failures };
+  return { utterances, failures, needsSpeakerReview: sharedSpeakers.size > 0 };
 }
 
 export function processMeeting(db, meetingId, opts) {
@@ -63,17 +74,16 @@ export function processMeeting(db, meetingId, opts) {
 
 async function runMeeting(db, meetingId, opts, progress) {
   const transcribe = opts.transcribe || ((tracks, cfg) => transcribeTracks(tracks, cfg, {
-    onTrackDone: ({ failed }) => {
-      progress.completed++;
-      if (failed) progress.failed++;
+    meetingId,
+    onTrackDone: ({ failed, count }) => {
+      progress.completed += count;
+      if (failed) progress.failed += count;
     },
   }));
-  const summarizer = opts.summarizer || getSummarizer(opts.cfg);
-
   db.setMeetingStatus(meetingId, 'processing');
 
   const transcribeStart = Date.now();
-  const { utterances, failures } = await transcribeAndStore(db, meetingId, opts, transcribe);
+  const { utterances, failures, needsSpeakerReview } = await transcribeAndStore(db, meetingId, opts, transcribe);
   const transcribeMs = Date.now() - transcribeStart;
 
   // Nobody actually spoke (bot joined an empty/near-silent channel). Don't
@@ -83,15 +93,43 @@ async function runMeeting(db, meetingId, opts, progress) {
     db.setMeetingStatus(meetingId, 'empty');
     return { notes: null, talktime: [], empty: true };
   }
+  if (needsSpeakerReview) {
+    return { reviewPending: true };
+  }
 
   return finishMeeting(db, meetingId, {
-    cfg: opts.cfg, summarizer, deliver: opts.deliver, progress,
+    cfg: opts.cfg, summarizer: opts.summarizer || getSummarizer(opts.cfg), deliver: opts.deliver, progress,
     timings: { transcribeMs, tracks: opts.tracks.length },
     retainAudio: async () => {
       if (!opts.cfg.keepAudio || opts.tracks.length === 0) return false;
       progress.stage = 'archiving';
       return retainRecording(dirname(opts.tracks[0].pcmPath), failures.length === 0, meetingId);
     },
+  });
+}
+
+export function finishReviewedMeeting(db, meetingId, { cfg, audioDir, deliver }) {
+  return withMeetingProgress(meetingId, null, async (progress) => {
+    try {
+      const complete = db.getMeeting(meetingId).transcription_complete === 1;
+      const result = await finishMeeting(db, meetingId, {
+        cfg, summarizer: getSummarizer(cfg), deliver, progress,
+        retainAudio: async () => {
+          if (!cfg.keepAudio) return false;
+          progress.stage = 'archiving';
+          return retainRecording(audioDir, complete, meetingId);
+        },
+      });
+      if (complete && !result.audioRetained) {
+        await rm(audioDir, { recursive: true, force: true }).catch((error) => {
+          console.warn(`[audio] meeting ${meetingId}: could not remove temporary audio: ${error.message}`);
+        });
+      }
+      return result;
+    } catch (error) {
+      if (db.getMeeting(meetingId)?.status === 'processing') db.setMeetingStatus(meetingId, 'summary_failed');
+      throw error;
+    }
   });
 }
 
@@ -154,7 +192,8 @@ export async function finishMeeting(db, meetingId, { cfg, summarizer, deliver = 
   const notes = await summarizeOrFail(db, meetingId, summarizer, input, cfg);
   const summarizeMs = Date.now() - summarizeStart;
   const { transcribeMs, ...rest } = timings;
-  console.log(`[pipeline] meeting ${meetingId}: transcribe ${transcribeMs}ms (${rest.tracks} tracks), summarize ${summarizeMs}ms`);
+  const transcriptionLog = transcribeMs == null ? '' : `transcribe ${transcribeMs}ms (${rest.tracks} tracks), `;
+  console.log(`[pipeline] meeting ${meetingId}: ${transcriptionLog}summarize ${summarizeMs}ms`);
 
   // summarizer.lastUsed is set by FallbackSummarizer to whichever provider
   // actually produced these notes; plain adapters leave it undefined.

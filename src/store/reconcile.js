@@ -49,7 +49,7 @@ async function sweepUploads(importsRoot, { readdir, remove, log }) {
 }
 
 // Statuses whose meeting still needs its audio (a retry may retranscribe from PCM).
-const KEEP_AUDIO_STATUSES = new Set(['recording', 'processing', 'transcription_failed', 'summary_failed']);
+const KEEP_AUDIO_STATUSES = new Set(['recording', 'processing', 'speaker_review', 'transcription_failed', 'summary_failed']);
 
 export async function reconcileOnBoot(db, audioRoot, {
   readdir = readdirSync, remove = rm, log = console, retentionDays = 30,

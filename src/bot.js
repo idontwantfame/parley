@@ -19,7 +19,6 @@ import { waitForReconnect } from './voice/reconnect.js';
 import { GuildVoiceGate, AUTO_LEAVE_GRACE_MS } from './voice/guild-voice-gate.js';
 import { canDiscardAudio } from './voice/recording-archive.js';
 import { processMeeting } from './pipeline/orchestrator.js';
-import { getSummarizer } from './adapters/summarizer/index.js';
 import { resolveSummaryLanguage } from './adapters/summarizer/languages.js';
 import { shouldAutoJoin, shouldAutoLeave, botMovedAway } from './voice/decisions.js';
 import { nicknameFor } from './voice/nickname.js';
@@ -94,7 +93,6 @@ export function startBot({ db, audioRoot }) {
       const result = await processMeeting(db, meetingId, {
         tracks,
         cfg,
-        summarizer: getSummarizer(cfg),
         deliver: async (notes, talktime) => postNotes({ client, meeting, cfg, notes, talktime }),
       });
       // Keep the PCM whenever a retry could still need it (partial transcript).

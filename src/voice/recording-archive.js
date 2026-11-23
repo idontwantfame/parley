@@ -48,6 +48,6 @@ export async function retainRecording(audioDir, transcriptionComplete, meetingId
  * that failed. `meeting` is the row after the pipeline ran.
  */
 export function canDiscardAudio(result, meeting) {
-  if (!result || result.audioRetained) return false;
+  if (!result || result.audioRetained || result.reviewPending) return false;
   return meeting?.transcription_complete === 1;
 }

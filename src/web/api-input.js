@@ -28,6 +28,7 @@ export function intQuery(value, max, fallback) {
 export const ADMIN_CONFIG_FIELDS = [
   'sttProvider', 'sttModel', 'whisperModel', 'autoJoin', 'autoJoinMinPeople', 'autoJoinChannelIds',
   'summaryPrompt', 'overviewPrompt', 'keepAudio', 'botNickname',
+  'sharedMicUserIds',
   'provider', 'model', 'fallbackProvider', 'fallbackModel', 'notesChannelId',
 ];
 

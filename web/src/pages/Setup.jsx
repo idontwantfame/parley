@@ -159,7 +159,7 @@ function VocabularyUpload() {
   );
 }
 
-function Switch({ checked, onChange, label, desc }) {
+function Switch({ checked, onChange, label, desc, disabled }) {
   return (
     <label className="flex items-start justify-between gap-4 cursor-pointer select-none">
       <span>
@@ -167,7 +167,7 @@ function Switch({ checked, onChange, label, desc }) {
         {desc && <span className="block text-xs text-muted mt-0.5">{desc}</span>}
       </span>
       <span className="relative shrink-0 mt-0.5">
-        <input type="checkbox" checked={checked} onChange={onChange} className="peer sr-only" />
+        <input type="checkbox" checked={checked} onChange={onChange} disabled={disabled} className="peer sr-only" />
         <span className="block h-6 w-10 rounded-full bg-surface-3 peer-checked:bg-primary transition-colors
           peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-primary
           peer-disabled:opacity-50" />
@@ -333,7 +333,7 @@ export default function Setup() {
       setMsg('Saved'); setMsgErr(false);
       // Switching the transcription backend may have auto-started/stopped the
       // local sidecar; refresh system status so its pill reflects reality.
-      if (patch.sttProvider !== undefined) refreshSys?.();
+      if (patch.sttProvider !== undefined || patch.sharedMicUserIds !== undefined) refreshSys?.();
       return r;
     } catch (e) { setMsg(e.message); setMsgErr(true); return false; }
     finally { setTimeout(() => setMsg(''), 2400); }
@@ -568,7 +568,7 @@ export default function Setup() {
           </AdminFieldset>
           <RecordingRetention enabled={c.keepAudio} save={save} />
         </Card>
-        <SpeakerNames key={guildId} guildId={guildId} />
+        <SpeakerNames key={guildId} guildId={guildId} sharedMicUserIds={c.sharedMicUserIds ?? []} saveConfig={save} />
       </div>
     </Page>
   );
@@ -695,7 +695,7 @@ function RecordingRetention({ enabled, save }) {
     label="Keep recordings" desc="Save audio from future completed meetings as downloadable MP3s." />;
 }
 
-function SpeakerNames({ guildId }) {
+function SpeakerNames({ guildId, sharedMicUserIds, saveConfig }) {
   const { user, authEnabled } = useAuth();
   const canEdit = !authEnabled || user?.isAdmin;
   const [speakers, setSpeakers] = useState(null);
@@ -712,6 +712,7 @@ function SpeakerNames({ guildId }) {
   }, [guildId, canEdit]);
   if (!canEdit) return null;
   const speaker = speakers?.find((row) => row.user_id === speakerId);
+  const shared = sharedMicUserIds.includes(speakerId);
 
   async function save(event) {
     event.preventDefault();
@@ -728,6 +729,17 @@ function SpeakerNames({ guildId }) {
     }
   }
 
+  async function toggleSharedMic() {
+    setSaving(true);
+    try {
+      await saveConfig({ sharedMicUserIds: shared
+        ? sharedMicUserIds.filter((id) => id !== speakerId)
+        : [...sharedMicUserIds, speakerId] });
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <Card title="Speaker display names" desc="Applies to transcripts and future summaries for this server.">
       {speakers?.length === 0 && <p className="text-sm text-muted">No speakers found yet.</p>}
@@ -738,6 +750,7 @@ function SpeakerNames({ guildId }) {
             <option value="">Choose a speaker</option>
             {speakers.map((row) => <option key={row.user_id} value={row.user_id}>
               {row.display_name ?? row.user_id}{row.override ? ` → ${row.override}` : ''}
+              {sharedMicUserIds.includes(row.user_id) ? ' (shared mic)' : ''}
             </option>)}
           </select>
           {speaker && (
@@ -748,6 +761,11 @@ function SpeakerNames({ guildId }) {
                 <button type="submit" className="btn btn-primary" disabled={saving}>Save name</button>
               </div>
             </Field>
+          )}
+          {speaker && /^[1-9]\d{16,19}$/.test(speakerId) && (
+            <Switch checked={shared} onChange={toggleSharedMic} disabled={saving}
+              label="Shared microphone"
+              desc="Use WhisperX to separate voices on this Discord account’s track. Review the names before Parley generates notes." />
           )}
         </form>
       )}

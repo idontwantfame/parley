@@ -103,6 +103,9 @@ export const api = {
   askCampaign: (id, question) => fetch(`/api/campaigns/${seg(id)}/ask`, jsonBody('POST', { question })).then(json),
   recapCampaign: (id, sessions) => fetch(`/api/campaigns/${seg(id)}/recap`, jsonBody('POST', { sessions })).then(json),
   retryMeeting: (id) => fetch(`/api/meetings/${seg(id)}/retry`, { method: 'POST' }).then(json),
+  approveSpeakers: (id, names) => fetch(`/api/meetings/${seg(id)}/speaker-review`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ names }),
+  }).then(json),
   regenerateSummary: (id) => fetch(`/api/meetings/${seg(id)}/regenerate`, { method: 'POST' }).then(json),
   regenerationStatus: (id) => fetch(`/api/meetings/${seg(id)}/regenerate`).then(json),
   commands: () => fetch('/api/commands').then(json),
