@@ -187,3 +187,15 @@ test('availableSttProviders lists every provider with models + readiness', () =>
   assert.deepEqual(openai.models, STT_MODELS.openai);
   assert.equal(list.find((p) => p.provider === 'sidecar').ok, true);
 });
+
+test('whisper models also request segment timestamps for sentence-level lines', async () => {
+  const { fetchImpl, calls } = captureFetch([{ ok: true, status: 200, body: { text: 'x', words: [] } }]);
+  await createOpenAICompatibleSTT({ baseUrl: 'http://x/v1', apiKey: 'k' }, { fetchImpl, readFile: fakeRead })('/tmp/a.wav', { model: 'whisper-1' });
+  assert.deepEqual(calls[0].init.body.getAll('timestamp_granularities[]'), ['word', 'segment']);
+});
+
+test('normalize passes segments through, trimmed', () => {
+  const out = normalize({ text: 'a. b.', words: [{ word: 'a', start: 0, end: 1 }],
+    segments: [{ text: ' a.', start: 0, end: 1 }, { text: ' b.', start: 1, end: 2 }] });
+  assert.deepEqual(out.segments, [{ start: 0, end: 1, text: 'a.' }, { start: 1, end: 2, text: 'b.' }]);
+});

@@ -322,7 +322,7 @@ Use **Settings → Behavior → Auto-join channels** to limit automatic recordin
 
 Use **Settings → Transcription vocabulary** to import a UTF-8 text or Markdown file with one literal term per line. The shared list helps new transcriptions and retries recognize recurring names and terms.
 
-Enable **Settings → Behavior → Keep recordings** for future meetings. Parley transcribes the original audio, then archives retained recordings as 48 kbps mono MP3s. Download the recording from a completed meeting’s action menu. Recordings expire after 30 days by default. Set `AUDIO_RETENTION_DAYS` to configure that period.
+Enable **Settings → Behavior → Keep recordings** for future meetings. Parley transcribes the original audio, then archives retained recordings as 48 kbps mono MP3s. Download the recording from a completed meeting’s action menu, or play it right on the meeting page: transcript lines are sentence-sized, and clicking one jumps the recording to that moment (the line being played is highlighted). Older meetings keep one line per speaking turn. A sidecar from before this change still works; it just splits lines by pauses and punctuation instead of the engine's own segments. Recordings expire after 30 days by default. Set `AUDIO_RETENTION_DAYS` to configure that period.
 
 **Live** shows processed audio tracks, an estimate when there is enough data, and the current summarization stage. The meeting action menu can also delete a retained recording while keeping the transcript and notes.
 

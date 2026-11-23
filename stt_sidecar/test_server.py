@@ -264,3 +264,11 @@ def test_invalid_model_or_language_is_a_client_error(monkeypatch):
     r = client.post("/transcribe", files=wav(), data={"model": "small.en", "language": "de"})
     assert r.status_code == 400
     assert client.post("/transcribe", files=wav(), data={"model": "small.en", "language": "en"}).status_code == 200
+
+def test_transcribe_returns_sentence_segments(monkeypatch):
+    # Segments are the transcript lines the dashboard can seek the recording to.
+    _state["model"] = FakeModel()
+    _state["model_name"] = "small"
+    client = TestClient(app)
+    r = client.post("/transcribe", files={"file": ("a.wav", make_silent_wav(), "audio/wav")})
+    assert r.json()["segments"] == [{"start": 0.0, "end": 1.0, "text": "hello world"}]

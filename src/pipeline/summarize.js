@@ -5,11 +5,29 @@ export function formatMs(ms) {
   return `${mm}:${ss}`;
 }
 
+// Stored transcripts are sentence-level (so lines can seek the recording).
+// For prompts, back-to-back lines from one speaker are merged into a turn so
+// the model isn't handed a timestamp and name on every sentence.
+export const TURN_MERGE_GAP_MS = 2000;
+
+function mergeTurns(sorted) {
+  const turns = [];
+  for (const u of sorted) {
+    const last = turns[turns.length - 1];
+    if (last && last.displayName === u.displayName && u.startMs - last.endMs <= TURN_MERGE_GAP_MS) {
+      turns[turns.length - 1] = { ...last, endMs: Math.max(last.endMs, u.endMs), text: `${last.text} ${u.text}` };
+    } else {
+      turns.push({ ...u });
+    }
+  }
+  return turns;
+}
+
 export function buildTranscript(utterances) {
   if (!utterances.length) return '';
   const sorted = [...utterances].sort((a, b) => a.startMs - b.startMs);
   const origin = sorted[0].startMs;
-  return sorted
+  return mergeTurns(sorted)
     .map((u) => `[${formatMs(u.startMs - origin)}] ${u.displayName}: ${u.text}`)
     .join('\n');
 }

@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mixTracksToWav, ensureMixedWav, MIXED_WAV_NAME } from '../src/voice/mix.js';
+import { MIX_ORIGIN_NAME, recordingOriginMs } from '../src/voice/mix.js';
 
 function tmp() {
   const dir = mkdtempSync(join(tmpdir(), 'parley-mix-'));
@@ -115,4 +116,27 @@ test('ensureMixedWav returns null for a missing or track-less dir', async () => 
     mkdirSync(emptyDir);
     assert.equal(await ensureMixedWav(emptyDir), null);
   } finally { cleanup(); }
+});
+
+test('ensureMixedWav records where the recording starts on the meeting timeline', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'parley-origin-'));
+  try {
+    writeFileSync(join(dir, 'u1_5000.pcm'), Buffer.alloc(320));
+    writeFileSync(join(dir, 'u2_3000.pcm'), Buffer.alloc(0)); // empty: not in the mix
+    writeFileSync(join(dir, 'u3_7000.pcm'), Buffer.alloc(320));
+    await ensureMixedWav(dir);
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, MIX_ORIGIN_NAME), 'utf8')), { originMs: 5000 });
+    assert.equal(await recordingOriginMs(dir), 5000);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('recordingOriginMs falls back to the raw tracks, then to null', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'parley-origin-'));
+  try {
+    assert.equal(await recordingOriginMs(dir), null);
+    assert.equal(await recordingOriginMs(join(dir, 'missing')), null);
+    writeFileSync(join(dir, 'u1_9000.pcm'), Buffer.alloc(320));
+    writeFileSync(join(dir, 'u2_8000.pcm'), Buffer.alloc(320));
+    assert.equal(await recordingOriginMs(dir), 8000);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

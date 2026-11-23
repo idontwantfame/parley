@@ -32,6 +32,8 @@ function buildForm(file, filePath, opts) {
   if (supportsWordTimestamps(opts.model)) {
     form.append('response_format', 'verbose_json');
     form.append('timestamp_granularities[]', 'word');
+    // Segments give sentence-level transcript lines the dashboard can seek to.
+    form.append('timestamp_granularities[]', 'segment');
   } else {
     form.append('response_format', 'json');
   }
@@ -98,5 +100,10 @@ export function normalize(json, { durationSec = null } = {}) {
       .map((s) => ({ word: s.text, start: s.start, end: s.end }));
   }
   if (!words.length && text && durationSec > 0) words = [{ word: text, start: 0, end: durationSec }];
-  return { text, words, language: json?.language };
+  const segments = Array.isArray(json?.segments)
+    ? json.segments
+      .filter((s) => Number.isFinite(s?.start) && Number.isFinite(s?.end))
+      .map((s) => ({ start: s.start, end: s.end, text: String(s.text ?? '').trim() }))
+    : [];
+  return { text, words, ...(segments.length ? { segments } : {}), language: json?.language };
 }

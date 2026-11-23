@@ -1,4 +1,4 @@
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { api } from '../api.js';
 import { useIsAdmin } from '../AuthContext.jsx';
@@ -108,8 +108,74 @@ function ActionItem({ item, todo, onToggle }) {
   );
 }
 
-/* ── transcript ───────────────────────────────────────────────────────── */
-function Transcript({ utterances }) {
+/* ── recording player + transcript ───────────────────────────────────── */
+// Index of the line playing at `atMs`: the last one starting at or before it.
+function lineAt(lines, atMs) {
+  let lo = 0;
+  let hi = lines.length - 1;
+  let found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (lines[mid].start_ms <= atMs) { found = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return found;
+}
+
+// Keeps the in-page player and the transcript in step: clicking a line seeks
+// the recording to it, and the line being played is highlighted.
+function useRecordingSync(lines, originMs) {
+  const audioRef = useRef(null);
+  const [activeId, setActiveId] = useState(null);
+  const onTime = useCallback(() => {
+    const audio = audioRef.current;
+    if (!audio || originMs == null) return;
+    const idx = lineAt(lines, originMs + audio.currentTime * 1000);
+    const id = idx >= 0 ? lines[idx].id : null;
+    setActiveId((cur) => (cur === id ? cur : id));
+  }, [lines, originMs]);
+  const seek = useCallback((u) => {
+    const audio = audioRef.current;
+    if (!audio || originMs == null) return;
+    audio.currentTime = Math.max(0, (u.start_ms - originMs) / 1000);
+    audio.play().catch(() => { /* autoplay refused: the position is still set */ });
+  }, [originMs]);
+  return { audioRef, activeId, onTime, seek };
+}
+
+function RecordingPlayer({ meetingId, sync }) {
+  return (
+    <section className="mt-9 card p-4 sticky top-3 z-10" aria-label="Recording">
+      <audio ref={sync.audioRef} controls preload="metadata" className="w-full"
+        src={api.meetingAudioUrl(meetingId, { inline: true })} onTimeUpdate={sync.onTime} onSeeked={sync.onTime} />
+      <p className="text-xs text-muted mt-1.5">Click a line in the transcript to play from there.</p>
+    </section>
+  );
+}
+
+const TranscriptLine = memo(function TranscriptLine({ u, label, active, onSeek }) {
+  // The whole line seeks, unless the click was the end of a text selection.
+  const seekFromRow = onSeek ? () => { if (window.getSelection()?.isCollapsed !== false) onSeek(u); } : undefined;
+  return (
+    <div className={`flex items-start gap-3 rounded-sm -mx-2 px-2 py-1 transition-colors ${active ? 'bg-primary-soft' : ''} ${onSeek ? 'cursor-pointer hover:bg-surface-2' : ''}`}
+      onClick={seekFromRow} aria-current={active ? 'true' : undefined}>
+      <Avatar name={u.display_name} size={28} />
+      <div className="min-w-0">
+        <div className="flex items-baseline gap-2">
+          <span className="text-[13px] font-semibold" style={{ color: colorOf(u.display_name) }}>{u.display_name}</span>
+          {onSeek ? (
+            <button type="button" onClick={(e) => { e.stopPropagation(); onSeek(u); }}
+              className="text-[11px] text-primary tabular-nums hover:underline" aria-label={`Play from ${label}`}>{label}</button>
+          ) : <span className="text-[11px] text-faint tabular-nums">{label}</span>}
+        </div>
+        <p className="text-[14px] text-ink-2 leading-relaxed mt-0.5">{u.text}</p>
+      </div>
+    </div>
+  );
+});
+
+// `lines` are sorted by start; times are shown from `baseMs` (the recording's
+// start when there is one, else the first line), not as raw epoch values.
+function Transcript({ lines, baseMs, activeId = null, onSeek = null }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState('');
   // Filtering a multi-hour transcript on every keystroke is expensive; let the
@@ -117,37 +183,29 @@ function Transcript({ utterances }) {
   const deferredQ = useDeferredValue(q);
   const filtered = useMemo(() => {
     const needle = deferredQ.trim().toLowerCase();
-    return needle ? utterances.filter((u) => u.text.toLowerCase().includes(needle)) : utterances;
-  }, [utterances, deferredQ]);
-  if (!utterances.length) return null;
+    return needle ? lines.filter((u) => u.text.toLowerCase().includes(needle)) : lines;
+  }, [lines, deferredQ]);
+  if (!lines.length) return null;
 
   return (
     <section className="mt-10 pt-8 border-t border-border">
       <div className="flex items-center justify-between gap-3 mb-4">
-        <button onClick={() => setOpen((o) => !o)} className="flex items-center gap-2 text-sm font-bold text-ink">
+        <button onClick={() => setOpen((o) => !o)} className="flex items-center gap-2 text-sm font-bold text-ink" aria-expanded={open}>
           <Icon.Chevron width={16} height={16} className={`transition-transform ${open ? 'rotate-90' : ''}`} />
           Transcript
-          <span className="chip">{utterances.length} lines</span>
+          <span className="chip">{lines.length} lines</span>
         </button>
         {open && (
           <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Find in transcript…"
-            className="input !w-52 !py-1.5 text-[13px]" />
+            aria-label="Find in transcript" className="input !w-52 !py-1.5 text-[13px]" />
         )}
       </div>
       {open && (
-        <div className="space-y-4">
+        <div className="space-y-2">
           {filtered.length === 0 && <p className="text-sm text-muted">No lines match "{q}".</p>}
           {filtered.map((u, i) => (
-            <div key={u.id ?? i} className="flex items-start gap-3">
-              <Avatar name={u.display_name} size={28} />
-              <div className="min-w-0">
-                <div className="flex items-baseline gap-2">
-                  <span className="text-[13px] font-semibold" style={{ color: colorOf(u.display_name) }}>{u.display_name}</span>
-                  <span className="text-[11px] text-faint tabular-nums">{fmtClock(u.start_ms)}</span>
-                </div>
-                <p className="text-[14px] text-ink-2 leading-relaxed mt-0.5">{u.text}</p>
-              </div>
-            </div>
+            <TranscriptLine key={u.id ?? i} u={u} label={fmtClock(u.start_ms - baseMs)}
+              active={u.id === activeId} onSeek={onSeek} />
           ))}
         </div>
       )}
@@ -417,6 +475,9 @@ function Note({ data, onReload }) {
   const duration = fmtDuration(meeting.started_at, meeting.ended_at);
   const todos = data.todos ?? [];
   const { progress, watching, outcome, watchRetry } = useMeetingProgress(meeting, data.progress, onReload);
+  const lines = useMemo(() => [...(utterances ?? [])].sort((a, b) => a.start_ms - b.start_ms), [utterances]);
+  const playable = data.hasAudio && data.audioOriginMs != null;
+  const sync = useRecordingSync(lines, playable ? data.audioOriginMs : null);
   const running = !!progress;
   const isFailed = !running && !watching && ['transcription_failed', 'summary_failed', 'processing'].includes(meeting.status);
   const [regen, setRegen] = useState(() => ({
@@ -596,7 +657,9 @@ function Note({ data, onReload }) {
         </section>
       )}
 
-      <Transcript utterances={utterances ?? []} />
+      {playable && <RecordingPlayer meetingId={meeting.id} sync={sync} />}
+      <Transcript lines={lines} baseMs={playable ? data.audioOriginMs : (lines[0]?.start_ms ?? 0)}
+        activeId={playable ? sync.activeId : null} onSeek={playable ? sync.seek : null} />
       {meeting.guild_id && <AskBox guildId={meeting.guild_id} meetingId={meeting.id} />}
       <MeetingNav neighbors={data.neighbors} />
     </article>

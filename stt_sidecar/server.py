@@ -169,13 +169,17 @@ def _transcribe_file(path: str, model: str, language: str, vocabulary: str):
             path, language=lang, word_timestamps=True, batch_size=_resolve_batch_size(), **hints)
     else:
         segments, info = m.transcribe(path, language=lang, word_timestamps=True, **hints)
-    words, texts = [], []
+    words, texts, lines = [], [], []
     for seg in segments:  # lazy: the actual inference runs while iterating
         texts.append(seg.text)
+        # Sentence-sized lines the dashboard can seek the recording to.
+        if seg.text.strip():
+            lines.append({"start": seg.start, "end": seg.end, "text": seg.text.strip()})
         for w in (getattr(seg, "words", None) or []):
             words.append({"word": w.word, "start": w.start, "end": w.end})
     return {"text": " ".join(t.strip() for t in texts).strip(),
             "words": words,
+            "segments": lines,
             "language": getattr(info, "language", language)}
 
 

@@ -48,7 +48,8 @@ export const api = {
   meeting: (id) => fetch(`/api/meetings/${id}`).then(json),
   // Export URL for a download link/button (md or json). Not fetched via json().
   exportMeetingUrl: (id, format = 'md') => `/api/meetings/${id}/export?format=${format}`,
-  meetingAudioUrl: (id) => `/api/meetings/${id}/audio`,
+  // `inline` streams it for the in-page player (seekable); default downloads.
+  meetingAudioUrl: (id, { inline = false } = {}) => `/api/meetings/${id}/audio${inline ? '?inline=1' : ''}`,
   deleteMeetingAudio: (id) => fetch(`/api/meetings/${id}/audio`, { method: 'DELETE' }).then(json),
   postMeetingNotes: (id) => fetch(`/api/meetings/${id}/repost`, { method: 'POST' }).then(json),
   meetingProgress: (id) => fetch(`/api/meetings/${id}/progress`).then(json),

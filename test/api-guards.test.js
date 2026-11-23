@@ -30,8 +30,8 @@ async function serve(t, db, { bot = null, user, mixAudio } = {}) {
   await new Promise((r) => server.once('listening', r));
   t.after(() => server.close());
   const base = `http://127.0.0.1:${server.address().port}/api`;
-  return (method, path, body) => fetch(`${base}${path}`, {
-    method, headers: body === undefined ? {} : { 'content-type': 'application/json' },
+  return (method, path, body, headers = {}) => fetch(`${base}${path}`, {
+    method, headers: { ...(body === undefined ? {} : { 'content-type': 'application/json' }), ...headers },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 }
@@ -214,4 +214,41 @@ test('only admins can bypass the model catalog cache', async (t) => {
   assert.equal(viewerRefresh.fetchedAt, first.fetchedAt);
   const adminRefresh = await (await admin('GET', '/providers/gemini/models?refresh=1')).json();
   assert.notEqual(adminRefresh.fetchedAt, first.fetchedAt);
+});
+
+test('meeting detail reports where the recording starts, so transcript lines can seek it', async (t) => {
+  const dir = sandbox(t);
+  const db = openDb(':memory:');
+  const id = meeting(db);
+  db.setAudioRetained(id, true);
+  addAudio(dir, id); // raw track u1_<1000+id>.pcm, not mixed yet
+  const call = await serve(t, db);
+  assert.equal((await (await call('GET', `/meetings/${id}`)).json()).audioOriginMs, 1000 + id);
+
+  writeFileSync(join(dir, 'audio', String(id), 'mixed.json'), JSON.stringify({ originMs: 42 }));
+  assert.equal((await (await call('GET', `/meetings/${id}`)).json()).audioOriginMs, 42);
+
+  // An MP3 archived before origins were recorded: fall back to the first line.
+  rmSync(join(dir, 'audio', String(id)), { recursive: true });
+  mkdirSync(join(dir, 'audio', String(id)), { recursive: true });
+  writeFileSync(join(dir, 'audio', String(id), 'mixed.mp3'), Buffer.alloc(10));
+  assert.equal((await (await call('GET', `/meetings/${id}`)).json()).audioOriginMs, id);
+});
+
+test('the recording streams inline with byte ranges for the dashboard player', async (t) => {
+  const dir = sandbox(t);
+  const db = openDb(':memory:');
+  const id = meeting(db);
+  db.setAudioRetained(id, true);
+  mkdirSync(join(dir, 'audio', String(id)), { recursive: true });
+  writeFileSync(join(dir, 'audio', String(id), 'mixed.mp3'), Buffer.alloc(1000, 7));
+  const call = await serve(t, db);
+  const res = await call('GET', `/meetings/${id}/audio?inline=1`, undefined, { range: 'bytes=0-99' });
+  assert.equal(res.status, 206);
+  assert.equal(res.headers.get('content-type'), 'audio/mpeg');
+  assert.equal(res.headers.get('content-length'), '100');
+  assert.doesNotMatch(res.headers.get('content-disposition') || '', /attachment/);
+  // The download link still gets a file attachment.
+  const download = await call('GET', `/meetings/${id}/audio`);
+  assert.match(download.headers.get('content-disposition'), /attachment/);
 });

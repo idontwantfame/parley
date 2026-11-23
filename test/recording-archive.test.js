@@ -4,6 +4,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { archiveRecording, MP3_NAME } from '../src/voice/recording-archive.js';
+import { recordingOriginMs, MIX_ORIGIN_NAME } from '../src/voice/mix.js';
 
 test('archive only removes original tracks after a successful full transcription and encode', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'parley-mp3-'));
@@ -22,7 +23,8 @@ test('archive only removes original tracks after a successful full transcription
   assert.equal(mp3, join(dir, MP3_NAME));
   assert.ok((await readdir(dir)).includes(pcm));
   await archiveRecording(dir, { transcriptionComplete: true, run: () => assert.fail('Should reuse the saved MP3') });
-  assert.deepEqual(await readdir(dir), [MP3_NAME]);
+  // The recording's start point (mixed.json) stays beside the MP3 for seeking.
+  assert.deepEqual((await readdir(dir)).sort(), [MIX_ORIGIN_NAME, MP3_NAME].sort());
   assert.ok((await readFile(mp3)).length);
 });
 
@@ -45,4 +47,15 @@ test('archived (kept) audio and unknown outcomes are never discarded', () => {
   assert.equal(canDiscardAudio(null, { transcription_complete: 1 }), false);
   assert.equal(canDiscardAudio({ audioRetained: false }, null), false);
   assert.equal(canDiscardAudio({ audioRetained: false }, { transcription_complete: null }), false);
+});
+
+test('archiving keeps the recording start point next to the MP3', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'parley-mp3-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, 'speaker_4000.pcm'), Buffer.alloc(3200));
+  await archiveRecording(dir, { transcriptionComplete: true, run: async (_cmd, args) => { await writeFile(args.at(-1), 'mp3'); } });
+  const files = await readdir(dir);
+  assert.ok(files.includes(MP3_NAME));
+  assert.ok(!files.some((f) => f.endsWith('.pcm')));
+  assert.equal(await recordingOriginMs(dir), 4000);
 });

@@ -3,8 +3,8 @@ import { Router } from 'express';
 import { ChannelType } from 'discord.js';
 import { readdir, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
-import { ensureMixedWav } from '../voice/mix.js';
+import { join, resolve } from 'node:path';
+import { ensureMixedWav, recordingOriginMs } from '../voice/mix.js';
 import { MP3_NAME } from '../voice/recording-archive.js';
 import { getGuildConfig, setGuildConfig } from '../store/config.js';
 import { getVocabulary, setVocabulary } from '../store/vocabulary.js';
@@ -164,6 +164,12 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
 
   // Meeting detail bundle: notes, transcript, this meeting's todos, the
   // adjacent meetings in the list, and what the retry/regenerate actions can do.
+  async function audioOrigin(id, utterances) {
+    const fromAudio = await recordingOriginMs(audioDir(id));
+    if (fromAudio !== null) return fromAudio;
+    return utterances.length ? Math.min(...utterances.map((u) => u.start_ms)) : null;
+  }
+
   r.get('/meetings/:id', async (req, res) => {
     const id = Number(req.params.id);
     const meeting = db.getMeeting(id);
@@ -179,6 +185,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
     const cfg = getGuildConfig(db, meeting.guild_id);
     const channelId = cfg.notesChannelId || meeting.channel_id;
     const channel = liveClient()?.channels?.cache?.get(channelId);
+    const hasAudio = meeting.status === 'done' && !!meeting.audio_retained && audioFiles !== null;
     res.json({
       meeting,
       summary: db.getSummary(id),
@@ -193,7 +200,11 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
         id: channelId, name: channel?.name || (channelId === meeting.channel_id ? meeting.channel_name : null),
       } : null,
       regenerate: { eligible: regen.ok, reason: regen.reason || null, ...regeneration.get(id) },
-      hasAudio: meeting.status === 'done' && !!meeting.audio_retained && audioFiles !== null,
+      hasAudio,
+      // Epoch ms at 0 s of the recording, so the player can seek to a line's
+      // start_ms. Recordings archived before this was saved fall back to the
+      // first line (usually within a second of the true start).
+      audioOriginMs: hasAudio ? await audioOrigin(id, utterances) : null,
     });
   });
 
@@ -231,6 +242,9 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
     const file = isMp3 ? mp3 : await mixOnce(id);
     if (!file) return res.status(404).json({ error: 'No recording is available for this meeting.' });
     res.setHeader('Cache-Control', 'private, no-store');
+    // ?inline=1 streams it for the dashboard player (byte ranges, so seeking
+    // works); otherwise it's a file download.
+    if (req.query.inline === '1') return res.sendFile(resolve(file));
     res.download(file, `${meetingExportBasename(meeting)}.${isMp3 ? 'mp3' : 'wav'}`);
   });
 

@@ -14,8 +14,10 @@ test('formatMs renders mm:ss', () => {
 });
 
 test('buildTranscript sorts by startMs and labels speakers', () => {
-  const t = buildTranscript(utterances);
-  assert.equal(t, '[00:00] Bob: first\n[00:02] Alice: second\n[00:05] Alice: third word here');
+  // Alice's second line starts > TURN_MERGE_GAP_MS after her first ends, so it
+  // stays a separate turn (back-to-back lines merge; see the test below).
+  const t = buildTranscript([...utterances.slice(0, 2), { ...utterances[2], startMs: 7000, endMs: 8000 }]);
+  assert.equal(t, '[00:00] Bob: first\n[00:02] Alice: second\n[00:07] Alice: third word here');
 });
 
 test('buildTranscript stamps relative to the first utterance, not epoch', () => {
@@ -39,4 +41,13 @@ test('computeTalkTime aggregates ms, words, pct per speaker', () => {
   assert.equal(alice.words, 4);     // "second"(1) + "third word here"(3)
   assert.equal(bob.ms, 1000);
   assert.equal(alice.pct + bob.pct, 100);
+});
+
+test('buildTranscript merges back-to-back lines from one speaker into a single turn', () => {
+  // Stored transcripts are sentence-level (for seeking); the summarizer should
+  // still get compact speaker turns, not a label on every sentence.
+  const u = (displayName, startMs, endMs, text) => ({ displayName, startMs, endMs, text });
+  const out = buildTranscript([u('Ann', 0, 1000, 'Hi.'), u('Ann', 1200, 2000, 'How are you?'),
+    u('Bob', 2100, 3000, 'Fine.'), u('Ann', 3100, 4000, 'Good.'), u('Ann', 9000, 9500, 'Later.')]);
+  assert.equal(out, '[00:00] Ann: Hi. How are you?\n[00:02] Bob: Fine.\n[00:03] Ann: Good.\n[00:09] Ann: Later.');
 });
