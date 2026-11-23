@@ -36,3 +36,34 @@ test('the map is capped by dropping the oldest finished entries', () => {
   assert.equal(regen.get(3), undefined);
   assert.deepEqual(regen.get(5), { state: 'done' });
 });
+
+test('the ETA uses measured chunk times, then updates with overview timings', () => {
+  let t = 100_000;
+  const regen = createRegenerationState({ now: () => t });
+  regen.start(1);
+  regen.update(1, { stage: 'chunks', total: 3, overviewTotal: 2 });
+  assert.equal(regen.get(1).progress.estimatedFinishAt, null);
+
+  t += 10_000;
+  regen.update(1, { durationMs: 10_000 });
+  t += 4_000;
+  assert.deepEqual(regen.get(1).progress, {
+    stage: 'chunks', total: 3, completed: 1, overviewTotal: 2, overviewCompleted: 0,
+    chunkDurationsMs: [10_000], remainingMs: 36_000, estimatedFinishAt: 150_000,
+  });
+
+  t += 6_000;
+  regen.update(1, { durationMs: 10_000 });
+  t += 10_000;
+  regen.update(1, { durationMs: 10_000 });
+  regen.update(1, { stage: 'overview', total: 2 });
+  assert.equal(regen.get(1).progress.estimatedFinishAt, 150_000);
+  t += 3_000;
+  regen.update(1, { durationMs: 3_000 });
+  assert.equal(regen.get(1).progress.overviewCompleted, 1);
+  assert.equal(regen.get(1).progress.estimatedFinishAt, 136_000);
+  t += 4_000;
+  assert.equal(regen.get(1).progress.estimatedFinishAt, null);
+  regen.update(1, { stage: 'fallback' });
+  assert.deepEqual(regen.get(1), { state: 'running' });
+});

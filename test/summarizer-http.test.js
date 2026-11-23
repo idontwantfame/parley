@@ -32,6 +32,7 @@ test('OllamaSummarizer retries output-length failures with a compact prompt', as
 
 test('OllamaSummarizer sends every transcript chunk and merges structured notes in the chosen language', async () => {
   const requests = [];
+  const progress = [];
   const sentences = [
     'Die Gruppe begann im Dorf.', 'Sie erreichte den Tempel.', 'Der Eingang war verriegelt.',
     'Alex fand einen Schlüssel.', 'Die Tür öffnete sich.', 'Ein Wächter erschien.',
@@ -62,7 +63,7 @@ test('OllamaSummarizer sends every transcript chunk and merges structured notes 
   const input = 'FIRST' + 'a'.repeat(26000) + 'LAST';
   assert.deepEqual(await s.summarize(input, {
     summaryLanguage: 'de', summaryPrompt: 'Extract the important facts.',
-  }), {
+  }, { onProgress: (event) => progress.push(event) }), {
     tldr: [...sentences.slice(0, 7), sentences.at(-1)].join(' '),
     topics: [{ title: 'Planung', points: ['Auftakt', 'Abschluss'] }],
     decisions: ['Termin bestätigt'], openQuestions: [],
@@ -75,6 +76,10 @@ test('OllamaSummarizer sends every transcript chunk and merges structured notes 
   assert.ok(chunks.every((request) => request.messages[0].content.includes('Extract the important facts.')));
   assert.ok(chunks.every((request) => !request.messages[0].content.includes('Explain where the group left off.')));
   assert.equal(requests.length, 6);
+  assert.deepEqual(progress[0], { stage: 'chunks', total: 5, overviewTotal: 1 });
+  assert.deepEqual(progress[6], { stage: 'overview', total: 1 });
+  assert.equal(progress.length, 8);
+  assert.ok([...progress.slice(1, 6), progress[7]].every(({ durationMs }) => Number.isInteger(durationMs) && durationMs >= 0));
   assert.equal(requests.at(-1).format, undefined);
   assert.match(requests.at(-1).messages[0].content, /^Explain where the group left off\./);
   assert.match(requests.at(-1).messages[0].content, /final overview.+at most 8 sentences/);

@@ -37,6 +37,7 @@ export class FallbackSummarizer {
       }
       this.log.warn?.(`[summarizer] ${this.label} failed (${primaryErr.message}) — falling back to ${this.fallbackLabel}`);
       try {
+        if (method === 'summarize') args[2]?.onProgress?.({ stage: 'fallback' });
         const out = await fallback[method](...args);
         this.lastUsed = this.fallbackLabel;
         return out;
@@ -48,6 +49,6 @@ export class FallbackSummarizer {
     }
   }
 
-  summarize(transcript, meta) { return this.#run('summarize', [transcript, meta]); }
+  summarize(transcript, meta, options) { return this.#run('summarize', [transcript, meta, options]); }
   ask(prompt) { return this.#run('ask', [prompt]); }
 }

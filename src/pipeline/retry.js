@@ -53,7 +53,7 @@ export function retryEligible(meeting, plan) {
 // Summarize a meeting's stored utterances with the guild's current summarizer
 // config (provider, model, language, prompt). Throws on summarizer failure;
 // writes nothing.
-async function summarizeStored(db, meeting, cfg) {
+async function summarizeStored(db, meeting, cfg, onProgress) {
   const utterances = db.listUtterances(meeting.id).map((u) => ({
     userId: u.user_id, displayName: u.display_name, startMs: u.start_ms, endMs: u.end_ms, text: u.text,
   }));
@@ -67,7 +67,7 @@ async function summarizeStored(db, meeting, cfg) {
     campaignContext: campaignContextFor(db, meeting),
   };
   const summarizer = getSummarizer(cfg);
-  const notes = await summarizer.summarize(transcript, meta);
+  const notes = await summarizer.summarize(transcript, meta, { onProgress });
   const modelUsed = summarizer.lastUsed ?? `${cfg.summarizerProvider}:${cfg.summarizerModel || ''}`;
   return { notes, talktime, meta, modelUsed };
 }
@@ -95,18 +95,18 @@ export function regeneratePlan(db, meetingId) {
  * existing summary and status untouched — the old notes stay until a new set
  * is actually in hand. Does not re-post to Discord.
  */
-export function regenerateSummary(db, meetingId) {
-  return withMeetingProgress(meetingId, null, () => regenerateSavedSummary(db, meetingId));
+export function regenerateSummary(db, meetingId, { onProgress } = {}) {
+  return withMeetingProgress(meetingId, null, () => regenerateSavedSummary(db, meetingId, onProgress));
 }
 
-async function regenerateSavedSummary(db, meetingId) {
+async function regenerateSavedSummary(db, meetingId, onProgress) {
   const plan = regeneratePlan(db, meetingId);
   if (!plan.ok) return { ok: false, reason: plan.reason };
   const meeting = plan.meeting;
   const cfg = getGuildConfig(db, meeting.guild_id);
   let result;
   try {
-    result = await summarizeStored(db, meeting, cfg);
+    result = await summarizeStored(db, meeting, cfg, onProgress);
   } catch (err) {
     return { ok: false, reason: err.userMessage ?? describeSummarizerError(err, cfg.summarizerProvider) };
   }

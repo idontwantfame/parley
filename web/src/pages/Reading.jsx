@@ -313,7 +313,7 @@ function writeDismissed(meetingId, error) {
 function useRegeneration(meeting, initial, onReload) {
   const [regen, setRegen] = useState(() => {
     const err = initial?.error ?? null;
-    return { busy: initial?.state === 'running', err: err && err === readDismissed(meeting.id) ? null : err };
+    return { busy: initial?.state === 'running', progress: initial?.progress, err: err && err === readDismissed(meeting.id) ? null : err };
   });
   const [starting, setStarting] = useState(false);
 
@@ -332,6 +332,7 @@ function useRegeneration(meeting, initial, onReload) {
             if (status.state === 'done') onReload?.();
             return;
           }
+          setRegen((current) => ({ ...current, progress: status.progress }));
         } catch { /* A temporary disconnect should not end a running job. */ }
       }
       if (!stop) timer = setTimeout(poll, REGEN_POLL_MS);
@@ -363,7 +364,38 @@ function useRegeneration(meeting, initial, onReload) {
     setRegen((r) => ({ ...r, err: null }));
   }, [meeting.id, regen.err]);
 
-  return { busy: regen.busy, err: regen.err, starting, start, dismiss };
+  return { ...regen, starting, start, dismiss };
+}
+
+function RegenerationProgress({ progress }) {
+  const percentage = progress ? Math.floor(100 * progress.completed / progress.total) : null;
+  const label = !progress ? 'Regenerating the summary…'
+    : progress.stage === 'overview' && progress.overviewCompleted < progress.overviewTotal
+      ? `Combining the overview (${progress.overviewCompleted} of ${progress.overviewTotal} passes complete)…`
+      : progress.completed === progress.total ? 'Saving the summary…'
+        : `${progress.completed} of ${progress.total} transcript chunks complete (${percentage}%)`;
+
+  return (
+    <div className="card p-4 mt-8 text-[13.5px] text-muted">
+      <div className="flex items-center gap-3" role="status">
+        <span className="h-4 w-4 rounded-full border-2 border-primary border-t-transparent animate-spin shrink-0" />
+        <div>
+          <p>{label}</p>
+          {progress?.estimatedFinishAt && (
+            <p>Estimated finish around {fmtTime(progress.estimatedFinishAt)} · {fmtMs(progress.remainingMs)} left</p>
+          )}
+        </div>
+      </div>
+      {progress?.chunkDurationsMs.length > 0 && (
+        <details className="mt-2">
+          <summary className="cursor-pointer">Chunk timings</summary>
+          <ol className="ml-5 mt-1 list-decimal">
+            {progress.chunkDurationsMs.map((ms, index) => <li key={index}>{fmtMs(ms)}</li>)}
+          </ol>
+        </details>
+      )}
+    </div>
+  );
 }
 
 function findTodo(todos, item) {
@@ -435,12 +467,7 @@ function Note({ data, onReload }) {
       {summary && meeting.status === 'done' &&
         <DiscordDelivery meeting={meeting} summary={summary} target={data.deliveryTarget} onReload={onReload} busy={running || regen.busy} />}
 
-      {regen.busy && (
-        <div className="card p-4 mt-8 flex items-center gap-3" role="status">
-          <span className="h-4 w-4 rounded-full border-2 border-primary border-t-transparent animate-spin shrink-0" />
-          <p className="text-[13.5px] text-muted">Regenerating the summary with the current summarizer settings…</p>
-        </div>
-      )}
+      {regen.busy && <RegenerationProgress progress={regen.progress} />}
       {regen.err && (
         <div className="card p-4 mt-8 border-l-2 flex items-start gap-3" style={{ borderColor: 'var(--error)' }} role="alert">
           <Icon.Alert width={18} height={18} className="text-error shrink-0 mt-0.5" />

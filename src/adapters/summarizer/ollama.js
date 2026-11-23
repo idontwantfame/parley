@@ -29,6 +29,15 @@ function splitTranscript(transcript) {
   return chunks;
 }
 
+function overviewRequests(count) {
+  let requests = 0;
+  while (count > 1) {
+    requests += Math.floor(count / OVERVIEW_GROUP_SIZE) + Number(count % OVERVIEW_GROUP_SIZE > 1);
+    count = Math.ceil(count / OVERVIEW_GROUP_SIZE);
+  }
+  return requests;
+}
+
 function noteKey(value) {
   return value.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
 }
@@ -114,9 +123,10 @@ export class OllamaSummarizer {
     return normalizeNotes(notes);
   }
 
-  async combineOverviews(parts, meta) {
+  async combineOverviews(parts, meta, onProgress) {
     let overviews = parts.map((part) => part.tldr.trim()).filter(Boolean);
     const language = summaryLanguageInstruction(meta.summaryLanguage);
+    onProgress?.({ stage: 'overview', total: overviewRequests(overviews.length) });
     while (overviews.length > 1) {
       const finalPass = overviews.length <= OVERVIEW_GROUP_SIZE;
       const extended = finalPass && this.overviewPrompt !== DEFAULT_OVERVIEW_PROMPT;
@@ -131,6 +141,7 @@ export class OllamaSummarizer {
         }
         const input = group.map((overview) => overview.slice(0, 600)).join('\n');
         const prompt = `${this.overviewPrompt}${language}\n\n${stage} Return only one plain-text paragraph, at most ${maxSentences} sentences, without a title or JSON.\n\n${input}`;
+        const started = performance.now();
         try {
           const reply = await this.chat(prompt, {
             options: { num_ctx: CONTEXT_TOKENS, num_predict: extended ? 650 : 360, temperature: 0.1 },
@@ -143,30 +154,38 @@ export class OllamaSummarizer {
           // The detailed notes can still be saved when overview generation fails.
           merged.push(conciseOverview(group.join(' '), maxSentences) || group[0]);
         }
+        onProgress?.({ durationMs: Math.round(performance.now() - started) });
       }
       overviews = merged;
     }
     return overviews[0] ?? '';
   }
 
-  async summarize(transcript, meta) {
+  async summarize(transcript, meta, { onProgress } = {}) {
     const instructions = `${summaryPrompt(meta)}${summaryLanguageInstruction(meta.summaryLanguage)}\n\nAttendees: ${(meta.attendees || []).join(', ')}`;
     if (transcript.length <= TRANSCRIPT_CHUNK_SIZE) {
-      return this.structuredNotes(`${instructions}\n\nTranscript:\n${transcript}`, 1800);
+      onProgress?.({ stage: 'chunks', total: 1, overviewTotal: 0 });
+      const started = performance.now();
+      const notes = await this.structuredNotes(`${instructions}\n\nTranscript:\n${transcript}`, 1800);
+      onProgress?.({ durationMs: Math.round(performance.now() - started) });
+      return notes;
     }
 
     // Keep each request inside the context window and retain the detailed notes
     // from every excerpt without asking the model to generate them a second time.
     const chunks = splitTranscript(transcript);
+    onProgress?.({ stage: 'chunks', total: chunks.length, overviewTotal: overviewRequests(chunks.length) });
     const parts = [];
     const concise = 'Keep each point short and use at most 3 topics, 3 decisions, 3 open questions, and 4 action items for this section.';
     for (const [index, chunk] of chunks.entries()) {
+      const started = performance.now();
       parts.push(await this.structuredNotes(
         `${instructions}\n\nExtract only information supported by this excerpt. ${concise}\n\nTranscript part ${index + 1} of ${chunks.length}:\n${chunk}`,
         1000,
       ));
+      onProgress?.({ durationMs: Math.round(performance.now() - started) });
     }
-    return combineNotes(parts, await this.combineOverviews(parts, meta));
+    return combineNotes(parts, await this.combineOverviews(parts, meta, onProgress));
   }
 
   async ask(prompt) {

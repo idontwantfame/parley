@@ -337,7 +337,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
     if (busy) return res.status(409).json({ error: busy });
     regeneration.start(id);
     res.status(202).json({ state: 'running' });
-    void regenerateSummary(db, id).then((result) => {
+    void regenerateSummary(db, id, { onProgress: (event) => regeneration.update(id, event) }).then((result) => {
       regeneration.finish(id, result.ok ? { state: 'done' } : { state: 'failed', error: result.reason });
     }).catch((error) => {
       console.error(`[summarizer] regeneration for meeting ${id} failed:`, error.message);
