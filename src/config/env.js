@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import dotenv from 'dotenv';
+import { resolveAuthSettings } from './auth-settings.js';
 const REQUIRED = ['DISCORD_TOKEN', 'DISCORD_CLIENT_ID'];
 export const DEFAULT_OLLAMA_URL = 'http://127.0.0.1:11434';
 export function resolveDataDir(env = process.env, exists = existsSync, cwd = process.cwd()) {
@@ -76,4 +77,7 @@ export const config = {
   openrouter: { apiKey: process.env.OPENROUTER_API_KEY, baseUrl: process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1' },
   ollama: { url: (process.env.OLLAMA_URL || DEFAULT_OLLAMA_URL).replace(/\/+$/, '') },
   ...resolveImportLimits(),
+  // Dashboard sign-in (SSO + password login). Replaced as a whole, never
+  // mutated, when the dashboard saves new settings (src/store/oidc-settings.js).
+  auth: resolveAuthSettings(),
 };

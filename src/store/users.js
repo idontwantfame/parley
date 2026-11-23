@@ -8,6 +8,8 @@
 // On first run a default `admin` / `admin` account is seeded so a fresh
 // self-hoster can log in immediately; the UI nudges them to change it. Admins
 // can add more users (email + password); any user can change their own password.
+// Accounts can also be linked to an OpenID Connect identity (issuer + subject,
+// see src/web/oidc.js); SSO-only accounts store an unusable password hash.
 
 import { createHash, randomBytes, scrypt, scryptSync, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
@@ -32,6 +34,11 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
 `;
+
+// Stored instead of a hash for accounts created by single sign-on. It is not a
+// `scrypt$…` value, so verifyPassword can never match it (not even '').
+const UNUSABLE_PASSWORD = '!sso';
+const PASSWORD_SCHEME = 'scrypt$';
 
 const SCRYPT_KEYLEN = 64;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -82,11 +89,25 @@ function hashLegacySessions(sql) {
   } catch (e) { sql.exec('ROLLBACK'); throw e; }
 }
 
-const PUBLIC_COLS = `id, username, email, is_admin AS isAdmin, must_change_password AS mustChangePassword, created_at AS createdAt`;
+// Adds the nullable SSO identity columns to an existing users table (rows are
+// untouched). SQLite treats NULLs as distinct, so the unique index only
+// constrains linked accounts: one local account per (issuer, subject).
+function migrateOidcColumns(sql) {
+  const cols = sql.prepare(`PRAGMA table_info(users)`).all().map((c) => c.name);
+  if (!cols.includes('oidc_issuer')) sql.exec(`ALTER TABLE users ADD COLUMN oidc_issuer TEXT`);
+  if (!cols.includes('oidc_subject')) sql.exec(`ALTER TABLE users ADD COLUMN oidc_subject TEXT`);
+  sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_oidc_identity ON users(oidc_issuer, oidc_subject)`);
+}
+
+const PUBLIC_COLS = `id, username, email, is_admin AS isAdmin, must_change_password AS mustChangePassword,
+  created_at AS createdAt, (oidc_subject IS NOT NULL) AS sso,
+  (substr(password_hash, 1, ${PASSWORD_SCHEME.length}) = '${PASSWORD_SCHEME}') AS hasPassword`;
 function publicUser(row) {
   if (!row) return null;
-  return { ...row, isAdmin: !!row.isAdmin, mustChangePassword: !!row.mustChangePassword };
+  return { ...row, isAdmin: !!row.isAdmin, mustChangePassword: !!row.mustChangePassword,
+    sso: !!row.sso, hasPassword: !!row.hasPassword };
 }
+const isUsableHash = (hash) => typeof hash === 'string' && hash.startsWith(PASSWORD_SCHEME);
 
 export function normalizeUsername(name) {
   return String(name ?? '').trim().toLowerCase();
@@ -97,6 +118,7 @@ export function normalizeUsername(name) {
 export function installUsers(db, { now = () => new Date().toISOString() } = {}) {
   const sql = db.sql;
   sql.exec(SCHEMA);
+  migrateOidcColumns(sql);
   hashLegacySessions(sql);
 
   const api = {
@@ -125,6 +147,46 @@ export function installUsers(db, { now = () => new Date().toISOString() } = {}) 
          VALUES (?, ?, ?, ?, ?, ?)`
       ).run(uname, email || null, hashPassword(password), isAdmin ? 1 : 0, mustChangePassword ? 1 : 0, now());
       return this.getUser(r.lastInsertRowid);
+    },
+    // Create an account for a first-time single sign-on user. It has no usable
+    // password (an admin may set one later). Throws on a duplicate username or
+    // an already-linked identity.
+    createSsoUser({ username, email = null, issuer, subject, isAdmin = false }) {
+      const uname = normalizeUsername(username);
+      if (!uname || uname.length > USERNAME_MAX) throw new Error('Invalid username.');
+      if (!issuer || !subject) throw new Error('An SSO identity is required.');
+      if (this.getUserByUsername(uname)) throw new Error('That username is already taken.');
+      const r = sql.prepare(
+        `INSERT INTO users (username, email, password_hash, is_admin, must_change_password, created_at, oidc_issuer, oidc_subject)
+         VALUES (?, ?, ?, ?, 0, ?, ?, ?)`
+      ).run(uname, email || null, UNUSABLE_PASSWORD, isAdmin ? 1 : 0, now(), issuer, subject);
+      return this.getUser(r.lastInsertRowid);
+    },
+    getUserByOidc(issuer, subject) {
+      if (!issuer || !subject) return null;
+      return publicUser(sql.prepare(`SELECT ${PUBLIC_COLS} FROM users WHERE oidc_issuer = ? AND oidc_subject = ?`)
+        .get(issuer, subject));
+    },
+    // The linked identity of an account, or null. Internal: never sent to clients.
+    oidcIdentity(userId) {
+      const row = sql.prepare(`SELECT oidc_issuer AS issuer, oidc_subject AS subject FROM users WHERE id = ?`).get(userId);
+      return row?.subject ? row : null;
+    },
+    // Link a local account to an SSO identity. The user must not be forced to
+    // set a password afterwards, so a pending forced change is lifted — and the
+    // temporary password it guarded (e.g. the seeded admin/admin) is retired
+    // rather than left usable without that gate. A real password is kept.
+    linkOidc(userId, issuer, subject) {
+      sql.prepare(`UPDATE users SET oidc_issuer = ?, oidc_subject = ?,
+          password_hash = CASE WHEN must_change_password = 1 THEN ? ELSE password_hash END,
+          must_change_password = 0
+        WHERE id = ?`).run(issuer, subject, UNUSABLE_PASSWORD, userId);
+      return this.getUser(userId);
+    },
+    findUsersByEmail(email) {
+      const value = String(email ?? '').trim();
+      if (!value) return [];
+      return sql.prepare(`SELECT ${PUBLIC_COLS} FROM users WHERE lower(email) = lower(?) ORDER BY id`).all(value).map(publicUser);
     },
     setPassword(userId, password) {
       if (!password) throw new Error('Password is required.');
@@ -162,12 +224,14 @@ export function installUsers(db, { now = () => new Date().toISOString() } = {}) 
 
     // ── Auth ────────────────────────────────────────────────────────────────
     // Verify credentials; resolves to the public user on success, else null.
+    // Accounts without a usable password (SSO-only) cost the same scrypt work as
+    // unknown names, so timing reveals neither.
     async authenticate(username, password) {
       const row = this.getUserByUsername(username);
-      const valid = await verifyPassword(password, row?.password_hash ?? getDummyHash());
-      if (!row || !valid) return null;
-      return publicUser({ id: row.id, username: row.username, email: row.email,
-        isAdmin: row.is_admin, mustChangePassword: row.must_change_password, createdAt: row.created_at });
+      const usable = isUsableHash(row?.password_hash);
+      const valid = await verifyPassword(password, usable ? row.password_hash : getDummyHash());
+      if (!row || !usable || !valid) return null;
+      return this.getUser(row.id);
     },
 
     // ── Sessions ──────────────────────────────────────────────────────────────
@@ -197,6 +261,12 @@ export function installUsers(db, { now = () => new Date().toISOString() } = {}) 
     },
     deleteUserSessions(userId) {
       sql.prepare(`DELETE FROM sessions WHERE user_id = ?`).run(userId);
+    },
+    // When password sign-in is switched off: end every session of accounts not
+    // linked to SSO (they could not sign in again anyway), except `keepUserId`.
+    revokePasswordOnlySessions(keepUserId = null) {
+      sql.prepare(`DELETE FROM sessions WHERE user_id IS NOT ?
+        AND user_id IN (SELECT id FROM users WHERE oidc_subject IS NULL)`).run(keepUserId);
     },
     purgeExpiredSessions() {
       // Real clock, matching how createSession computes expires_at.

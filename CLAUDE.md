@@ -30,6 +30,8 @@ Campaigns (src/campaign/): cross-session memory. A campaign groups meetings (mee
 
 Imports (src/pipeline/import.js, src/web/import-routes.js): admins upload a recording made outside Discord (raw request body, streamed to DATA_DIR/imports); ffmpeg converts it to the meeting's mixed.mp3 (+ mixed.json origin) and the sidecar transcribes it. Speaker detection is optional: the sidecar's `-full` image (WITH_DIARIZATION=1) runs WhisperX alignment + pyannote community-1 when HF_TOKEN is set (stt_sidecar/whisperx_backend.py, diarize.py); otherwise every line is "Speaker 1". Speakers get per-meeting ids `import-<meetingId>-<n>`, renamed via speaker_names. Transcript lines are sentence-level with epoch start_ms; the meeting page player seeks to start_ms - audioOriginMs.
 
+Dashboard SSO (OIDC, off by default): src/web/oidc*.js + auth-settings-routes.js, settings in src/config/auth-settings.js / src/store/oidc-settings.js (env OIDC_*, PUBLIC_URL, PASSWORD_LOGIN; dashboard writes .env via persistEnv). Uses openid-client v6 (code flow + PKCE); identity = users.(oidc_issuer, oidc_subject); link by verified email only; optional admin-group sync never demotes the last admin; password login can't be turned off unless the acting admin is SSO-linked, and only takes effect once an admin SSO sign-in has verified the current settings fingerprint (OIDC_VERIFIED in .env; any provider/URL/group change clears it). Recovery: PASSWORD_LOGIN=true + restart.
+
 Slash commands: /join /leave /summary /history /search /ask /recap /journal /campaign /setup (src/commands/). Auto-join when >1 human, auto-leave when ≤1 (src/voice/decisions.js).
 
 ## Key conventions / gotchas

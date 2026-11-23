@@ -17,16 +17,21 @@ export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [authEnabled, setAuthEnabled] = useState(true);
   const [defaultPasswordActive, setDefaultPasswordActive] = useState(false);
+  // Sign-in methods the server offers: single sign-on (OIDC) and passwords.
+  const [sso, setSso] = useState({ enabled: false, label: '' });
+  const [passwordLogin, setPasswordLogin] = useState(true);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      const { user, authEnabled: enabled, defaultPasswordActive: dpa } = await api.me();
+      const { user, authEnabled: enabled, defaultPasswordActive: dpa, sso: ssoInfo, passwordLogin: pw } = await api.me();
       // `authEnabled` is sent by auth-aware servers; default true when present.
       setAuthEnabled(enabled !== false);
       setDefaultPasswordActive(!!dpa);
+      setSso({ enabled: Boolean(ssoInfo?.enabled), label: ssoInfo?.label || 'Sign in with SSO' });
+      setPasswordLogin(pw !== false);
       setUser(user || null);
       return user || null;
     } catch (e) {
@@ -81,8 +86,8 @@ export function AuthProvider({ children }) {
   }, []);
 
   const value = useMemo(
-    () => ({ user, authEnabled, defaultPasswordActive, loading, error, refresh, retry, login, logout }),
-    [user, authEnabled, defaultPasswordActive, loading, error, refresh, retry, login, logout],
+    () => ({ user, authEnabled, defaultPasswordActive, sso, passwordLogin, loading, error, refresh, retry, login, logout }),
+    [user, authEnabled, defaultPasswordActive, sso, passwordLogin, loading, error, refresh, retry, login, logout],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

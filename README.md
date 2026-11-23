@@ -102,6 +102,7 @@ A fully self-hosted alternative to Otter/Fathom/Fireflies, built for Discord. Au
 - [Supported summarizers](#-supported-summarizers)
 - [Importing recordings](#-importing-recordings)
 - [Privacy & consent](#-privacy--consent)
+- [Single sign-on (OIDC)](#-single-sign-on-oidc)
 - [Development](#-development)
 - [Contributing](#-contributing)
 - [License](#-license)
@@ -530,6 +531,30 @@ passwords are scrypt-hashed (8-char minimum) in SQLite, and destructive/system
 operations require an admin account. Still, add TLS via a reverse proxy before
 exposing it beyond localhost. It never returns API keys or the Discord token to
 the browser — those stay in `.env` and only their "is it set?" status is shown.
+
+## 🔐 Single sign-on (OIDC)
+
+The dashboard can let people sign in with your identity provider over OpenID Connect. It's **off by default** and built for [Authentik](https://goauthentik.io), but any standards-compliant provider works (Keycloak, Authelia, Pocket ID, Google…). Configure it in **Account → Single sign-on** (admins) or with the `OIDC_*` variables in `.env.example`; the dashboard writes its changes to `.env` and applies them live.
+
+**Authentik setup**
+
+1. In Authentik, create an **OAuth2/OpenID Provider**: client type **Confidential**, and pick a **Signing Key** (e.g. the built-in self-signed certificate). Without a signing key Authentik signs tokens with HS256, which Parley refuses.
+2. Set its redirect URI (strict) to `https://<your dashboard>/api/auth/oidc/callback` — Account → Single sign-on shows the exact value to copy once the dashboard URL is set.
+3. Create an **Application** for that provider and bind it to the groups that may use Parley. That's the access control: whoever Authentik lets into the application can sign in.
+4. In Parley, enable single sign-on and enter the dashboard URL, the issuer `https://<authentik host>/application/o/<app slug>/` (keep the trailing slash), the client ID and the client secret. Parley checks the connection before saving.
+
+**Who gets in, and who's an admin**
+
+- Accounts are created on first sign-in (turn off **Create accounts on first sign-in** to allow only existing accounts). An existing Parley account is linked when the provider reports the same email as **verified**.
+- **Allowed groups** (optional) adds a second check on top of the application binding.
+- **Admin group** (optional, e.g. `parley-admins`): its members become admins and others lose admin rights, re-checked at every sign-in — the last remaining admin is never demoted automatically. Leave it empty to manage admins by hand on the Account page.
+- Authentik's default `profile` scope puts a `groups` claim (group names) in the token; other providers may need a groups scope or claim mapping (**Scopes** and **Groups claim** settings).
+
+**Password sign-in** stays on by default. You can switch it off only from an SSO-linked admin account, and it actually turns off only after an admin has signed in with single sign-on using the current settings; changing the provider, URLs or group settings puts it back on until someone confirms them again. So a typo can't lock everyone out. Switching it off ends existing password sessions (except yours). If your provider goes down later, set `PASSWORD_LOGIN=true` in `.env` and restart Parley to get password sign-in back. Signing out of Parley doesn't sign you out of your provider.
+
+Behind a reverse proxy or Docker's port mapping, set `TRUSTED_PROXY` (see `docker-compose.yml`) so Parley sees each visitor's real address — otherwise everyone shares one sign-in rate limit (20 sign-in starts per 10 minutes per address).
+
+An `http://` issuer is accepted for providers on your LAN, but use HTTPS whenever the provider is reachable from outside: tokens and the client secret travel over that connection.
 
 ## 🛠️ Development
 

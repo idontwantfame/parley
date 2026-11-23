@@ -4,8 +4,11 @@
 // `sessions` table (see src/store/users.js).
 //
 //   • requireAuth(users)        — Express middleware; 401s unauthenticated calls
-//   • authRouter({ users })     — /api/auth/* (login, logout, me, password) +
+//   • authRouter({ users, oidc }) — /api/auth/* (login, logout, me, password) +
 //                                  /api/users (admin CRUD)
+//
+// Single sign-on (OpenID Connect) lives in oidc.js / oidc-service.js; this file
+// only asks the service whether password login is allowed and what to show.
 //
 // The web server binds localhost by default, but auth makes the dashboard safe
 // to expose (e.g. behind a reverse proxy / Docker port map).
@@ -13,45 +16,26 @@
 import { createHash } from 'node:crypto';
 import { Router } from 'express';
 import { USERNAME_MAX } from '../store/users.js';
+import { AUTH_DEFAULTS } from '../config/auth-settings.js';
+import { isHttpsUrl } from '../store/oidc-settings.js';
+import { readCookie, SESSION_COOKIE, setSessionCookie, clearSessionCookie } from './cookies.js';
 
-const COOKIE = 'parley_session';
 // Minimum password length, enforced on every set/change/reset path. Kept modest
 // for a self-hosted tool but well above the old 4-char floor.
 export const PASSWORD_MIN = 8;
 
-// Minimal cookie parser — we only need our one session cookie, so no dep.
-function readCookie(req, name) {
-  const header = req.headers?.cookie;
-  if (!header) return null;
-  for (const part of header.split(';')) {
-    const idx = part.indexOf('=');
-    if (idx === -1) continue;
-    if (part.slice(0, idx).trim() !== name) continue;
-    // A malformed escape is a bad cookie, not a server error: treat as absent.
-    try { return decodeURIComponent(part.slice(idx + 1).trim()); } catch { return null; }
-  }
-  return null;
-}
+export const PASSWORD_LOGIN_OFF_ERROR = 'Password sign-in is turned off. Use single sign-on.';
+export const SSO_ONLY_ACCOUNT_ERROR = 'This account signs in with SSO.';
 
-function setSessionCookie(res, token, expiresAt, secure) {
-  const attrs = [
-    `${COOKIE}=${token}`,
-    'Path=/',
-    'HttpOnly',
-    'SameSite=Lax',
-    `Expires=${new Date(expiresAt).toUTCString()}`,
-  ];
-  // Secure only over https (so localhost http dev still works). Express sets
-  // req.secure from the connection / X-Forwarded-Proto when trust proxy is on.
-  if (secure) attrs.push('Secure');
-  res.append('Set-Cookie', attrs.join('; '));
-}
-
-function clearSessionCookie(res, secure) {
-  const attrs = [`${COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', `Expires=${new Date(0).toUTCString()}`];
-  if (secure) attrs.push('Secure'); // mirror setSessionCookie so browsers match the cookie
-  res.append('Set-Cookie', attrs.join('; '));
-}
+// Stand-in for the OIDC service (src/web/oidc-service.js) when none is wired
+// in: SSO off, password login on — exactly the pre-SSO behaviour.
+const SSO_OFF = Object.freeze({
+  settings: () => AUTH_DEFAULTS,
+  ready: () => false,
+  ensure: async () => null,
+  passwordLoginEnabled: () => true,
+  publicInfo: () => ({ enabled: false, label: AUTH_DEFAULTS.label }),
+});
 
 // In-memory login rate limiter — no dep, resets on process restart (fine: its
 // job is to blunt online brute force, not to be a durable audit log). Keyed by
@@ -121,7 +105,7 @@ export function createLoginLimiter({
 // so optional routes can read the user too.
 export function attachUser(users) {
   return (req, _res, next) => {
-    const token = readCookie(req, COOKIE);
+    const token = readCookie(req, SESSION_COOKIE);
     req.sessionToken = token ?? null;
     req.authResolved = true; // marks that the auth stack ran (see requireAdmin)
     req.user = token ? users.getSessionUser(token) : null;
@@ -187,11 +171,16 @@ export function sameOrigin(req, res, next) {
   next();
 }
 
-export function authRouter({ users, now = () => Date.now(), loginLimiter = createLoginLimiter({ now }) }) {
+export function authRouter({ users, oidc = SSO_OFF, now = () => Date.now(), loginLimiter = createLoginLimiter({ now }) }) {
   const r = Router();
+  // Secure cookies over https, and whenever the public URL is https (a TLS
+  // proxy that does not send X-Forwarded-Proto must not get plain cookies).
+  const secure = (req) => req.secure || isHttpsUrl(oidc.settings().publicUrl);
 
   // ── Session ────────────────────────────────────────────────────────────────
   r.post('/auth/login', async (req, res) => {
+    // PASSWORD_LOGIN=false only bites while SSO actually works (see oidc-service).
+    if (!oidc.passwordLoginEnabled()) return res.status(403).json({ error: PASSWORD_LOGIN_OFF_ERROR });
     const username = String(req.body?.username ?? '').trim();
     const password = String(req.body?.password ?? '');
     if (!username || !password) return res.status(400).json({ error: 'Username and password are required.' });
@@ -212,13 +201,13 @@ export function authRouter({ users, now = () => Date.now(), loginLimiter = creat
     if (!user) return res.status(401).json({ error: 'Invalid username or password.' });
     loginLimiter.reset(limitKey);
     const { token, expiresAt } = users.createSession(user.id);
-    setSessionCookie(res, token, expiresAt, req.secure);
+    setSessionCookie(res, token, expiresAt, secure(req));
     res.json({ ok: true, user });
   });
 
   r.post('/auth/logout', (req, res) => {
     if (req.sessionToken) users.deleteSession(req.sessionToken);
-    clearSessionCookie(res, req.secure);
+    clearSessionCookie(res, secure(req));
     res.json({ ok: true });
   });
 
@@ -227,11 +216,18 @@ export function authRouter({ users, now = () => Date.now(), loginLimiter = creat
   // servers without this route make the client fall back to open mode).
   // `defaultPasswordActive` lets the login screen show the admin/admin hint only
   // while it's actually true, instead of advertising it to every visitor.
+  // `sso` drives the "Sign in with SSO" button (enabled only once the provider
+  // was discovered) and `passwordLogin` whether the password form is shown.
   r.get('/auth/me', (req, res) => {
+    // Not awaited: a provider that was down at boot gets retried in the
+    // background (throttled inside the service) so the button appears later.
+    if (!oidc.ready()) oidc.ensure().catch(() => {});
     res.json({
       authEnabled: true,
       user: req.user || null,
       defaultPasswordActive: users.defaultPasswordActive ? users.defaultPasswordActive() : undefined,
+      sso: oidc.publicInfo(),
+      passwordLogin: oidc.passwordLoginEnabled(),
     });
   });
 
@@ -241,6 +237,10 @@ export function authRouter({ users, now = () => Date.now(), loginLimiter = creat
   // is the response to a suspected compromise) and the current request gets a
   // fresh session cookie so the user stays logged in here.
   r.post('/auth/password', requireAuth(users), async (req, res) => {
+    // With password sign-in off, accounts without SSO cannot use passwords at all.
+    if (!oidc.passwordLoginEnabled() && !req.user.sso) return res.status(403).json({ error: PASSWORD_LOGIN_OFF_ERROR });
+    // SSO-only accounts have no password to change (an admin can set one).
+    if (req.user.hasPassword === false) return res.status(400).json({ error: SSO_ONLY_ACCOUNT_ERROR });
     const current = String(req.body?.currentPassword ?? '');
     const next = String(req.body?.newPassword ?? '');
     if (next.length < PASSWORD_MIN) {
@@ -256,7 +256,7 @@ export function authRouter({ users, now = () => Date.now(), loginLimiter = creat
     users.setPassword(req.user.id, next);
     users.deleteUserSessions(req.user.id); // revoke all sessions, including this one
     const { token, expiresAt } = users.createSession(req.user.id); // re-issue for the current request
-    setSessionCookie(res, token, expiresAt, req.secure);
+    setSessionCookie(res, token, expiresAt, secure(req));
     res.json({ ok: true, user: users.getUser(req.user.id) });
   });
 

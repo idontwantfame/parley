@@ -7,6 +7,8 @@ import { apiRouter } from './api.js';
 import { IMPORT_REQUEST_TIMEOUT_MS } from './import-routes.js';
 import { installUsers } from '../store/users.js';
 import { authRouter, attachUser, requireAuth, requirePasswordChanged, sameOrigin } from './auth.js';
+import { oidcRouter } from './oidc.js';
+import { createOidcService } from './oidc-service.js';
 
 const DIST = join(dirname(fileURLToPath(import.meta.url)), '../../web/dist');
 // Expired login sessions are also purged on every login; this catches idle instances.
@@ -35,7 +37,15 @@ export function jsonErrorHandler(log = console) {
   };
 }
 
-export function createWebServer({ db, bot = null, client = null, sidecar = null, users = installUsers(db) }) {
+// Password sign-in can also go off through a restart (e.g. PASSWORD_LOGIN=false
+// written back after the PASSWORD_LOGIN=true recovery). Accounts without SSO
+// cannot sign in again, so their leftover sessions end now, as they would on a
+// live switch-off (auth-settings-routes.js / oidc.js).
+function endPasswordOnlySessionsIfOff(users, oidc) {
+  if (!oidc.passwordLoginEnabled()) users.revokePasswordOnlySessions();
+}
+
+export function createWebServer({ db, bot = null, client = null, sidecar = null, users = installUsers(db), oidc = createOidcService() }) {
   const app = express();
   // Trust only the loopback proxy so req.secure / req.ip reflect a *local*
   // reverse proxy's X-Forwarded-* headers. Trusting every hop (`true`) let any
@@ -50,10 +60,14 @@ export function createWebServer({ db, bot = null, client = null, sidecar = null,
   // and mounted first; everything else under /api needs a session, a same-origin
   // request (CSRF guard), and an account that has moved off the default password.
   // The /users admin routes inside authRouter apply the password gate themselves.
+  // The SSO routes (/auth/oidc/login + /callback) are public GETs, so neither
+  // the same-origin guard nor the session gate stands in their way.
+  endPasswordOnlySessionsIfOff(users, oidc);
   app.use(attachUser(users));
   app.use('/api', sameOrigin);
-  app.use('/api', authRouter({ users }));
-  app.use('/api', requireAuth(users), requirePasswordChanged(users), apiRouter({ db, bot, client, sidecar }));
+  app.use('/api', authRouter({ users, oidc }));
+  app.use('/api', oidcRouter({ users, oidc }));
+  app.use('/api', requireAuth(users), requirePasswordChanged(users), apiRouter({ db, bot, client, sidecar, oidc, users }));
 
   if (existsSync(DIST)) {
     app.use(express.static(DIST));
@@ -69,7 +83,10 @@ const FALLBACK_ATTEMPTS = 10;
 export async function startWebServer({ db, bot = null, client = null, sidecar = null, port = 3000, host = process.env.WEB_UI_HOST || '127.0.0.1', maxAttempts = FALLBACK_ATTEMPTS }) {
   db.backfillTodos();
   const users = installUsers(db);
-  const app = createWebServer({ db, bot, client, sidecar, users });
+  const oidc = createOidcService();
+  // Connect to the identity provider in the background (never blocks boot).
+  oidc.start().catch((e) => console.warn('[oidc] startup check failed:', e.message));
+  const app = createWebServer({ db, bot, client, sidecar, users, oidc });
   const server = await listenWithFallback(app, port, host, maxAttempts);
   // Recording imports stream large request bodies (see import-routes.js).
   server.requestTimeout = IMPORT_REQUEST_TIMEOUT_MS;

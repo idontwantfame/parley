@@ -90,7 +90,7 @@ export function upsertEnvLine(text, key, value) {
 // would write extra KEY=value lines into the file, letting an attacker set
 // arbitrary env vars (e.g. redirect OPENAI_BASE_URL to exfiltrate the real key).
 // Reject rather than silently strip so the caller sees the bad input.
-function assertEnvSafe(value) {
+export function assertEnvSafe(value) {
   if (/[\r\n\x00-\x1f]/.test(value)) {
     throw new Error('Value contains illegal control characters.');
   }
@@ -113,7 +113,7 @@ function normalizeHost(hostname) {
   return [hi >> 8, hi & 255, lo >> 8, lo & 255].join('.');
 }
 
-function isBlockedHost(hostname) {
+export function isBlockedHost(hostname) {
   const host = normalizeHost(hostname);
   if (host === 'metadata.google.internal' || host === '0.0.0.0' || host === '::') return true;
   if (isIP(host) === 4) return /^169\.254\./.test(host); // IPv4 link-local + cloud metadata
@@ -180,7 +180,7 @@ async function writeEnvFile(envPath, text) {
 
 /** Persist [[KEY, value], ...] to the env file in one write (creating it if needed). */
 const pendingWrites = new Map();
-async function persistEnv(entries, envPath) {
+export async function persistEnv(entries, envPath) {
   const previous = pendingWrites.get(envPath) ?? Promise.resolve();
   const write = previous.catch(() => {}).then(async () => {
     const existing = existsSync(envPath) ? await readFile(envPath, 'utf8') : '';

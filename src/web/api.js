@@ -33,6 +33,7 @@ import {
 } from './api-input.js';
 import { mountCampaignRoutes } from './campaign-routes.js';
 import { mountImportRoutes } from './import-routes.js';
+import { mountAuthSettingsRoutes } from './auth-settings-routes.js';
 
 function audioDir(id) {
   return join(env.dataDir, 'audio', String(id));
@@ -63,7 +64,7 @@ const artifactDirs = () => ({ dataDir: env.dataDir, exportDir: env.exportDir });
 // A Discord user id, or a speaker of an imported recording (import-<meeting>-<n>).
 const SPEAKER_ID = /^(?:[1-9]\d{16,19}|import-[1-9]\d{0,15}-\d{1,3})$/;
 
-export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAudio = ensureMixedWav, imports = {} }) {
+export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAudio = ensureMixedWav, imports = {}, oidc = null, users = null }) {
   const r = Router();
   // Meeting ids with a summary regeneration in flight (guards double-submits).
   const regeneration = new Map();
@@ -687,6 +688,9 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
   });
 
   mountCampaignRoutes(r, { db, liveClient });
+  // Sign-in settings (SSO + password login); the server always passes the OIDC
+  // service, a bare apiRouter (tests) simply has no such routes.
+  if (oidc) mountAuthSettingsRoutes(r, { oidc, users });
   // `imports` overrides the import routes' sidecar check, runner and limits (tests).
   mountImportRoutes(r, { db, liveClient, ...imports });
 

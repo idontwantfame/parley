@@ -120,6 +120,10 @@ export const api = {
 
   // ── Auth ──────────────────────────────────────────────────────────────────
   me: () => fetch('/api/auth/me').then(json),
+  // Full-page navigation target that starts single sign-on (not fetched).
+  ssoLoginUrl: (returnTo = '/') => `/api/auth/oidc/login?returnTo=${encodeURIComponent(returnTo)}`,
+  authSettings: () => fetch('/api/system/auth').then(json),
+  saveAuthSettings: (patch) => fetch('/api/system/auth', jsonBody('PUT', patch)).then(json),
   login: (username, password) => fetch('/api/auth/login', jsonBody('POST', { username, password })).then(json),
   logout: () => fetch('/api/auth/logout', { method: 'POST' }).then(json),
   changePassword: (currentPassword, newPassword) =>

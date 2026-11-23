@@ -4,6 +4,7 @@ import Field from '../components/Field.jsx';
 import { useAuth } from '../AuthContext.jsx';
 import { Page, PageHead } from '../components/Page.jsx';
 import { Avatar, Icon, Empty } from '../components/ui.jsx';
+import SsoSettings from '../components/SsoSettings.jsx';
 
 function Card({ title, desc, children, action }) {
   return (
@@ -47,6 +48,14 @@ function PasswordCard({ user, onChanged }) {
     } finally {
       setBusy(false);
     }
+  }
+
+  if (user?.sso && !user?.hasPassword) {
+    return (
+      <Card title="Your password" desc="You sign in with single sign-on, so this account has no password to change.">
+        <p className="text-sm text-muted">Manage your password with your identity provider.</p>
+      </Card>
+    );
   }
 
   return (
@@ -153,6 +162,7 @@ function UserRow({ u, me, onChanged }) {
           <div className="flex items-center gap-2">
             <span className="text-sm font-semibold text-ink truncate">{u.username}</span>
             {u.isAdmin && <span className="chip !bg-primary-soft !text-primary"><Icon.Shield width={11} height={11} />Admin</span>}
+            {u.sso && <span className="chip" title="Signs in with single sign-on">SSO</span>}
             {u.id === me?.id && <span className="text-[11px] text-muted">you</span>}
           </div>
           {u.email && <p className="text-xs text-muted truncate">{u.email}</p>}
@@ -208,10 +218,11 @@ export default function Account() {
   const { user, refresh } = useAuth();
   return (
     <Page max="720px">
-      <PageHead title="Account" subtitle="Your login and, for admins, who else can access Parley." />
+      <PageHead title="Account" subtitle="Your login and, for admins, who can access Parley and how they sign in." />
       <div className="space-y-5">
         <PasswordCard user={user} onChanged={refresh} />
         {user?.isAdmin && <UsersCard me={user} />}
+        {user?.isAdmin && <SsoSettings Card={Card} />}
       </div>
     </Page>
   );
