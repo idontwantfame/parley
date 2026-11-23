@@ -191,3 +191,41 @@ test('transcribeTracks sends the capped vocabulary hint to the STT provider', as
   assert.ok(seen[0].length <= VOCABULARY_HINT_MAX_CHARS);
   assert.ok(seen[0].startsWith('Name0, Name1'));
 });
+
+test('a track is uploaded as WAV straight from its PCM file, with no WAV copy written to disk', async (t) => {
+  const { createServer } = await import('node:http');
+  const { mkdtempSync, readdirSync, rmSync, writeFileSync, existsSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'parley-wavless-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const pcmPath = join(dir, 'u1_1000.pcm');
+  writeFileSync(pcmPath, Buffer.alloc(3200, 7));
+  let body = Buffer.alloc(0);
+  let filesDuringUpload = null;
+  const server = createServer((req, res) => {
+    filesDuringUpload = readdirSync(dir);
+    req.on('data', (chunk) => { body = Buffer.concat([body, chunk]); });
+    req.on('end', () => {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ text: 'hi', words: [{ word: ' hi', start: 0, end: 0.1 }] }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+
+  const { utterances, failures } = await transcribeTracks(
+    [{ userId: 'u1', displayName: 'Al', startMs: 1000, pcmPath }], {},
+    { env: { sttUrl: `http://127.0.0.1:${server.address().port}` } });
+
+  assert.deepEqual(failures, []);
+  assert.equal(utterances.length, 1);
+  assert.deepEqual(filesDuringUpload, ['u1_1000.pcm'], 'no WAV copy on disk');
+  const text = body.toString('latin1');
+  assert.match(text, /filename="u1_1000\.wav"/);
+  const riff = body.indexOf('RIFF');
+  assert.ok(riff > 0);
+  assert.equal(body.readUInt32LE(riff + 40), 3200, 'WAV data length is the PCM size');
+  assert.equal(body.subarray(riff + 44, riff + 44 + 3200).every((b) => b === 7), true);
+  assert.ok(existsSync(pcmPath), 'the PCM is kept');
+});

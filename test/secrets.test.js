@@ -6,7 +6,9 @@ import { parseEnv } from 'node:util';
 import dotenv from 'dotenv';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { upsertEnvLine, setProviderKey, secretStatus, isSecretProvider, connectionStatus, setConnection, redactUrl } from '../src/store/secrets.js';
+import {
+  upsertEnvLine, setProviderKey, secretStatus, isSecretProvider, connectionStatus, setConnection, redactUrl, resolvesToBlockedHost,
+} from '../src/store/secrets.js';
 
 test('upsertEnvLine replaces an existing key in place', () => {
   const text = 'A=1\nGEMINI_API_KEY=old\nB=2\n';
@@ -75,7 +77,7 @@ test('setConnection applies live + persists, ignoring unknown keys', async () =>
 
   const status = await setConnection(
     { discordToken: '  tok  ', discordClientId: '999', sttUrl: 'http://sidecar:8000', bogus: 'nope' },
-    { env, envPath },
+    { env, envPath, lookup: async () => [{ address: '172.18.0.2', family: 4 }] },
   );
   assert.equal(env.discordToken, 'tok');          // trimmed + live
   assert.equal(env.discordClientId, '999');
@@ -106,7 +108,7 @@ test('Ollama URL updates live and persists a normalized LAN base URL', async (t)
   const envPath = join(dir, '.env');
   const env = { ollama: { url: 'http://127.0.0.1:11434' } };
   await assert.rejects(() => setConnection({ ollamaUrl: 'http://user:password@ollama:11434' }, { env, envPath }), /without credentials/);
-  const next = await setConnection({ ollamaUrl: 'http://ollama:11434/' }, { env, envPath });
+  const next = await setConnection({ ollamaUrl: 'http://ollama:11434/' }, { env, envPath, lookup: async () => [{ address: '172.18.0.3', family: 4 }] });
   assert.equal(next.ollamaUrl.value, 'http://ollama:11434');
   assert.equal(env.ollama.url, 'http://ollama:11434');
   assert.match(readFileSync(envPath, 'utf8'), /^OLLAMA_URL=http:\/\/ollama:11434$/m);
@@ -243,4 +245,58 @@ test('connectionStatus redacts credentials in a legacy STT URL', () => {
   assert.equal(s.sttUrl.value.includes('secret'), false);
   assert.equal(redactUrl('http://user:secret@sidecar:8000/'), 'http://sidecar:8000/');
   assert.equal(redactUrl('not a url'), 'not a url');
+});
+
+// A resolver that answers every name with `address`.
+const resolvingTo = (address) => async () => [{ address, family: address.includes(':') ? 6 : 4 }];
+
+test('an STT or Ollama URL whose name resolves to a blocked address is refused', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'parley-dns-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const envPath = join(dir, '.env');
+  writeFileSync(envPath, 'STT_URL=http://old:8000\n');
+  const env = { sttUrl: 'http://old:8000', ollama: { url: 'http://127.0.0.1:11434' } };
+  const metadata = resolvingTo('169.254.169.254');
+  await assert.rejects(setConnection({ sttUrl: 'http://rebind.example:8000' }, { env, envPath, lookup: metadata }), /blocked address/);
+  await assert.rejects(setConnection({ ollamaUrl: 'http://rebind.example:11434' }, { env, envPath, lookup: resolvingTo('fe80::1') }), /blocked address/);
+  assert.equal(env.sttUrl, 'http://old:8000');
+  assert.equal(readFileSync(envPath, 'utf8'), 'STT_URL=http://old:8000\n');
+
+  await setConnection({ sttUrl: 'http://stt.lan:8000', ollamaUrl: 'http://ollama.lan:11434' }, { env, envPath, lookup: resolvingTo('10.0.0.5') });
+  assert.equal(env.sttUrl, 'http://stt.lan:8000');
+  assert.equal(env.ollama.url, 'http://ollama.lan:11434');
+});
+
+test('a name that does not resolve (yet) can still be saved', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'parley-dns2-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const env = { sttUrl: undefined };
+  const notFound = async () => { throw Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }); };
+  await setConnection({ sttUrl: 'http://stt:8000' }, { env, envPath: join(dir, '.env'), lookup: notFound });
+  assert.equal(env.sttUrl, 'http://stt:8000');
+});
+
+test('resolvesToBlockedHost checks literal addresses and every resolved address', async () => {
+  assert.equal(await resolvesToBlockedHost('169.254.169.254', async () => assert.fail('no lookup for a literal')), true);
+  assert.equal(await resolvesToBlockedHost('10.1.2.3', async () => assert.fail('no lookup for a literal')), false);
+  const mixed = async () => [{ address: '10.0.0.1', family: 4 }, { address: '169.254.1.1', family: 4 }];
+  assert.equal(await resolvesToBlockedHost('two.example', mixed), true);
+});
+
+test('the sidecar access key is write-only: set, reported only as present, and cleared by an empty value', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'parley-sttkey-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const envPath = join(dir, '.env');
+  writeFileSync(envPath, 'DISCORD_TOKEN=x\n');
+  const env = { sttApiKey: undefined };
+  const set = await setConnection({ sttApiKey: '  k3y-value  ' }, { env, envPath });
+  assert.equal(env.sttApiKey, 'k3y-value');
+  assert.equal(set.sttApiKeySet, true);
+  assert.equal(JSON.stringify(set).includes('k3y-value'), false, 'never returned');
+  assert.match(readFileSync(envPath, 'utf8'), /^STT_API_KEY=k3y-value$/m);
+  const cleared = await setConnection({ sttApiKey: '' }, { env, envPath });
+  assert.equal(env.sttApiKey, undefined);
+  assert.equal(cleared.sttApiKeySet, false);
+  assert.doesNotMatch(readFileSync(envPath, 'utf8'), /STT_API_KEY/);
+  assert.equal(connectionStatus({}).sttApiKeySet, false);
 });

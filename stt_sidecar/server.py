@@ -1,13 +1,32 @@
-import ctypes, glob, logging, os, re, shutil, sysconfig, tempfile, threading
+import ctypes, glob, logging, os, re, sysconfig, threading, time
+from dataclasses import dataclass
+from typing import Annotated, BinaryIO, Optional
 
+import anyio.from_thread
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from typing import Annotated, Optional
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 
 import diarize as diarization
+from request_guard import GuardLimits, RequestGuard, too_large_detail
 from speaker_transcript import build_response
 
 log = logging.getLogger("stt_sidecar")
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    """A whole-number setting; unset or unreadable means `default`, too small is raised to `minimum`."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("%s=%r is not a whole number; using %d", name, raw, default)
+        return default
+    if value < minimum:
+        log.warning("%s=%d is below %d; using %d", name, value, minimum, minimum)
+    return max(minimum, value)
+
 
 # Device selection (audit B2): STT_DEVICE=auto tries cuda/float16 first and falls
 # back to cpu/int8 on any init failure. Explicit values are used as-is.
@@ -19,10 +38,25 @@ STT_COMPUTE = os.environ.get("STT_COMPUTE", "auto")
 # size defaults per device; STT_BATCH_SIZE overrides, STT_BATCH_SIZE=0 disables.
 _env_batch = os.environ.get("STT_BATCH_SIZE")
 STT_BATCH_SIZE = int(_env_batch) if (_env_batch not in (None, "")) else None
+GPU_BATCH_SIZE, CPU_BATCH_SIZE = 8, 4
 # Transcriptions running at once. FastAPI's threadpool would otherwise run ~40
 # in parallel on one CPU/GPU: no faster overall, but each holds its audio and
 # decoder state (and possibly a different model), which can exhaust memory.
-STT_MAX_CONCURRENCY = max(1, int(os.environ.get("STT_MAX_CONCURRENCY") or 2))
+STT_MAX_CONCURRENCY = _env_int("STT_MAX_CONCURRENCY", 2, minimum=1)
+# Requests allowed to wait (uploading or queued) beyond the running ones; more
+# get an immediate 503 "busy" instead of tying up a worker thread each.
+STT_MAX_QUEUE = _env_int("STT_MAX_QUEUE", 8, minimum=0)
+# Largest accepted upload: 2 GiB, the bot's own IMPORT_MAX_BYTES default.
+STT_MAX_UPLOAD_BYTES = _env_int("STT_MAX_UPLOAD_BYTES", 2 * 1024 ** 3, minimum=1)
+# Longest recording speaker detection takes: its decoded audio (~0.23 GB per
+# hour as float32) and the labelling models' working memory grow with length.
+STT_MAX_DIARIZE_SECONDS = _env_int("STT_MAX_DIARIZE_SECONDS", 6 * 3600, minimum=1)
+# Optional shared secret: when set, every endpoint but /health needs
+# "Authorization: Bearer <STT_API_KEY>" (see request_guard.py).
+STT_API_KEY = os.environ.get("STT_API_KEY", "").strip()
+# How often a running transcription asks whether its client is still there.
+DISCONNECT_POLL_SECONDS = 2.0
+CLIENT_CLOSED_REQUEST = 499  # nginx's convention; the client never reads it
 
 
 def _preload_cuda_libs():
@@ -55,29 +89,69 @@ if STT_DEVICE in ("auto", "cuda"):
 
 from faster_whisper import WhisperModel, BatchedInferencePipeline, available_models, decode_audio  # noqa: E402 (must follow lib preload above)
 
+
+def _guard_limits() -> GuardLimits:
+    """Read per request, so the module settings above stay the single source."""
+    return GuardLimits(api_key=STT_API_KEY, max_upload_bytes=STT_MAX_UPLOAD_BYTES,
+                       max_in_flight=STT_MAX_CONCURRENCY + STT_MAX_QUEUE)
+
+
 app = FastAPI()
+app.add_middleware(RequestGuard, limits=_guard_limits)
 _state = {"model": None, "model_name": None, "device": None, "compute": None, "batched": None, "batched_for": None}
 # One model load/swap at a time: concurrent cold requests used to each build a
 # WhisperModel (2x RAM or more) and race on _state.
 _model_lock = threading.Lock()
 _inference_slots = threading.BoundedSemaphore(STT_MAX_CONCURRENCY)
+# One speaker-detection request at a time, from decoding to labelling, so two
+# long recordings are never decoded (or labelled) side by side. Always taken
+# before an inference slot.
+_labelling_slot = threading.Lock()
 # Only faster-whisper's own model names: anything else would be fetched from
 # the Hugging Face Hub (or opened as a local path) on the client's say-so.
 KNOWN_MODELS = frozenset(available_models())
 _LANGUAGE_CODE = re.compile(r"^[a-z]{2,3}$")
-# Whisper's (and the diarizer's) input rate: diarized uploads are decoded once
-# to 16 kHz mono and the same samples go to both.
+# Whisper's (and the diarizer's) input rate: uploads are decoded once to
+# 16 kHz mono and the same samples go to every stage.
 SAMPLE_RATE = 16000
 MIN_SPEAKERS, MAX_SPEAKERS = 1, 20
 DIARIZATION_UNAVAILABLE = "Speaker detection is not enabled on this sidecar: "
+NOT_AUDIO = "The uploaded file isn't audio this sidecar can read."
 
 
-def _resolve_batch_size():
-    """Effective batch size: explicit env wins; else per-device default (GPU can
-    hold a bigger batch than CPU). Returns 0 to mean 'disabled' (sequential)."""
+@dataclass(frozen=True)
+class WhisperOptions:
+    model: str
+    language: str
+    vocabulary: str
+
+
+class ClientDisconnected(Exception):
+    """The client hung up; the rest of its transcription is skipped."""
+
+
+def _resolve_batch_size() -> Optional[int]:
+    """Batch size for the current device: explicit env wins (0 = disabled);
+    else the per-device default (GPU holds a bigger batch than CPU). None while
+    the device is undecided (STT_DEVICE=auto before the first model load)."""
     if STT_BATCH_SIZE is not None:
         return max(0, STT_BATCH_SIZE)
-    return 8 if _state["device"] == "cuda" else 4
+    device = _state["device"] or (None if STT_DEVICE == "auto" else STT_DEVICE)
+    if device is None:
+        return None
+    return GPU_BATCH_SIZE if device == "cuda" else CPU_BATCH_SIZE
+
+
+def _batching_failed() -> bool:
+    """The warm model could not be wrapped in a batched pipeline (remembered until it changes)."""
+    wrapped = _state["batched_for"]
+    return wrapped is not None and wrapped is _state["model"] and _state["batched"] is None
+
+
+def _effective_batch_size() -> Optional[int]:
+    """What /health reports: the batch size the next transcription uses; 0 = sequential."""
+    return 0 if _batching_failed() else _resolve_batch_size()
+
 
 def _candidates():
     """Ordered (device, compute_type) pairs to try when building a model."""
@@ -100,7 +174,16 @@ def get_model(name: str):
 
 
 def _load_model(name: str):
-    """Build the model on the first device that works (caller holds _model_lock)."""
+    """Build the model on the first device that works (caller holds _model_lock).
+
+    Exactly one model stays warm, so memory is predictable. The cache lets go
+    of the old model before building the new one; a request still transcribing
+    with the old model keeps it alive until it finishes, so a swap can briefly
+    hold two, and requests alternating between two sizes reload on each switch.
+    An LRU of two would avoid the reloads only by keeping two models resident
+    all the time; operators who mix sizes can pin one per-guild model instead.
+    """
+    _state.update(model=None, model_name=None, batched=None, batched_for=None)
     candidates = _candidates()
     last_err = None
     for device, compute in candidates:
@@ -130,7 +213,7 @@ def get_batched(model):
     cached until the model changes. Returns None if batching is disabled or the
     model can't be wrapped (e.g. a fake test model), so the caller falls back
     to sequential."""
-    if _resolve_batch_size() <= 0:
+    if not _resolve_batch_size():
         return None
     # A real faster-whisper model exposes feature_extractor; the batched pipeline
     # needs it. Guard so fakes/unsupported models fall back cleanly instead of
@@ -138,24 +221,31 @@ def get_batched(model):
     if not hasattr(model, "feature_extractor"):
         return None
     with _model_lock:
-        if _state["batched"] is not None and _state["batched_for"] is model:
-            return _state["batched"]
+        if _state["batched_for"] is model:
+            return _state["batched"]  # None: this model can't be batched (remembered)
         try:
             batched = BatchedInferencePipeline(model=model)
         except Exception as err:  # unsupported — fall back
             log.warning("Batched pipeline unavailable (%s); using sequential", err)
-            return None
-        _state.update(batched=batched, batched_for=model)
+            batched = None
+        # Cache only for the model that is still warm: a pipeline for a
+        # swapped-out model would keep it (and its memory) alive next to the new one.
+        if _state["model"] is model:
+            _state.update(batched=batched, batched_for=model)
         return batched
 
+
+# async: answered on the event loop, so /health never waits for a worker thread
+# behind queued transcriptions. Nothing in here blocks or loads a model.
 @app.get("/health")
-def health():
+async def health() -> dict:
     return {
         "status": "ok",
         "model": _state["model_name"],
         "device": _state["device"],
         "compute": _state["compute"],
-        "batch_size": _resolve_batch_size(),
+        "batch_size": _effective_batch_size(),
+        "auth": "key" if STT_API_KEY else "none",
         "diarization": diarization.status(),
     }
 
@@ -176,16 +266,77 @@ def _validate_speakers(min_speakers: Optional[int], max_speakers: Optional[int])
         raise HTTPException(400, "min_speakers cannot be greater than max_speakers.")
 
 
-def _whisper_segments(audio, model: str, language: str, vocabulary: str) -> tuple[list[dict], str]:
-    """Transcribe `audio` (a file path, or 16 kHz mono samples as a numpy array)
-    into nested segments [{start, end, text, words: [{word, start, end}]}]
-    plus the (detected) language."""
-    m = get_model(model)
-    lang = None if language == "auto" else language
+def _validate_upload_size(upload: UploadFile) -> None:
+    """The exact file size (the request guard already capped the whole body)."""
+    if (upload.size or 0) > STT_MAX_UPLOAD_BYTES:
+        raise HTTPException(413, too_large_detail(STT_MAX_UPLOAD_BYTES))
+
+
+def _client_gone(request: Request) -> bool:
+    """Ask the event loop whether the client has disconnected (we run in FastAPI's worker thread)."""
+    try:
+        return anyio.from_thread.run(request.is_disconnected)
+    except RuntimeError:  # not in an AnyIO worker thread: there is no loop to ask
+        return False
+
+
+class DisconnectWatch:
+    """Stops work for a client that has hung up (e.g. the bot timed out).
+
+    /transcribe is a sync handler: FastAPI runs it in a worker thread, where
+    nothing can interrupt it. So it asks between stages and between Whisper
+    segments; a stage already running (decoding, one batch of segments,
+    speaker labelling) still runs to its end.
+    """
+
+    def __init__(self, request: Request) -> None:
+        self._request = request
+        self._next_poll = 0.0
+
+    def check(self) -> None:
+        if _client_gone(self._request):
+            raise ClientDisconnected()
+
+    def poll(self) -> None:
+        """check(), at most once per DISCONNECT_POLL_SECONDS (for per-segment loops)."""
+        now = time.monotonic()
+        if now >= self._next_poll:
+            self._next_poll = now + DISCONNECT_POLL_SECONDS
+            self.check()
+
+
+def _decode_upload(upload: BinaryIO) -> np.ndarray:
+    """The upload as 16 kHz mono float32 samples, exactly as faster-whisper
+    would decode it, read straight from the multipart parser's spooled file
+    (no second copy on disk). The spooled file is closed right after, so a long
+    transcription doesn't keep the upload on disk."""
+    try:
+        upload.seek(0)
+        return decode_audio(upload, sampling_rate=SAMPLE_RATE)
+    except MemoryError:
+        raise
+    except Exception as err:  # FFmpeg can't read it, no audio stream (IndexError), empty file...
+        log.info("Refused an upload that could not be decoded (%s: %s)", type(err).__name__, err)
+        raise HTTPException(400, NOT_AUDIO) from err
+    finally:
+        upload.close()
+
+
+def _segment_dict(seg) -> dict:
+    return {"start": seg.start, "end": seg.end, "text": seg.text,
+            "words": [{"word": w.word, "start": w.start, "end": w.end}
+                      for w in (getattr(seg, "words", None) or [])]}
+
+
+def _whisper_segments(audio: np.ndarray, opts: WhisperOptions, watch: DisconnectWatch) -> tuple[list[dict], str]:
+    """Transcribe 16 kHz mono `audio` into nested segments
+    [{start, end, text, words: [{word, start, end}]}] plus the (detected) language."""
+    m = get_model(opts.model)
+    lang = None if opts.language == "auto" else opts.language
     supported = getattr(m, "supported_languages", None)
     if lang and supported and lang not in supported:
-        raise HTTPException(400, f"Model {model!r} does not support language {lang!r}.")
-    hints = {"hotwords": vocabulary.strip()} if vocabulary.strip() else {}
+        raise HTTPException(400, f"Model {opts.model!r} does not support language {lang!r}.")
+    hints = {"hotwords": opts.vocabulary.strip()} if opts.vocabulary.strip() else {}
     # Prefer the batched pipeline (parallel VAD segments, 1.7-2.6x faster);
     # fall back to the plain model when batching is off/unavailable.
     batched = get_batched(m)
@@ -194,66 +345,72 @@ def _whisper_segments(audio, model: str, language: str, vocabulary: str) -> tupl
             audio, language=lang, word_timestamps=True, batch_size=_resolve_batch_size(), **hints)
     else:
         segments, info = m.transcribe(audio, language=lang, word_timestamps=True, **hints)
-    # Lazy: the actual inference runs while iterating.
-    nested = [{"start": seg.start, "end": seg.end, "text": seg.text,
-               "words": [{"word": w.word, "start": w.start, "end": w.end}
-                         for w in (getattr(seg, "words", None) or [])]}
-              for seg in segments]
-    return nested, getattr(info, "language", language)
+    nested = []
+    for seg in segments:  # lazy: the actual inference runs while iterating
+        watch.poll()
+        nested.append(_segment_dict(seg))
+    return nested, getattr(info, "language", opts.language)
 
 
-def _transcribe_file(path: str, model: str, language: str, vocabulary: str) -> dict:
-    return build_response(*_whisper_segments(path, model, language, vocabulary))
+def _refuse_long_recording(audio: np.ndarray) -> None:
+    seconds = audio.size / SAMPLE_RATE
+    if seconds > STT_MAX_DIARIZE_SECONDS:
+        raise HTTPException(400, (
+            "Recording is longer than this sidecar accepts for speaker detection "
+            f"({seconds / 3600:.1f} h; the limit is {STT_MAX_DIARIZE_SECONDS / 3600:.1f} h, "
+            "set by STT_MAX_DIARIZE_SECONDS)."))
 
 
-def _transcribe_with_speakers(path: str, model: str, language: str, vocabulary: str,
-                              min_speakers: Optional[int], max_speakers: Optional[int]) -> dict:
+def _transcribe_plain(upload: BinaryIO, opts: WhisperOptions, watch: DisconnectWatch) -> dict:
+    with _inference_slots:
+        watch.check()
+        audio = _decode_upload(upload)
+        return build_response(*_whisper_segments(audio, opts, watch))
+
+
+def _transcribe_with_speakers(upload: BinaryIO, opts: WhisperOptions, watch: DisconnectWatch,
+                              speaker_bounds: tuple[Optional[int], Optional[int]]) -> dict:
     """WhisperX-style: faster-whisper transcript, then alignment + speakers."""
-    diarization.get_labeller()  # load (or refuse with a 400) before spending time on Whisper
-    audio = decode_audio(path, sampling_rate=SAMPLE_RATE)  # decoded once, shared by every stage
-    segments, detected = _whisper_segments(audio, model, language, vocabulary)
-    labelled = diarization.label_speakers(segments, audio, detected, min_speakers, max_speakers)
+    # The speaker model (GB-scale, may download) loads before taking any slot,
+    # so a slow first load never holds one; it also refuses with a 400 early.
+    diarization.get_labeller()
+    # Decode only once this request may label: a waiting request holds no audio.
+    with _labelling_slot, _inference_slots:
+        watch.check()
+        audio = _decode_upload(upload)
+        _refuse_long_recording(audio)
+        watch.check()
+        segments, detected = _whisper_segments(audio, opts, watch)
+        watch.check()
+        labelled = diarization.label_speakers(segments, audio, detected, *speaker_bounds)
     return build_response(labelled, detected, with_speakers=True)
 
 
 # Plain `def` (audit B1): FastAPI runs sync endpoints in its threadpool, so the
-# event loop — and /health — stay responsive during long transcriptions.
+# event loop stays free. The request guard (request_guard.py) has already
+# checked the key, the body size and the queue before the upload was parsed.
 @app.post("/transcribe")
-def transcribe(file: UploadFile = File(...), model: str = Form("small"), language: str = Form("auto"),
+def transcribe(request: Request, file: UploadFile = File(...), model: str = Form("small"),
+               language: str = Form("auto"),
                vocabulary: Annotated[str, Form(max_length=131072)] = "",
                diarize: Annotated[bool, Form()] = False,
                min_speakers: Annotated[Optional[int], Form()] = None,
                max_speakers: Annotated[Optional[int], Form()] = None):
     _validate(model, language)
     _validate_speakers(min_speakers, max_speakers)
+    _validate_upload_size(file)
+    opts, watch = WhisperOptions(model, language, vocabulary), DisconnectWatch(request)
     try:
-        if diarize:
-            diarization.check_available()  # cheap: before the upload is even saved
-        return _transcribe_upload(file, model, language, vocabulary,
-                                  (min_speakers, max_speakers) if diarize else None)
+        if not diarize:
+            return _transcribe_plain(file.file, opts, watch)
+        diarization.check_available()  # cheap: before any audio work
+        return _transcribe_with_speakers(file.file, opts, watch, (min_speakers, max_speakers))
     except diarization.DiarizationUnavailable as err:
         raise HTTPException(400, DIARIZATION_UNAVAILABLE + str(err)) from err
+    except ClientDisconnected as err:
+        log.info("Client disconnected; stopped its transcription early")
+        raise HTTPException(CLIENT_CLOSED_REQUEST, "Client closed the request.") from err
 
-
-def _transcribe_upload(file: UploadFile, model: str, language: str, vocabulary: str,
-                       speaker_bounds: Optional[tuple[Optional[int], Optional[int]]]) -> dict:
-    """Save the upload to a temp file and transcribe it (with speakers when
-    `speaker_bounds` = (min_speakers, max_speakers) is given)."""
-    suffix = os.path.splitext(file.filename or "a.wav")[1] or ".wav"
-    fd, path = tempfile.mkstemp(prefix="stt-", suffix=suffix)
-    try:
-        # Stream the upload to disk instead of holding a second copy in memory.
-        with os.fdopen(fd, "wb") as tmp:
-            shutil.copyfileobj(file.file, tmp)
-        with _inference_slots:
-            if speaker_bounds is None:
-                return _transcribe_file(path, model, language, vocabulary)
-            return _transcribe_with_speakers(path, model, language, vocabulary, *speaker_bounds)
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass  # cleanup failure must not mask a transcription error
 
 if __name__ == "__main__":
     import uvicorn

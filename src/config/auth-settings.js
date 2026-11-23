@@ -65,6 +65,15 @@ export const stripTrailingSlashes = (value) => String(value ?? '').trim().replac
 const text = (value) => String(value ?? '').trim();
 const textOr = (value, fallback) => text(value) || fallback;
 
+/**
+ * Does SSO create accounts for first-time users? Only with OIDC_AUTO_CREATE on
+ * AND a group allowlist: without one, anyone the identity provider knows could
+ * mint themselves an account, so only existing or linked accounts sign in.
+ */
+export function autoCreateEffective(settings) {
+  return !!settings.autoCreate && (settings.allowedGroups?.length ?? 0) > 0;
+}
+
 /** Typed, frozen auth settings from an env-like object. */
 export function resolveAuthSettings(env = process.env) {
   const d = AUTH_DEFAULTS;

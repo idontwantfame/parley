@@ -89,9 +89,22 @@ function ProviderFields({ d, set, secretSet }) {
   );
 }
 
-function AccessFields({ d, set }) {
+// Automatic account creation only applies once Allowed groups is set (so a
+// provider that admits everyone can't mint accounts). Judge the draft, and
+// trust the server's verdict while the groups are unchanged.
+function autoCreatePending(d, settings) {
+  if (!d.ssoEnabled || !d.autoCreate) return false;
+  const groups = d.allowedGroups.trim();
+  if (!groups) return true;
+  return groups === draftFrom(settings).allowedGroups.trim() && settings.sso.autoCreateEffective === false;
+}
+
+function AccessFields({ d, set, settings }) {
+  const pending = autoCreatePending(d, settings);
+  // Start expanded when the note below applies, so it isn't hidden.
+  const [startOpen] = useState(pending);
   return (
-    <details className="group">
+    <details className="group" open={startOpen}>
       <summary className="text-[13px] font-medium text-ink cursor-pointer select-none">Access and admins</summary>
       <div className="space-y-4 mt-3">
         <Field label="Admin group" hint="Members become admins, checked at every sign-in. Leave empty to manage admins here by hand.">
@@ -102,6 +115,11 @@ function AccessFields({ d, set }) {
         </Field>
         <Check checked={d.autoCreate} onChange={(v) => set('autoCreate', v)} label="Create accounts on first sign-in"
           hint="Off: only people who already have a Parley account (linked by verified email) can use single sign-on." />
+        {pending && (
+          <p className="text-xs text-warn" role="status">
+            Accounts are created automatically only once Allowed groups is set; until then only existing accounts can sign in.
+          </p>
+        )}
         <div className="grid sm:grid-cols-2 gap-4">
           <Field label="Scopes"><input className="input" value={d.scopes} onChange={(e) => set('scopes', e.target.value)} placeholder="openid profile email" /></Field>
           <Field label="Groups claim"><input className="input" value={d.groupsClaim} onChange={(e) => set('groupsClaim', e.target.value)} placeholder="groups" /></Field>
@@ -143,7 +161,7 @@ function SsoForm({ settings, onSaved }) {
         <CopyField value={redirectUriFor(d.publicUrl, settings.redirectUri)} />
       </Field>
       <ProviderFields d={d} set={set} secretSet={settings.sso.clientSecretSet} />
-      <AccessFields d={d} set={set} />
+      <AccessFields d={d} set={set} settings={settings} />
       <Check checked={d.passwordLogin} onChange={(v) => set('passwordLogin', v)} label="Allow password sign-in"
         hint="You can turn it off once you've signed in with SSO as an admin, so you can't lock yourself out." />
       {settings.passwordLogin === false && settings.passwordLoginEffective && (

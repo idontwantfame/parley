@@ -299,3 +299,15 @@ test('a provider redirect is never followed (so it cannot bounce requests to ano
   assert.equal(redirected, 1);
   assert.equal(followed, 0);
 });
+
+test('provider requests are refused when the host name resolves to a blocked address', async () => {
+  const { createGuardedFetch } = await import('../src/web/oidc-discovery.js');
+  let fetched = 0;
+  const fetchImpl = async () => { fetched += 1; return new Response('{}'); };
+  const toMetadata = createGuardedFetch({ fetchImpl, lookup: async () => [{ address: '169.254.169.254', family: 4 }] });
+  await assert.rejects(toMetadata('https://idp.example/.well-known/openid-configuration', {}), /blocked/);
+  assert.equal(fetched, 0);
+  const toLan = createGuardedFetch({ fetchImpl, lookup: async () => [{ address: '10.0.0.7', family: 4 }] });
+  await toLan('https://idp.example/token', {});
+  assert.equal(fetched, 1);
+});

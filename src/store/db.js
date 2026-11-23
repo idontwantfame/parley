@@ -410,6 +410,10 @@ export function openDb(path) {
     listUtterances(meetingId) {
       return sql.prepare(`${NAMED_UTTERANCES} WHERE u.meeting_id = ? ORDER BY u.start_ms`).all(meetingId);
     },
+    // Does the meeting have any transcript line? (Existence only — cheap.)
+    hasUtterances(meetingId) {
+      return !!sql.prepare(`SELECT EXISTS (SELECT 1 FROM utterances WHERE meeting_id = ?) AS found`).get(meetingId).found;
+    },
     // The last `n` utterances of a meeting, oldest first (speaker renames applied).
     listLastUtterances(meetingId, n) {
       return sql.prepare(

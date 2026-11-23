@@ -9,7 +9,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDb } from '../src/store/db.js';
-import { retryPlan, retryMeeting, retryEligible, RETRYABLE_STATUSES } from '../src/pipeline/retry.js';
+import { retryPlan, retryMeeting, retryEligible, regeneratePlan, RETRYABLE_STATUSES } from '../src/pipeline/retry.js';
 import { apiRouter } from '../src/web/api.js';
 
 function tmp() {
@@ -211,4 +211,59 @@ test('retryEligible allows re-transcribing a done meeting whose transcript is kn
     db.setMeetingStatus(id, 'recording');
     assert.equal(eligible(), false);
   } finally { cleanup(); }
+});
+
+// A fake sidecar that fails every upload of user 222's track (HTTP 400, so the
+// client does not retry) and transcribes everyone else.
+async function partialSidecar(t) {
+  const { createServer } = await import('node:http');
+  const server = createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk.toString('latin1'); });
+    req.on('end', () => {
+      if (body.includes('filename="222_')) { res.statusCode = 400; return res.end('{"detail":"bad track"}'); }
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ text: 'Hello there.', words: [{ word: ' Hello', start: 0, end: 0.4 }, { word: ' there.', start: 0.4, end: 0.8 }] }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { config } = await import('../src/config/env.js');
+  const previous = config.sttUrl;
+  config.sttUrl = `http://127.0.0.1:${server.address().port}`;
+  t.after(() => { config.sttUrl = previous; server.close(); });
+}
+
+test('retryMeeting: a retranscribe that is still partial keeps the PCM so it can be retried again', async (t) => {
+  const { dir, cleanup } = tmp();
+  t.after(cleanup);
+  await partialSidecar(t);
+  const db = openDb(':memory:');
+  db.sql.prepare(`INSERT INTO guild_config (guild_id, summarizer_provider) VALUES ('g1', 'fake')`).run();
+  const id = Number(db.createMeeting({ guildId: 'g1', channelId: 'c', channelName: 'gen', startedAt: 'now' }));
+  db.addAttendee(id, '111', 'A');
+  db.addAttendee(id, '222', 'B');
+  db.replaceUtterances(id, [{ userId: '111', displayName: 'A', startMs: 1000, endMs: 2000, text: 'hi' }], { complete: false });
+  db.setMeetingStatus(id, 'done');
+  const audioDir = join(dir, 'audio', String(id));
+  mkdirSync(audioDir, { recursive: true });
+  writeFileSync(join(audioDir, '111_1000.pcm'), Buffer.alloc(32000));
+  writeFileSync(join(audioDir, '222_1500.pcm'), Buffer.alloc(32000));
+
+  const result = await retryMeeting(db, id, { dataDir: dir });
+
+  assert.equal(result.ok, true);
+  assert.equal(db.getMeeting(id).transcription_complete, 0);
+  const plan = retryPlan(db, id, { dataDir: dir });
+  assert.equal(plan.action, 'retranscribe');
+  assert.equal(retryEligible(db.getMeeting(id), plan), true, 'retry stays offered for the failed speaker');
+});
+
+test('retryPlan and regeneratePlan only ask whether a transcript exists (never load it)', () => {
+  const db = openDb(':memory:');
+  const id = db.createMeeting({ guildId: 'g1', channelId: 'c', channelName: 'gen', startedAt: 'now' });
+  db.addUtterance({ meetingId: id, userId: 'u', displayName: 'Al', startMs: 0, endMs: 5, text: 'hi' });
+  db.setMeetingStatus(id, 'done');
+  const noLoading = { ...db, listUtterances: () => assert.fail('loaded every transcript line') };
+  assert.equal(retryPlan(noLoading, id, { dataDir: '/nonexistent' }).action, 'resummarize');
+  assert.equal(regeneratePlan(noLoading, id).ok, true);
 });

@@ -5,7 +5,7 @@
 // failures. openid-client itself never follows redirects (redirect: 'manual').
 
 import * as client from 'openid-client';
-import { isBlockedHost } from '../store/secrets.js';
+import { isBlockedHost, resolvesToBlockedHost } from '../store/secrets.js';
 
 export const DISCOVERY_TIMEOUT_SEC = 10; // also applies to token, userinfo and JWKS requests
 const MAX_REPORTED_ISSUER = 200;
@@ -26,12 +26,24 @@ function assertEndpointsAllowed(meta) {
   }
 }
 
-/** fetch for every provider request: refuses blocked (link-local/metadata) hosts. */
-export async function guardedFetch(url, options) {
-  const { hostname } = new URL(url instanceof URL ? url.href : String(url));
-  if (isBlockedHost(hostname)) throw new ProviderProblem(`Refused a request to a blocked address (${hostname}).`);
-  return fetch(url, options);
+/**
+ * A fetch for provider requests that refuses blocked (link-local/metadata)
+ * hosts, by name or by what the name resolves to at request time (discovery,
+ * token, userinfo and JWKS alike). DNS rebinding between this check and the
+ * connection remains possible.
+ */
+export function createGuardedFetch({ fetchImpl = (...args) => fetch(...args), lookup } = {}) {
+  return async (url, options) => {
+    const { hostname } = new URL(url instanceof URL ? url.href : String(url));
+    if (await resolvesToBlockedHost(hostname, lookup)) {
+      throw new ProviderProblem(`Refused a request to a blocked address (${hostname}).`);
+    }
+    return fetchImpl(url, options);
+  };
 }
+
+/** fetch for every provider request (see createGuardedFetch). */
+export const guardedFetch = createGuardedFetch();
 
 // Refuse providers we could not validate ID tokens for: openid-client checks
 // signatures against the JWKS, which only works for asymmetric algorithms.

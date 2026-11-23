@@ -19,11 +19,21 @@ export function LiveProvider({ children }) {
   const { guildId } = useGuild();
   const [live, setLive] = useState(EMPTY);
   const [error, setError] = useState(null);
+  // Bumped whenever a session of the current guild disappears between two
+  // polls (its notes are now a meeting), so pages can refetch exactly then —
+  // not when a server switch merely empties the list.
+  const [endedCount, setEndedCount] = useState(0);
   const timer = useRef(null);
   const lastJson = useRef('[]');
   // Incremented per request so a slow response for a previously selected
   // guild can never overwrite the current guild's sessions.
   const seq = useRef(0);
+  // The guild and meeting ids of the last successful poll.
+  const lastSeen = useRef({ guildId: null, ids: [] });
+  // Latest guild/refresh, so a Stop that resolves after a server switch can
+  // tell and skip refreshing the guild that's no longer shown.
+  const guildRef = useRef(guildId);
+  guildRef.current = guildId;
 
   const apply = useCallback((rows) => {
     // Most polls return the same (usually empty) list; only update state when
@@ -40,7 +50,12 @@ export function LiveProvider({ children }) {
     try {
       const { live: rows } = await api.live(guildId);
       if (mine !== seq.current) return;
-      apply(Array.isArray(rows) ? rows : EMPTY);
+      const list = Array.isArray(rows) ? rows : EMPTY;
+      const ids = list.map((s) => s.meetingId);
+      const prev = lastSeen.current;
+      if (prev.guildId === guildId && prev.ids.some((id) => !ids.includes(id))) setEndedCount((n) => n + 1);
+      lastSeen.current = { guildId, ids };
+      apply(list);
       setError(null);
     } catch (e) {
       if (mine !== seq.current) return;
@@ -83,11 +98,16 @@ export function LiveProvider({ children }) {
     };
   }, [refresh, pollMs, guildId]);
 
+  const refreshRef = useRef(refresh);
+  refreshRef.current = refresh;
   const stop = useCallback(async (channelId) => {
-    await api.stopLive(guildId, channelId);
-    await refresh();
-  }, [guildId, refresh]);
+    const forGuild = guildId;
+    await api.stopLive(forGuild, channelId);
+    // Switched servers while stopping: the old guild's sessions must not be
+    // fetched and shown under the new one.
+    if (guildRef.current === forGuild) await refreshRef.current();
+  }, [guildId]);
 
-  const value = useMemo(() => ({ live, error, refresh, stop }), [live, error, refresh, stop]);
+  const value = useMemo(() => ({ live, error, endedCount, refresh, stop }), [live, error, endedCount, refresh, stop]);
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

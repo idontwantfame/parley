@@ -8,6 +8,9 @@ import { join } from 'node:path';
 import { openDb } from '../src/store/db.js';
 import { installUsers } from '../src/store/users.js';
 import { createWebServer } from '../src/web/server.js';
+
+// The seeded admin's first-run password is random; pin it to 'admin' here.
+const ADMIN_SEED = { firstRunPassword: 'admin', log: { warn() {}, info() {}, log() {} } };
 import { resolveAuthSettings } from '../src/config/auth-settings.js';
 import { createOidcService } from '../src/web/oidc-service.js';
 import { settingsFingerprint } from '../src/store/oidc-settings.js';
@@ -22,11 +25,16 @@ function capture() {
 const cookieNamed = (res, name) => res.headers.getSetCookie().find((c) => c.startsWith(`${name}=`)) ?? null;
 const pair = (setCookie) => setCookie?.split(';')[0] ?? null;
 
+// Accounts are only created automatically with a group allowlist, so by
+// default the allowlist is MEMBERS and whoever signs in belongs to it.
+const MEMBERS = 'parley-users';
+
 // A running dashboard wired to a fake provider. `auth` adds env-style settings.
 async function setup(t, { auth = {}, ssoOn = true } = {}) {
   const provider = await startFakeProvider();
+  provider.user = { ...provider.user, groups: [MEMBERS] };
   const db = openDb(':memory:');
-  const users = installUsers(db);
+  const users = installUsers(db, ADMIN_SEED);
   const env = { auth: resolveAuthSettings({}) };
   const { lines, log } = capture();
   const oidc = createOidcService({ env, log, envPath: join(mkdtempSync(join(tmpdir(), 'parley-oidc-')), '.env') });
@@ -36,7 +44,7 @@ async function setup(t, { auth = {}, ssoOn = true } = {}) {
   t.after(async () => { server.close(); await provider.close(); });
   env.auth = resolveAuthSettings({
     OIDC_ENABLED: ssoOn ? 'true' : 'false', OIDC_ISSUER: provider.issuer, OIDC_CLIENT_ID: provider.clientId,
-    OIDC_CLIENT_SECRET: provider.clientSecret, PUBLIC_URL: base, ...auth,
+    OIDC_CLIENT_SECRET: provider.clientSecret, PUBLIC_URL: base, OIDC_ALLOWED_GROUPS: MEMBERS, ...auth,
   });
   return { provider, users, base, env, oidc, logs: lines };
 }
@@ -97,7 +105,7 @@ test('happy path: first SSO sign-in auto-creates an account and starts a session
 test('a verified email links the sign-in to the existing local account', async (t) => {
   const ctx = await setup(t);
   const kim = ctx.users.createUser({ username: 'kim', email: 'kim@example.com', password: 'pw123456' });
-  ctx.provider.user = { sub: 'kim-sub', preferred_username: 'kimmy', email: 'KIM@example.com', email_verified: true };
+  ctx.provider.user = { sub: 'kim-sub', preferred_username: 'kimmy', email: 'KIM@example.com', email_verified: true, groups: [MEMBERS] };
   const run = await signIn(ctx);
   const who = await me(ctx.base, run.session);
   assert.equal(who.user.id, kim.id);
@@ -108,7 +116,7 @@ test('a verified email links the sign-in to the existing local account', async (
 test('an unverified email is never used to link accounts', async (t) => {
   const ctx = await setup(t);
   const kim = ctx.users.createUser({ username: 'kim', email: 'kim@example.com', password: 'pw123456' });
-  ctx.provider.user = { sub: 'attacker', preferred_username: 'kim', email: 'kim@example.com', email_verified: false };
+  ctx.provider.user = { sub: 'attacker', preferred_username: 'kim', email: 'kim@example.com', email_verified: false, groups: [MEMBERS] };
   const run = await signIn(ctx);
   const who = await me(ctx.base, run.session);
   assert.notEqual(who.user.id, kim.id);
@@ -147,18 +155,18 @@ test('when groups are needed and userinfo fails, sign-in fails closed', async (t
 
 test('the admin group promotes and demotes, but never the last admin', async (t) => {
   const ctx = await setup(t, { auth: { OIDC_ADMIN_GROUP: 'parley-admins' } });
-  ctx.provider.user = { ...ctx.provider.user, groups: ['parley-admins'] };
+  ctx.provider.user = { ...ctx.provider.user, groups: [MEMBERS, 'parley-admins'] };
   let who = await me(ctx.base, (await signIn(ctx)).session);
   assert.equal(who.user.isAdmin, true);
 
-  ctx.provider.user = { ...ctx.provider.user, groups: [] };
+  ctx.provider.user = { ...ctx.provider.user, groups: [MEMBERS] };
   who = await me(ctx.base, (await signIn(ctx)).session);
   assert.equal(who.user.isAdmin, false); // the seeded admin still exists
 
-  ctx.provider.user = { ...ctx.provider.user, groups: ['parley-admins'] };
+  ctx.provider.user = { ...ctx.provider.user, groups: [MEMBERS, 'parley-admins'] };
   await signIn(ctx);
   ctx.users.deleteUser(ctx.users.getUserByUsername('admin').id);
-  ctx.provider.user = { ...ctx.provider.user, groups: [] };
+  ctx.provider.user = { ...ctx.provider.user, groups: [MEMBERS] };
   who = await me(ctx.base, (await signIn(ctx)).session);
   assert.equal(who.user.isAdmin, true);
   assert.ok(ctx.logs.some((l) => /last admin/i.test(l)));
@@ -266,7 +274,7 @@ test('PASSWORD_LOGIN=false takes effect only after an admin SSO sign-in verified
   assert.equal((await me(ctx.base)).passwordLogin, true); // SSO works, but nobody proved it yet
   await signIn(ctx); // a non-admin sign-in does not verify
   assert.equal((await me(ctx.base)).passwordLogin, true);
-  ctx.provider.user = { sub: 'boss', preferred_username: 'boss', email: 'boss@example.com', email_verified: true, groups: ['admins'] };
+  ctx.provider.user = { sub: 'boss', preferred_username: 'boss', email: 'boss@example.com', email_verified: true, groups: [MEMBERS, 'admins'] };
   await signIn(ctx);
   assert.equal((await me(ctx.base)).passwordLogin, false);
   const res = await jpost(ctx.base, '/api/auth/login', { username: 'admin', password: 'admin' });
@@ -279,7 +287,7 @@ test('when password login turns off, password-only sessions end and password cha
   const jo = ctx.users.createUser({ username: 'jo', password: 'pw123456' });
   const joSession = pair(cookieNamed(await jpost(ctx.base, '/api/auth/login', { username: 'jo', password: 'pw123456' }), 'parley_session'));
   assert.equal((await me(ctx.base, joSession)).user.username, 'jo');
-  ctx.provider.user = { ...ctx.provider.user, groups: ['admins'] };
+  ctx.provider.user = { ...ctx.provider.user, groups: [MEMBERS, 'admins'] };
   const admin = await signIn(ctx); // verifies → password login is now effectively off
   assert.equal((await me(ctx.base, joSession)).user, null);
   assert.equal((await me(ctx.base, admin.session)).user.username, 'jane');
@@ -329,7 +337,7 @@ test('an SSO-only account cannot change a password it does not have, until an ad
 
 test('the user list marks SSO-linked accounts', async (t) => {
   const ctx = await setup(t, { auth: { OIDC_ADMIN_GROUP: 'admins' } });
-  ctx.provider.user = { ...ctx.provider.user, groups: ['admins'] };
+  ctx.provider.user = { ...ctx.provider.user, groups: [MEMBERS, 'admins'] };
   const run = await signIn(ctx);
   const list = await (await fetch(`${ctx.base}/api/users`, { headers: { cookie: run.session } })).json();
   assert.deepEqual(list.users.map((u) => [u.username, u.sso]), [['admin', false], ['jane', true]]);
@@ -352,7 +360,7 @@ test('the flow cookie is Secure behind an https proxy', async (t) => {
 // A server (re)starting with settings straight from .env: no provider needed.
 function bootServer({ passwordLogin, verified }) {
   const db = openDb(':memory:');
-  const users = installUsers(db);
+  const users = installUsers(db, ADMIN_SEED);
   const jo = users.createUser({ username: 'jo', password: 'pw123456' });
   const sam = users.createSsoUser({ username: 'sam', issuer: 'https://idp.example/', subject: 'sam' });
   const tokens = { jo: users.createSession(jo.id).token, sam: users.createSession(sam.id).token };
@@ -377,4 +385,12 @@ test('starting while password login is effectively on leaves every session alone
     assert.equal(users.getSessionUser(tokens.jo).username, 'jo', JSON.stringify(opts));
     assert.equal(users.getSessionUser(tokens.sam).username, 'sam', JSON.stringify(opts));
   }
+});
+
+test('without a group allowlist, auto-create is off: unknown identities get no_account', async (t) => {
+  const ctx = await setup(t, { auth: { OIDC_ALLOWED_GROUPS: '', OIDC_AUTO_CREATE: 'true' } });
+  const run = await signIn(ctx);
+  assert.equal(run.location, '/?authError=no_account');
+  assert.equal(run.session, null);
+  assert.equal(ctx.users.countUsers(), 1);
 });

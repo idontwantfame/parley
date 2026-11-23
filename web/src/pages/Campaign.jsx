@@ -3,11 +3,15 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api.js';
 import { Page, PageHead, SectionHead } from '../components/Page.jsx';
 import { Icon, Empty } from '../components/ui.jsx';
-import Markdown from '../components/Markdown.jsx';
+import Markdown from '../components/LazyMarkdown.jsx';
 import { fmtDateShort, fmtRelative } from '../lib/format.js';
 import { useIsAdmin } from '../AuthContext.jsx';
+import { useSingleFlight } from '../hooks/useSingleFlight.js';
 
 const JOURNAL_POLL_MS = 3000;
+// Campaign ids are numeric; anything else in the URL is not a campaign (and
+// must never reach a request path).
+const CAMPAIGN_ID = /^\d+$/;
 
 const ASK_SUGGESTIONS = [
   'Who are the important NPCs so far?',
@@ -248,10 +252,15 @@ function Settings({ campaign, channels, onChange }) {
   const [includePast, setIncludePast] = useState(true);
   const [msg, setMsg] = useState(null);
   const [err, setErr] = useState(null);
+  const [deleting, runDelete] = useSingleFlight();
 
   useEffect(() => { setName(campaign.name); }, [campaign.name]);
   useEffect(() => {
-    api.voiceChannels(campaign.guild_id).then((r) => setVoice(Array.isArray(r) ? r : [])).catch(() => setVoice([]));
+    let stale = false;
+    api.voiceChannels(campaign.guild_id)
+      .then((r) => { if (!stale) setVoice(Array.isArray(r) ? r : []); })
+      .catch(() => { if (!stale) setVoice([]); });
+    return () => { stale = true; };
   }, [campaign.guild_id, channels.length]);
 
   async function act(fn) {
@@ -307,10 +316,12 @@ function Settings({ campaign, channels, onChange }) {
         </div>
         {err && <p className="text-sm text-error" role="alert">{err}</p>}
         <div className="pt-4 border-t border-border">
-          <button className="btn btn-ghost !py-1.5 !text-error" onClick={() => {
+          <button className="btn btn-ghost !py-1.5 !text-error" disabled={deleting} onClick={() => runDelete(async () => {
             if (!window.confirm(`Delete "${campaign.name}"? Its journal is deleted; the recordings stay in Meetings.`)) return;
-            act(async () => { await api.deleteCampaign(campaign.id); navigate('/campaigns'); });
-          }}><Icon.Trash width={14} height={14} />Delete campaign</button>
+            setErr(null); setMsg(null);
+            try { await api.deleteCampaign(campaign.id); navigate('/campaigns'); }
+            catch (e) { setErr(e?.message || 'Could not delete the campaign.'); }
+          })}><Icon.Trash width={14} height={14} />{deleting ? 'Deleting…' : 'Delete campaign'}</button>
         </div>
       </div>
     </section>
@@ -319,6 +330,7 @@ function Settings({ campaign, channels, onChange }) {
 
 export default function Campaign() {
   const { id } = useParams();
+  const validId = CAMPAIGN_ID.test(id ?? '');
   const isAdmin = useIsAdmin();
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
@@ -329,13 +341,14 @@ export default function Campaign() {
 
   const load = useCallback(async () => {
     const forId = id;
+    if (!validId) return;
     try {
       const d = await api.campaign(forId);
       if (current.current === forId) { setData(d); setError(null); }
     } catch (e) {
       if (current.current === forId) setError(e?.message || 'Failed to load');
     }
-  }, [id]);
+  }, [id, validId]);
   useEffect(() => { setData(null); setError(null); load(); }, [load]);
 
   // Poll while a background journal update runs: one request at a time
@@ -353,6 +366,12 @@ export default function Campaign() {
     return () => { stop = true; clearTimeout(timer); };
   }, [updating, load]);
 
+  if (!validId) return (
+    <Page>
+      <Empty icon={Icon.Book} title="Campaign not found" body="There's no campaign at this address."
+        action={<Link to="/campaigns" className="btn btn-primary !py-2">All campaigns</Link>} />
+    </Page>
+  );
   if (!data && error) return <Page><Empty icon={Icon.Book} title="Couldn't load campaign" body={error} /></Page>;
   if (!data) return <Page><div className="h-10 w-64 skeleton rounded-md mb-6" /><div className="h-40 skeleton rounded-[14px]" /></Page>;
 

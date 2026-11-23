@@ -49,7 +49,7 @@ function StatSkeleton() {
 
 export default function Dashboard() {
   const { guildId } = useGuild();
-  const { live } = useLive();
+  const { live, endedCount } = useLive();
   const [meetings, setMeetings] = useState(null);
   const [agg, setAgg] = useState(null);
   const [todos, setTodos] = useState([]);
@@ -57,7 +57,8 @@ export default function Dashboard() {
 
   // Refetch when a live session ends (its notes become a new recent meeting),
   // without flashing the skeleton; only a server switch resets the page.
-  const liveCount = live.length;
+  // endedCount (not the live count) is the trigger: a server switch empties
+  // and refills the live list, which would otherwise fetch the page again.
   const shownGuild = useRef(null);
   useEffect(() => {
     if (!guildId) return;
@@ -78,7 +79,7 @@ export default function Dashboard() {
       setTodos(Array.isArray(t) ? t : []);
     }).catch((e) => { if (!stale) setError(e?.message || 'Failed to load'); });
     return () => { stale = true; };
-  }, [guildId, liveCount]);
+  }, [guildId, endedCount]);
 
   if (!guildId) return <Page><Empty icon={Icon.Home} title="No server selected" body="Pick a Discord server from the switcher to see its dashboard." /></Page>;
   if (error) return <Page><Empty icon={Icon.Home} title="Couldn't load dashboard" body={error} /></Page>;

@@ -39,8 +39,11 @@ function send(base, method, path, body, cookie) {
     ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
 }
 
+// Accounts are only created automatically with a group allowlist: MEMBERS,
+// which every test user below belongs to.
+const MEMBERS = 'parley-users';
 const enableBody = (ctx, extra = {}) => ({ ssoEnabled: true, issuer: ctx.provider.issuer, clientId: ctx.provider.clientId,
-  clientSecret: ctx.provider.clientSecret, publicUrl: ctx.base, ...extra });
+  clientSecret: ctx.provider.clientSecret, publicUrl: ctx.base, allowedGroups: [MEMBERS], ...extra });
 
 // Complete an SSO sign-in in this "browser" and return the session cookie.
 async function ssoSignIn(base) {
@@ -59,7 +62,8 @@ test('GET /system/auth shows the settings to admins, without the client secret',
   const body = JSON.parse(text);
   assert.deepEqual(body.sso, {
     enabled: false, issuer: '', clientId: '', clientSecretSet: true, scopes: 'openid profile email', groupsClaim: 'groups',
-    allowedGroups: ['a', 'b'], adminGroup: '', autoCreate: true, label: 'Sign in with SSO', status: 'off', error: null,
+    allowedGroups: ['a', 'b'], adminGroup: '', autoCreate: true, autoCreateEffective: true, label: 'Sign in with SSO',
+    status: 'off', error: null,
   });
   assert.equal(body.passwordLogin, true);
   assert.equal(body.passwordLoginEffective, true);
@@ -130,7 +134,7 @@ test('enabling SSO persists to .env, applies live and returns the GET shape', as
   const me = await (await fetch(`${ctx.base}/api/auth/me`)).json();
   assert.deepEqual(me.sso, { enabled: true, label: 'Sign in with Authentik' });
   assert.equal(await ssoSignIn(ctx.base), null, 'the new allowlist applies immediately');
-  ctx.provider.user = { ...ctx.provider.user, groups: ['staff'] };
+  ctx.provider.user = { ...ctx.provider.user, groups: [MEMBERS, 'staff'] };
   assert.ok(await ssoSignIn(ctx.base), 'the new settings work immediately');
 });
 
@@ -165,7 +169,7 @@ test('password login cannot be turned off by an admin who has never signed in wi
 test('an SSO-linked admin can turn password login off; it bites once verified, and provider changes un-verify', async (t) => {
   const ctx = await setup(t);
   await send(ctx.base, 'PUT', '/api/system/auth', enableBody(ctx, { adminGroup: 'admins' }), ctx.admin);
-  ctx.provider.user = { ...ctx.provider.user, groups: ['admins'] };
+  ctx.provider.user = { ...ctx.provider.user, groups: [MEMBERS, 'admins'] };
   const ssoAdmin = await ssoSignIn(ctx.base); // an admin SSO sign-in verifies the current settings
   const res = await send(ctx.base, 'PUT', '/api/system/auth', { passwordLogin: false }, ssoAdmin);
   assert.equal(res.status, 200);
@@ -202,7 +206,7 @@ test('turning password login off revokes password-only sessions, except the acti
   await send(ctx.base, 'PUT', '/api/system/auth', enableBody(ctx, { adminGroup: 'admins' }), ctx.admin);
   ctx.users.createUser({ username: 'jo', password: 'pw123456' });
   const jo = await ctx.login('jo', 'pw123456');
-  ctx.provider.user = { ...ctx.provider.user, groups: ['admins'] };
+  ctx.provider.user = { ...ctx.provider.user, groups: [MEMBERS, 'admins'] };
   const ssoAdmin = await ssoSignIn(ctx.base); // verified; password login still configured on
   assert.equal((await send(ctx.base, 'GET', '/api/auth/me', undefined, jo).then((r) => r.json())).user.username, 'jo');
   assert.equal((await send(ctx.base, 'PUT', '/api/system/auth', { passwordLogin: false }, ssoAdmin)).status, 200);
@@ -229,7 +233,7 @@ test('concurrent PUTs are serialized, so neither change is lost', async (t) => {
 test('password login can be turned back on while the provider is down (no discovery needed)', async (t) => {
   const ctx = await setup(t);
   await send(ctx.base, 'PUT', '/api/system/auth', enableBody(ctx, { adminGroup: 'admins' }), ctx.admin);
-  ctx.provider.user = { ...ctx.provider.user, groups: ['admins'] };
+  ctx.provider.user = { ...ctx.provider.user, groups: [MEMBERS, 'admins'] };
   const ssoAdmin = await ssoSignIn(ctx.base);
   assert.equal((await send(ctx.base, 'PUT', '/api/system/auth', { passwordLogin: false }, ssoAdmin)).status, 200);
   await ctx.provider.close(); // the identity provider goes away
@@ -242,4 +246,11 @@ test('password login can be turned back on while the provider is down (no discov
   assert.equal((await res.json()).passwordLogin, true);
   assert.equal(ctx.provider.requests.discovery, discoveries);
   assert.equal((await send(ctx.base, 'POST', '/api/auth/login', { username: 'admin', password: 'admin-pass-1' })).status, 200);
+});
+
+test('GET /system/auth reports auto-create as not in effect without a group allowlist', async (t) => {
+  const ctx = await setup(t, { OIDC_AUTO_CREATE: 'true' });
+  const body = await (await send(ctx.base, 'GET', '/api/system/auth', undefined, ctx.admin)).json();
+  assert.equal(body.sso.autoCreate, true);
+  assert.equal(body.sso.autoCreateEffective, false);
 });

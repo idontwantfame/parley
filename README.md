@@ -195,7 +195,7 @@ Parley's bot connects **out** to Discord over a websocket, so it needs **no publ
 - **Cloud LLM (default):** only the final transcript *text* is sent to Gemini/OpenAI. Easiest, cheapest, great quality.
 - **Fully offline:** run [Ollama](https://ollama.com) (on the host or another box) and select it in Settings. Nothing ever leaves your network.
 
-> **Security:** the dashboard requires a **login**. On first run it seeds a default `admin` / `admin` account — sign in, and Parley **requires you to set a new password before the dashboard unlocks** (the rest of the API is gated until you do). Admins can add more users (username + optional email + password) and reset passwords; any user can change their own. Sensitive operations (API keys, Discord credentials, bot/sidecar control, deleting or merging meetings) are **admin-only**. Login is rate-limited against brute force, requests are same-origin-checked (CSRF), sessions are httpOnly cookies (marked `Secure` over https) that are revoked when a password changes, and passwords are scrypt-hashed (8-char minimum) in the same SQLite db. The server binds `127.0.0.1` by default (and, in Docker, only the host's localhost). To reach it from another machine, tunnel over SSH (`ssh -L 3000:127.0.0.1:3000 user@host`) or front it with a reverse proxy + TLS. Do **not** expose port 3000 to the internet directly.
+> **Security:** the dashboard requires a **login**. On first run Parley creates an `admin` account with a **random password printed once in the server log** (`docker compose logs bot | grep -A4 "First run"`, or the terminal running `npm start`) — sign in with it, and Parley **requires you to set a new password before the dashboard unlocks** (the rest of the API is gated until you do). Installs created before this change keep their `admin` / `admin` login until it's changed. Admins can add more users (username + optional email + password) and reset passwords; any user can change their own. Sensitive operations are **admin-only**: API keys, Discord credentials, bot/sidecar control, stopping a live recording, deleting or merging meetings, imports, the summarizer/fallback/notes-channel and transcription settings, prompts and retention. Parley is built for **one team**: every dashboard user can read every server's meetings, so only give accounts to people who should see them all. Login and password changes are rate-limited against brute force, responses carry a Content-Security-Policy and anti-framing headers, requests are same-origin-checked (CSRF), sessions are httpOnly cookies (marked `Secure` over https) that are revoked when a password changes, and passwords are scrypt-hashed (8-char minimum) in the same SQLite db. The server binds `127.0.0.1` by default (and, in Docker, only the host's localhost). To reach it from another machine, tunnel over SSH (`ssh -L 3000:127.0.0.1:3000 user@host`) or front it with a reverse proxy + TLS. Do **not** expose port 3000 to the internet directly.
 
 ## 📦 Prerequisites
 
@@ -289,7 +289,7 @@ npm start
 
 > `npm start` loads `.env` automatically via Node's `--env-file` flag (Node 20+). If your shell already has empty `DISCORD_TOKEN=` etc., the `.env` values win.
 
-The bot connects to Discord **and** the web dashboard comes up at **<http://127.0.0.1:3000>** (first login `admin` / `admin`; you'll be required to set a new password before the dashboard unlocks). Haven't set a Discord token yet? Open the dashboard and paste it into the first-run wizard — Parley connects and registers its slash commands live, no restart. Run headless (no dashboard) with `WEB_UI=0 npm start`.
+The bot connects to Discord **and** the web dashboard comes up at **<http://127.0.0.1:3000>** (first login: `admin` with the first-run password printed in the server log; you'll be required to set a new password before the dashboard unlocks). Haven't set a Discord token yet? Open the dashboard and paste it into the first-run wizard — Parley connects and registers its slash commands live, no restart. Run headless (no dashboard) with `WEB_UI=0 npm start`.
 
 For production, keep both processes alive with a process manager:
 
@@ -381,6 +381,8 @@ Speech-to-text is pluggable per server. The default needs no API key; the cloud 
 - **sidecar** *(default)* — local [faster-whisper](https://github.com/SYSTRAN/faster-whisper) running in its own container. Fully offline and free. Transcription runs on your **NVIDIA GPU automatically** when available (falls back to CPU; override with `STT_DEVICE=cpu|cuda` and `STT_COMPUTE`), and uses **batched inference** for 1.7–2.6x throughput (`STT_BATCH_SIZE` tunes the batch, `0` disables). Pick a model size from `tiny` to `large-v3-turbo`.
 - **openai** — OpenAI or any OpenAI-compatible `/audio/transcriptions` endpoint. Set `OPENAI_API_KEY` (and `OPENAI_BASE_URL`). Lets you skip running the sidecar entirely.
 
+**Sidecar access key.** The sidecar has no login of its own. If it's reachable by other devices — e.g. it runs on another PC on your network — set the same `STT_API_KEY` for Parley and the sidecar (in the project `.env`, which Docker Compose passes to both). The sidecar then refuses requests without it; Parley's **Settings → Transcription** shows whether a key is set. A key saved from the dashboard only reaches Parley, so set it on the sidecar's environment too. The sidecar also answers *busy* when its queue is full (`STT_MAX_QUEUE`, default 8 waiting requests); Parley waits and retries instead of failing.
+
 Every backend returns the same `{ text, words }` shape with word-level timestamps, so per-speaker attribution and talk-time stats work the same way regardless of provider. Switch in **Settings → Transcription** or with `/setup stt_provider:…`.
 
 > Want to try it before wiring up a meeting? `node scripts/try-stt.mjs --provider openai` transcribes a recorded `.pcm` track (or any `--file`) and prints the text + timing.
@@ -404,7 +406,7 @@ One-time setup for speaker detection (about two minutes):
 
 **Fully local.** Hugging Face is only contacted to download the models once; they're cached in the `/models` volume (alignment models download per language on first use and need no token). After the first import you can set `HF_HUB_OFFLINE=1` on the sidecar: from then on it makes no network calls and the token isn't needed. Audio never leaves the machine running the sidecar — pair it with the Ollama summarizer and nothing leaves your network.
 
-Limits: `IMPORT_MAX_BYTES` (default 2 GiB) caps the upload and `IMPORT_STT_TIMEOUT_MS` (default 3 hours) bounds transcription. ffmpeg must be installed where the bot runs (the Docker image has it). Behind a reverse proxy, raise its request body size and timeout to match. Imported audio follows `AUDIO_RETENTION_DAYS` like other kept recordings.
+Imports are processed one at a time (others show *Waiting for another import to finish…*), so a long import never starves live meetings' transcription. Limits: `IMPORT_MAX_BYTES` (default 2 GiB) caps the upload and `IMPORT_STT_TIMEOUT_MS` (default 3 hours) bounds transcription; on the sidecar, `STT_MAX_UPLOAD_BYTES` (default 2 GiB) caps any upload and `STT_MAX_DIARIZE_SECONDS` (default 6 hours) caps recordings sent for speaker detection — raise it if you import longer ones. ffmpeg must be installed where the bot runs (the Docker image has it). Behind a reverse proxy, raise its request body size and timeout to match. Imported audio follows `AUDIO_RETENTION_DAYS` like other kept recordings.
 
 ## 🔒 Privacy & consent
 
@@ -524,7 +526,7 @@ terminal and `npm run web:dev` (Vite on :5173, proxies `/api` to :3000) in
 another.
 
 **Security:** the UI binds to 127.0.0.1 only and requires a login (default
-`admin` / `admin`; you must set a new password before the dashboard unlocks).
+`admin` with the first-run password printed in the server log; you must set a new password before the dashboard unlocks).
 Sessions are httpOnly cookies (`Secure` over https) that are revoked on password
 change, requests are same-origin-checked (CSRF), login attempts are rate-limited,
 passwords are scrypt-hashed (8-char minimum) in SQLite, and destructive/system
@@ -545,8 +547,8 @@ The dashboard can let people sign in with your identity provider over OpenID Con
 
 **Who gets in, and who's an admin**
 
-- Accounts are created on first sign-in (turn off **Create accounts on first sign-in** to allow only existing accounts). An existing Parley account is linked when the provider reports the same email as **verified**.
-- **Allowed groups** (optional) adds a second check on top of the application binding.
+- Accounts are created on first sign-in **only when Allowed groups is set** (`OIDC_ALLOWED_GROUPS`, e.g. the group you bound the Authentik application to) — without it, only people who already have a Parley account can sign in, so a misconfigured provider can't hand out accounts. An existing Parley account is linked when the provider reports the same email as **verified**.
+- **Allowed groups** also acts as a second check on top of the application binding.
 - **Admin group** (optional, e.g. `parley-admins`): its members become admins and others lose admin rights, re-checked at every sign-in — the last remaining admin is never demoted automatically. Leave it empty to manage admins by hand on the Account page.
 - Authentik's default `profile` scope puts a `groups` claim (group names) in the token; other providers may need a groups scope or claim mapping (**Scopes** and **Groups claim** settings).
 

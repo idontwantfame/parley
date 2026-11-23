@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useLive } from '../LiveContext.jsx';
+import { useIsAdmin } from '../AuthContext.jsx';
 import { AvatarStack, Icon } from './ui.jsx';
 import { fmtClock } from '../lib/format.js';
 
@@ -29,15 +30,24 @@ export function RecDot({ size = 8 }) {
   );
 }
 
+// Stopping a recording is admin-only on the server, so other users don't get
+// a button that would only fail.
 function StopButton({ channelId, small = false }) {
+  const isAdmin = useIsAdmin();
+  if (!isAdmin) return null;
+  return <StopControl channelId={channelId} small={small} />;
+}
+
+function StopControl({ channelId, small }) {
   const { stop } = useLive();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   async function run() {
+    if (busy) return;
     if (!window.confirm('Stop this recording? Parley will leave the channel and post the notes.')) return;
     setBusy(true); setErr(null);
     try { await stop(channelId); }
-    catch (e) { setErr(e?.message || 'Failed to stop.'); setBusy(false); }
+    catch (e) { setErr(e?.status === 403 ? 'Only admins can stop a recording.' : (e?.message || 'Failed to stop.')); setBusy(false); }
   }
   return (
     <div className="flex items-center gap-2">
@@ -62,6 +72,7 @@ export function LiveCard({ session }) {
 
 export function ProgressText({ progress }) {
   if (!progress) return 'Preparing transcription…';
+  if (progress.stage === 'queued') return 'Waiting for another import to finish…';
   if (progress.stage === 'summarizing') return 'Generating notes…';
   if (progress.stage === 'importing') return 'Transcribing and detecting speakers…';
   if (progress.stage === 'archiving') return 'Saving the recording…';

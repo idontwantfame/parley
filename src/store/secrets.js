@@ -16,6 +16,7 @@ import { chmod, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
+import { lookup as dnsLookup } from 'node:dns/promises';
 import { config, DEFAULT_OLLAMA_URL, resolveEnvFile } from '../config/env.js';
 
 // provider -> { env: ENV_VAR_NAME, apply(config, value) }
@@ -35,6 +36,8 @@ const CONNECTION_SETTINGS = {
   discordClientId: { env: 'DISCORD_CLIENT_ID', secret: false, apply: (c, v) => { c.discordClientId = v; } },
   sttUrl: { env: 'STT_URL', secret: false, apply: (c, v) => { c.sttUrl = v || 'http://127.0.0.1:8000'; } },
   ollamaUrl: { env: 'OLLAMA_URL', secret: false, apply: (c, v) => { c.ollama = { ...c.ollama, url: v || DEFAULT_OLLAMA_URL }; } },
+  // The sidecar's optional shared access key (write-only; '' removes it).
+  sttApiKey: { env: 'STT_API_KEY', secret: true, apply: (c, v) => { c.sttApiKey = v; } },
 };
 
 export function isSecretProvider(provider) {
@@ -118,6 +121,35 @@ export function isBlockedHost(hostname) {
   if (host === 'metadata.google.internal' || host === '0.0.0.0' || host === '::') return true;
   if (isIP(host) === 4) return /^169\.254\./.test(host); // IPv4 link-local + cloud metadata
   return isIP(host) === 6 && /^fe[89ab][\da-f]:/.test(host); // IPv6 link-local fe80::/10
+}
+
+// How long saving a URL waits for its name to resolve before giving up.
+const LOOKUP_TIMEOUT_MS = 3000;
+
+async function resolveAll(host, lookup) {
+  let timer;
+  const timedOut = new Promise((resolve) => { timer = setTimeout(resolve, LOOKUP_TIMEOUT_MS, []); });
+  try {
+    return await Promise.race([lookup(host, { all: true, verbatim: true }), timedOut]);
+  } catch {
+    return []; // not resolvable (yet): it can't reach anything now
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Does this hostname — or any address its name resolves to right now — hit a
+ * blocked (link-local / cloud-metadata) address? A name that does not resolve
+ * counts as not blocked. DNS can change after this check (rebinding), so it
+ * narrows the SSRF surface rather than closing it.
+ */
+export async function resolvesToBlockedHost(hostname, lookup = dnsLookup) {
+  if (isBlockedHost(hostname)) return true;
+  const host = hostname.replace(/^\[|\]$/g, '');
+  if (isIP(host)) return false;
+  const addresses = await resolveAll(host, lookup);
+  return addresses.some(({ address }) => isBlockedHost(address));
 }
 
 function assertSttUrlSafe(value) {
@@ -223,6 +255,7 @@ export function connectionStatus(env = config) {
     discordClientId: { set: !!env.discordClientId, value: env.discordClientId || '' },
     sttUrl: { set: !!env.sttUrl, value: redactUrl(env.sttUrl || '') },
     ollamaUrl: { set: !!env.ollama?.url, value: ollamaUrl },
+    sttApiKeySet: !!env.sttApiKey,
   };
 }
 
@@ -236,16 +269,30 @@ function normalizeConnectionValue(key, raw) {
   return value;
 }
 
+// The URLs Parley's server sends requests to must not resolve to a blocked
+// address either (ALLOW_REMOTE_STT=1 still lifts this for the STT URL).
+const RESOLVED_URL_LABELS = { sttUrl: 'STT URL', ollamaUrl: 'Ollama URL' };
+
+async function assertResolvesSafely(key, value, lookup) {
+  const label = RESOLVED_URL_LABELS[key];
+  if (!label || !value) return;
+  if (key === 'sttUrl' && process.env.ALLOW_REMOTE_STT === '1') return;
+  if (await resolvesToBlockedHost(new URL(value).hostname, lookup)) {
+    throw new Error(`${label} resolves to a blocked address (link-local or cloud metadata).`);
+  }
+}
+
 /**
  * Apply a patch of connection settings. Only known keys are accepted. All of
  * them are validated first, then persisted in one write, then applied to the
  * live config — a bad value leaves both the file and the config untouched.
  * A value of '' clears the setting. Returns the new connectionStatus.
  */
-export async function setConnection(patch = {}, { env = config, envPath = resolveEnvFile() } = {}) {
+export async function setConnection(patch = {}, { env = config, envPath = resolveEnvFile(), lookup = dnsLookup } = {}) {
   const entries = Object.keys(patch)
     .filter((k) => Object.prototype.hasOwnProperty.call(CONNECTION_SETTINGS, k))
     .map((k) => [k, normalizeConnectionValue(k, patch[k])]);
+  for (const [k, value] of entries) await assertResolvesSafely(k, value, lookup);
   if (entries.length) await persistEnv(entries.map(([k, value]) => [CONNECTION_SETTINGS[k].env, value]), envPath);
   for (const [k, value] of entries) CONNECTION_SETTINGS[k].apply(env, value || undefined);
   return connectionStatus(env);

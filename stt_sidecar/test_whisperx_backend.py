@@ -28,6 +28,7 @@ class FakeWhisperX:
         self.align_load_error = align_load_error
         self.align_load_delay = align_load_delay
         self.align_loads, self.align_calls, self.pipelines, self.diarize_calls, self.assigned = [], [], [], [], []
+        self.cache_empties = []
 
     def load_align_model(self, language_code, device, **kwargs):
         self.align_loads.append((language_code, device))
@@ -80,10 +81,11 @@ def install(monkeypatch, fake, cuda=False):
     diarize_mod = types.ModuleType("whisperx.diarize")
     diarize_mod.DiarizationPipeline = fake.pipeline_class()
     alignment = types.ModuleType("whisperx.alignment")
-    alignment.DEFAULT_ALIGN_MODELS_TORCH = {"en": "WAV2VEC2_ASR_BASE_960H"}
+    alignment.DEFAULT_ALIGN_MODELS_TORCH = {"en": "WAV2VEC2_ASR_BASE_960H", "fr": "VOXPOPULI_ASR_BASE_10K_FR"}
     alignment.DEFAULT_ALIGN_MODELS_HF = {"ja": "jonatasgrosman/wav2vec2-large-xlsr-53-japanese"}
     torch = types.ModuleType("torch")
-    torch.cuda = types.SimpleNamespace(is_available=lambda: cuda)
+    torch.cuda = types.SimpleNamespace(is_available=lambda: cuda,
+                                       empty_cache=lambda: fake.cache_empties.append(True))
     for name, mod in {"whisperx": top, "whisperx.diarize": diarize_mod,
                       "whisperx.alignment": alignment, "torch": torch}.items():
         monkeypatch.setitem(sys.modules, name, mod)
@@ -230,14 +232,104 @@ def test_language_without_an_align_model_keeps_whispers_word_timings(monkeypatch
         (" hi", 0.0, "SPEAKER_01"), (" there", 0.5, "SPEAKER_01")]
 
 
-def test_align_model_load_failure_keeps_whisper_timings_and_is_retried(monkeypatch):
+def test_align_model_load_failure_keeps_whisper_timings_and_is_retried_later(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(whisperx_backend, "_now", lambda: clock[0])
     label, fake = labeller(monkeypatch, FakeWhisperX(align_load_error=OSError("network down")))
     out = label(SEGMENTS, AUDIO, "en", None, None)
     assert out[1]["words"][0]["start"] == 2.0 and out[1]["speaker"] == "SPEAKER_00"
     fake.align_load_error = None
+    # Remembered for a while: a hub timeout isn't paid again on every request.
+    clock[0] += whisperx_backend.ALIGN_RETRY_SECONDS - 1
+    out = label(SEGMENTS, AUDIO, "en", None, None)
+    assert out[1]["words"][0]["start"] == 2.0
+    assert len(fake.align_loads) == 1
+    clock[0] += 2
     out = label(SEGMENTS, AUDIO, "en", None, None)
     assert out[1]["words"][0]["start"] == 2.01
     assert len(fake.align_loads) == 2
+
+
+def test_a_failed_align_model_does_not_hold_back_other_languages(monkeypatch):
+    fake = FakeWhisperX()
+    real_load = fake.load_align_model
+    def load(language_code, device, **kw):
+        if language_code == "en":
+            fake.align_loads.append((language_code, device))
+            raise OSError("network down")
+        return real_load(language_code, device, **kw)
+    fake.load_align_model = load
+    label, _ = labeller(monkeypatch, fake)
+    label(SEGMENTS, AUDIO, "en", None, None)
+    out = label(SEGMENTS, AUDIO, "fr", None, None)
+    assert out[0]["words"][0]["start"] == 0.01  # fr aligned
+    assert fake.align_loads == [("en", "cpu"), ("fr", "cpu")]
+
+
+def test_at_most_two_align_models_stay_loaded(monkeypatch):
+    label, fake = labeller(monkeypatch, cuda=True)
+    for language in ("en", "ja", "en", "fr", "en", "ja"):
+        label(SEGMENTS, AUDIO, language, None, None)
+    # en is reused while recent; ja is evicted by fr, then loaded again.
+    assert [lang for lang, _ in fake.align_loads] == ["en", "ja", "fr", "ja"]
+    assert whisperx_backend.MAX_ALIGN_MODELS == 2
+    assert fake.cache_empties  # evicting frees the GPU cache
+
+
+def test_an_evicted_align_model_is_unreferenced_when_memory_is_released(monkeypatch):
+    import gc
+    import weakref
+
+    class AlignModel:
+        pass
+    fake = FakeWhisperX()
+    refs = {}
+    def load(language_code, device, **kw):
+        fake.align_loads.append((language_code, device))
+        model = AlignModel()
+        refs[language_code] = weakref.ref(model)
+        return model, {"language": language_code}
+    fake.load_align_model = load
+    label, _ = labeller(monkeypatch, fake, cuda=True)
+    alive_at_release = []
+    def empty_cache():
+        gc.collect()
+        alive_at_release.append(refs["en"]() is not None)
+    sys.modules["torch"].cuda.empty_cache = empty_cache
+    monkeypatch.setattr(whisperx_backend, "_has_align_model", lambda language: True)
+    # Alignment itself is not under test (and the fake would keep the model in align_calls).
+    monkeypatch.setattr(whisperx_backend._Labeller, "_align_segment", lambda self, seg, model, audio: [])
+    for language in ("en", "ja", "fr"):
+        label(SEGMENTS, AUDIO, language, None, None)
+    assert alive_at_release == [False]
+
+
+# ── giving memory back ───────────────────────────────────────────────────────
+
+def test_release_memory_empties_the_cuda_cache_when_torch_uses_cuda(monkeypatch):
+    fake = install(monkeypatch, FakeWhisperX(), cuda=True)
+    whisperx_backend.release_memory()
+    assert fake.cache_empties == [True]
+
+
+def test_release_memory_is_a_no_op_on_cpu(monkeypatch):
+    fake = install(monkeypatch, FakeWhisperX(), cuda=False)
+    whisperx_backend.release_memory()
+    assert fake.cache_empties == []
+
+
+def test_release_memory_never_imports_torch(monkeypatch):
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    whisperx_backend.release_memory()
+    assert "torch" not in sys.modules
+
+
+def test_release_memory_survives_a_failing_cache_flush(monkeypatch):
+    install(monkeypatch, FakeWhisperX(), cuda=True)
+    def boom():
+        raise RuntimeError("CUDA error: device-side assert")
+    sys.modules["torch"].cuda.empty_cache = boom
+    whisperx_backend.release_memory()  # logged, not raised
 
 
 def test_a_segment_that_fails_to_align_keeps_its_own_words(monkeypatch):

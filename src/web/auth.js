@@ -137,7 +137,8 @@ export function requireAdmin(req, res, next) {
 // default password (must_change_password). Auth routes (login/logout/me/password)
 // are mounted *before* this, so the user can still authenticate and set a real
 // password — they just can't touch anything else until they do. Without this, a
-// reachable instance with the default admin/admin is fully operable by anyone.
+// reachable instance with a leaked first-run password (or an older install's
+// admin/admin) would be fully operable by anyone.
 export function requirePasswordChanged(_users) {
   return (req, res, next) => {
     if (!req.user) return res.status(401).json({ error: 'Not authenticated.' });
@@ -214,8 +215,10 @@ export function authRouter({ users, oidc = SSO_OFF, now = () => Date.now(), logi
   // Current user (or null). Drives the frontend's auth gate; never 401s.
   // `authEnabled: true` tells the client this server enforces login (older
   // servers without this route make the client fall back to open mode).
-  // `defaultPasswordActive` lets the login screen show the admin/admin hint only
-  // while it's actually true, instead of advertising it to every visitor.
+  // `defaultPasswordActive` lets the login screen show the first-sign-in hint
+  // only while the seeded admin still has its initial password, and
+  // `firstRunPasswordInLog` says that password is the random one printed to the
+  // server log (older installs were seeded with admin/admin).
   // `sso` drives the "Sign in with SSO" button (enabled only once the provider
   // was discovered) and `passwordLogin` whether the password form is shown.
   r.get('/auth/me', (req, res) => {
@@ -226,6 +229,7 @@ export function authRouter({ users, oidc = SSO_OFF, now = () => Date.now(), logi
       authEnabled: true,
       user: req.user || null,
       defaultPasswordActive: users.defaultPasswordActive ? users.defaultPasswordActive() : undefined,
+      firstRunPasswordInLog: users.firstRunPasswordInLog ? users.firstRunPasswordInLog() : false,
       sso: oidc.publicInfo(),
       passwordLogin: oidc.passwordLoginEnabled(),
     });
@@ -246,12 +250,22 @@ export function authRouter({ users, oidc = SSO_OFF, now = () => Date.now(), logi
     if (next.length < PASSWORD_MIN) {
       return res.status(400).json({ error: `New password must be at least ${PASSWORD_MIN} characters.` });
     }
+    // Guesses of the current password count against the account (a stolen
+    // session must not become an unlimited password oracle).
+    const limitKey = `password-change|${req.user.id}`;
+    const retryAfter = loginLimiter.retryAfterSec(limitKey);
+    if (retryAfter !== null) {
+      res.set('Retry-After', String(retryAfter));
+      return res.status(429).json({ error: `Too many wrong passwords. Try again in ${retryAfter}s.` });
+    }
     const row = users.getUserByUsername(req.user.username);
     const mustChange = !!row?.must_change_password;
     if (!mustChange) {
+      loginLimiter.fail(limitKey);
       if (!(await users.authenticate(req.user.username, current))) {
         return res.status(400).json({ error: 'Current password is incorrect.' });
       }
+      loginLimiter.reset(limitKey);
     }
     users.setPassword(req.user.id, next);
     users.deleteUserSessions(req.user.id); // revoke all sessions, including this one

@@ -5,6 +5,7 @@ import { SystemProvider, useSystem } from './SystemContext.jsx';
 import { AuthProvider, useAuth } from './AuthContext.jsx';
 import { LiveProvider } from './LiveContext.jsx';
 import Layout from './components/Layout.jsx';
+import ErrorBoundary from './components/ErrorBoundary.jsx';
 import Login from './pages/Login.jsx';
 import ForcePasswordChange from './pages/ForcePasswordChange.jsx';
 import Onboarding from './pages/Onboarding.jsx';
@@ -118,9 +119,13 @@ function Gate() {
 }
 
 export default function App() {
+  // Last line of defence: an unexpected render error shows a reload card
+  // instead of a blank page.
   return (
-    <AuthProvider>
-      <Gate />
-    </AuthProvider>
+    <ErrorBoundary fullPage>
+      <AuthProvider>
+        <Gate />
+      </AuthProvider>
+    </ErrorBoundary>
   );
 }

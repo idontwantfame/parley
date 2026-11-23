@@ -8,8 +8,11 @@ import { openDb } from '../src/store/db.js';
 import { installUsers, USERNAME_MAX } from '../src/store/users.js';
 import { authRouter, attachUser, createLoginLimiter, sameOrigin } from '../src/web/auth.js';
 
+// The seeded admin's first-run password is random; pin it to 'admin' here.
+const ADMIN_SEED = { firstRunPassword: 'admin', log: { warn() {}, info() {}, log() {} } };
+
 function appWith(db, { trustProxy, loginLimiter } = {}) {
-  const users = installUsers(db);
+  const users = installUsers(db, ADMIN_SEED);
   const app = express();
   if (trustProxy !== undefined) app.set('trust proxy', trustProxy);
   app.use(express.json({ limit: '256kb' }));
@@ -151,7 +154,7 @@ test('same-origin check honours X-Forwarded-Host from a trusted proxy only', asy
 
 test('sessions are stored as SHA-256 digests and still resolve', () => {
   const db = openDb(':memory:');
-  const users = installUsers(db);
+  const users = installUsers(db, ADMIN_SEED);
   const admin = users.getUserByUsername('admin');
   const { token } = users.createSession(admin.id);
   const stored = db.sql.prepare('SELECT token FROM sessions').all().map((r) => r.token);
@@ -161,12 +164,12 @@ test('sessions are stored as SHA-256 digests and still resolve', () => {
 
 test('existing plaintext sessions are hashed on install and keep working', () => {
   const db = openDb(':memory:');
-  const users = installUsers(db);
+  const users = installUsers(db, ADMIN_SEED);
   const admin = users.getUserByUsername('admin');
   const legacy = 'ab'.repeat(32);
   db.sql.prepare(`INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`)
     .run(legacy, admin.id, new Date().toISOString(), new Date(Date.now() + 60_000).toISOString());
-  const again = installUsers(db);
+  const again = installUsers(db, ADMIN_SEED);
   const rows = db.sql.prepare('SELECT token FROM sessions').all();
   assert.equal(rows.some((r) => r.token === legacy), false);
   assert.ok(rows.some((r) => r.token.includes(createHash('sha256').update(legacy).digest('hex'))));
@@ -175,7 +178,7 @@ test('existing plaintext sessions are hashed on install and keep working', () =>
 
 test('expired sessions are purged when a new session is created', () => {
   const db = openDb(':memory:');
-  const users = installUsers(db);
+  const users = installUsers(db, ADMIN_SEED);
   const admin = users.getUserByUsername('admin');
   users.createSession(admin.id, -1_000);
   users.createSession(admin.id);
@@ -183,7 +186,7 @@ test('expired sessions are purged when a new session is created', () => {
 });
 
 test('authenticate yields to the event loop for known and unknown users', async () => {
-  const users = installUsers(openDb(':memory:'));
+  const users = installUsers(openDb(':memory:'), ADMIN_SEED);
   for (const name of ['admin', 'nobody']) {
     let ticked = false;
     const pending = users.authenticate(name, 'wrong-password');

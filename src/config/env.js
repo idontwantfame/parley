@@ -71,6 +71,8 @@ export const config = {
   recordingNickname: resolveRecordingNickname(),
   notesBaseUrl: process.env.WEB_PUBLIC_URL?.trim(),
   sttUrl: process.env.STT_URL || 'http://127.0.0.1:8000',
+  // Optional shared secret the sidecar requires (sent as a Bearer token).
+  sttApiKey: process.env.STT_API_KEY?.trim() || undefined,
   gemini: { apiKey: process.env.GEMINI_API_KEY },
   openai: { apiKey: process.env.OPENAI_API_KEY, baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1' },
   opencode: { apiKey: process.env.OPENCODE_API_KEY, baseUrl: process.env.OPENCODE_BASE_URL || 'https://opencode.ai/zen/go/v1' },

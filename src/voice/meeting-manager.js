@@ -71,15 +71,38 @@ export class MeetingManager {
     // starts), so waitForFinalize can't miss a stop that is still flushing.
     let settle;
     this.finalizing.set(session.meetingId, new Promise((resolve) => { settle = resolve; }));
+    let done = null;
     try {
       if (session.stopAll) await session.stopAll();  // flush in-flight speaking turns first
+      done = this.beginFinalize(session, settle);
     } catch (err) {
-      this.finalizing.delete(session.meetingId);
-      settle();
+      // Flushing or saving the stop failed: the meeting must not stay
+      // 'recording' (nothing would ever pick it up); its audio stays for a retry.
+      this.markStopFailed(session.meetingId);
       throw err;
+    } finally {
+      if (!done) {
+        this.processing.delete(session.meetingId);
+        this.finalizing.delete(session.meetingId);
+        settle();
+      }
     }
-    const tracks = session.registry.list();
+    return { meetingId: session.meetingId, done };
+  }
 
+  markStopFailed(meetingId) {
+    try {
+      const m = this.db.getMeeting(meetingId);
+      if (m && (m.status === 'recording' || m.status === 'processing')) this.db.setMeetingStatus(meetingId, 'transcription_failed');
+    } catch (err) {
+      console.error(`[pipeline] meeting ${meetingId}: could not mark the failed stop: ${err?.message || err}`);
+    }
+  }
+
+  // Mark the meeting processing and kick finalize WITHOUT awaiting; returns
+  // the pipeline promise (settles `settle` when it is over).
+  beginFinalize(session, settle) {
+    const tracks = session.registry.list();
     const stoppedAt = this.now();
     this.db.setMeetingStatus(session.meetingId, 'processing', stoppedAt);
     this.processing.set(session.meetingId, {
@@ -91,11 +114,11 @@ export class MeetingManager {
       stoppedAt,
     });
 
-    // Kick finalize WITHOUT awaiting. It settles (success or failure) → the
-    // meeting leaves the processing map, so a failed pipeline can't strand a
-    // phantom "Processing" card. finalize owns its own error handling/reporting;
-    // if a throw escapes it (an unexpected crash outside its try/catch), fail
-    // loud: log prominently AND unstuck the row so the dashboard doesn't show
+    // finalize settles (success or failure) → the meeting leaves the
+    // processing map, so a failed pipeline can't strand a phantom "Processing"
+    // card. finalize owns its own error handling/reporting; if a throw escapes
+    // it (an unexpected crash outside its try/catch), fail loud: log
+    // prominently AND unstick the row so the dashboard doesn't show
     // "Processing" until the next boot reconcile (which only runs at process
     // start, so without this a stuck row hangs between restarts).
     const done = Promise.resolve()
@@ -114,8 +137,7 @@ export class MeetingManager {
         settle();
       });
     done.catch(() => {}); // callers may not await `done` — never leave an unhandled rejection
-
-    return { meetingId: session.meetingId, done };
+    return done;
   }
 
   /**

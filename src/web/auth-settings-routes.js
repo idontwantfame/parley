@@ -16,6 +16,7 @@
 
 import { requireAdmin } from './auth.js';
 import { redactUrl } from '../store/secrets.js';
+import { autoCreateEffective } from '../config/auth-settings.js';
 import {
   AuthSettingsError, mergeAuthSettings, normalizeAuthPatch, redirectUriFor,
 } from '../store/oidc-settings.js';
@@ -32,7 +33,8 @@ export function authSettingsView(oidc) {
     sso: {
       enabled: s.enabled, issuer: redactUrl(s.issuer), clientId: s.clientId, clientSecretSet: !!s.clientSecret,
       scopes: s.scopes, groupsClaim: s.groupsClaim, allowedGroups: [...s.allowedGroups], adminGroup: s.adminGroup,
-      autoCreate: s.autoCreate, label: s.label, status, error,
+      // Accounts are only created automatically with a group allowlist.
+      autoCreate: s.autoCreate, autoCreateEffective: autoCreateEffective(s), label: s.label, status, error,
     },
     passwordLogin: s.passwordLogin, // configured
     passwordLoginEffective: oidc.passwordLoginEnabled(),

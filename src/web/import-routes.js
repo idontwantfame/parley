@@ -20,10 +20,12 @@ import { requireAdmin } from './auth.js';
 import { intQuery, isSingleQuery } from './api-input.js';
 
 export const DEFAULT_IMPORT_TITLE = 'Imported recording';
-// How long the web server allows for receiving one whole request. Node's
-// default (5 minutes) would cut off a multi-gigabyte upload on a normal link;
-// header reads keep their own short timeout.
+// How long an admin's recording upload may take to arrive. The server's
+// default deadline (5 minutes, request-deadline.js) would cut off a
+// multi-gigabyte upload on a normal link; only this request gets longer.
 export const IMPORT_REQUEST_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+// An upload that sends nothing for this long is treated as abandoned.
+export const IMPORT_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const TITLE_MAX = 100;
 const SPEAKERS_MAX = 20;
 const QUERY_FIELDS = ['title', 'startedAt', 'language', 'post', 'filename', 'speakers', 'minSpeakers', 'maxSpeakers'];
@@ -113,13 +115,21 @@ const tooLargeMessage = (maxBytes) => `The recording is larger than the ${Math.f
 
 class UploadTooLarge extends Error {}
 
+const UPLOAD_INTERRUPTED = 'The upload was interrupted.';
+const clientGone = (req) => req.destroyed || req.readableAborted || (req.socket?.destroyed ?? false);
+
 // The body is read through a PassThrough so that refusing it mid-stream never
 // destroys the request itself (which would cut the connection before the
-// client could read the 413). A client that goes away still fails the copy.
+// client could read the 413). A client that goes away still fails the copy —
+// also one that left before this was attached (its 'close' already fired).
 function detachedBody(req) {
   const body = new PassThrough();
+  if (clientGone(req) && !req.complete) {
+    body.destroy(new Error(UPLOAD_INTERRUPTED));
+    return body;
+  }
   req.once('error', (err) => body.destroy(err));
-  req.once('close', () => { if (!req.complete) body.destroy(new Error('The upload was interrupted.')); });
+  req.once('close', () => { if (!req.complete) body.destroy(new Error(UPLOAD_INTERRUPTED)); });
   req.pipe(body);
   return body;
 }
@@ -146,9 +156,12 @@ async function saveUpload(req, { dir, ext, maxBytes }) {
   }
 }
 
-// Close the connection on a refusal: the client may still be sending a large
-// body that nobody will read.
-const refuse = (res, status, error) => res.set('Connection', 'close').status(status).json({ error });
+// Close the connection on every refusal: the client may still be sending a
+// large body that nobody will read. What still arrives is discarded until then.
+function refuse(req, res, status, error) {
+  req.resume();
+  return res.set('Connection', 'close').status(status).json({ error });
+}
 
 function capabilityError(capability, speakers) {
   if (!capability.available) return capability.reason || 'The local speech-to-text sidecar is not available.';
@@ -198,20 +211,35 @@ export function mountImportRoutes(r, {
       const saved = await saveUpload(req, { dir: join(dataDir, IMPORT_UPLOADS_DIR), ext: options.ext, maxBytes });
       if (saved.bytes > 0) return saved;
       await rm(saved.path, { force: true });
-      refuse(res, 400, EMPTY_BODY);
+      refuse(req, res, 400, EMPTY_BODY);
     } catch (err) {
-      // Keep the connection: the rest of the body is discarded as it arrives,
-      // and the client reads the 413 once it stops sending.
-      if (err instanceof UploadTooLarge) return void res.status(413).json({ error: tooLargeMessage(maxBytes) });
-      if (req.destroyed || req.aborted) return void log.error?.('[import] upload aborted by the client.');
+      // The rest of a too-large body is discarded as it arrives (saveUpload
+      // resumed it); the connection closes after the 413.
+      if (err instanceof UploadTooLarge) return void refuse(req, res, 413, tooLargeMessage(maxBytes));
+      if (clientGone(req)) {
+        req.destroy();
+        return void log.error?.('[import] upload aborted by the client.');
+      }
+      // Anything else (disk full…) ends in a 500 from the error handler; don't
+      // keep reading the body or reuse the connection.
+      res.set('Connection', 'close');
+      req.resume();
       throw err;
     }
     return null;
   }
 
+  // Only now (signed-in admin, options valid, sidecar ready) may the upload
+  // take longer than the server's default request deadline.
+  function allowLongUpload(req) {
+    req.extendDeadline?.(IMPORT_REQUEST_TIMEOUT_MS);
+    req.setTimeout?.(IMPORT_IDLE_TIMEOUT_MS);
+  }
+
   r.post('/guilds/:g/imports', requireAdmin, async (req, res) => {
     const { status, error, options } = await precheck(req);
-    if (error) return refuse(res, status, error);
+    if (error) return refuse(req, res, status, error);
+    allowLongUpload(req);
     const upload = await receive(req, res, options);
     if (!upload) return;
     const { title, startedAt, language, speakers, minSpeakers, maxSpeakers, post } = options;

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api.js';
 import { useGuild } from '../GuildContext.jsx';
+import { useIsAdmin } from '../AuthContext.jsx';
 import { Page, PageHead } from '../components/Page.jsx';
 import { Avatar, Icon, Empty } from '../components/ui.jsx';
 import { fmtDateShort } from '../lib/format.js';
@@ -28,13 +29,14 @@ function peopleOf(todo, canon) {
   return [...new Set(splitAssignees(todo.assignee).map((n) => canon.get(n) || n))];
 }
 
-function TodoRow({ todo, onToggle, people }) {
+function TodoRow({ todo, onToggle, people, canEdit }) {
   const [busy, setBusy] = useState(false);
   const done = Boolean(todo.done);
-  async function change() { if (busy) return; setBusy(true); try { await onToggle(todo); } finally { setBusy(false); } }
+  async function change() { if (busy || !canEdit) return; setBusy(true); try { await onToggle(todo); } finally { setBusy(false); } }
   return (
     <li className="flex items-start gap-3 px-4 py-3 hover:bg-surface-2 transition-colors group">
-      <input type="checkbox" checked={done} onChange={change} disabled={busy} className="pcheck mt-0.5" aria-label={todo.task} />
+      <input type="checkbox" checked={done} onChange={change} disabled={busy || !canEdit} className="pcheck mt-0.5" aria-label={todo.task}
+        title={canEdit ? undefined : 'Only admins can edit action items.'} />
       <div className="min-w-0 flex-1">
         <span className={`text-[14px] leading-relaxed block ${done ? 'line-through text-muted' : 'text-ink'}`}>{todo.task}</span>
         <div className="flex items-center gap-2 mt-1 flex-wrap">
@@ -61,6 +63,7 @@ function Skeleton() {
 
 export default function ActionItems() {
   const { guildId } = useGuild();
+  const isAdmin = useIsAdmin();
   const [todos, setTodos] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -157,7 +160,7 @@ export default function ActionItems() {
           <div className="card"><Empty icon={Icon.Check} title={showDone ? 'No action items' : 'All caught up'} body={showDone ? 'Action items appear here once meetings are summarized.' : 'No open tasks in this view.'} /></div>
         ) : (
           <ul className="card p-1 divide-y divide-border">
-            {visible.map((t) => <TodoRow key={t.id} todo={t} onToggle={toggle} people={peopleOf(t, canon)} />)}
+            {visible.map((t) => <TodoRow key={t.id} todo={t} onToggle={toggle} people={peopleOf(t, canon)} canEdit={isAdmin} />)}
           </ul>
         )}
     </Page>

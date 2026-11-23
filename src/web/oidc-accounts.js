@@ -7,12 +7,14 @@
 //   2. Linked      — an account linked to (issuer, sub) is used as is.
 //   3. Email link  — else a single local account with the same email is linked,
 //                    but ONLY when the provider says email_verified === true.
-//   4. Auto-create — else (OIDC_AUTO_CREATE) a new SSO-only, non-admin account.
+//   4. Auto-create — else (OIDC_AUTO_CREATE, and only with an allowlist) a new
+//                    SSO-only, non-admin account.
 //   5. Admin sync  — OIDC_ADMIN_GROUP set → admin = membership, at every sign-in,
 //                    except the last remaining admin is never demoted.
 // Failures are { error: code } using the /?authError= codes of the callback.
 
 import { normalizeUsername, USERNAME_MAX } from '../store/users.js';
+import { autoCreateEffective } from '../config/auth-settings.js';
 
 const MAX_USERNAME_SUFFIX = 100;
 const USERNAME_DISALLOWED = /[^\p{L}\p{N}._-]+/gu;
@@ -111,7 +113,7 @@ export function resolveSsoAccount({ users, settings, profile, log = console }) {
   const linked = users.getUserByOidc(profile.issuer, profile.subject);
   let result = linked ? { user: linked } : linkByVerifiedEmail(users, profile);
   if (!result) {
-    if (!settings.autoCreate) return { error: 'no_account' };
+    if (!autoCreateEffective(settings)) return { error: 'no_account' };
     result = createAccount(users, profile, settings);
   }
   if (result.error) return result;

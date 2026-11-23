@@ -2,6 +2,7 @@ import { ChannelType } from 'discord.js';
 import { renderNotesChunks } from './discord-notes.js';
 import { resolveSummaryLanguage } from '../adapters/summarizer/languages.js';
 import { config } from '../config/env.js';
+import { QUIET_MESSAGE } from './discord-safe.js';
 
 function meetingLink(base, id) {
   if (!base) return null;
@@ -71,7 +72,7 @@ export async function postNotes({ client, meeting, cfg, notes, talktime }) {
   let sent = 0;
   try {
     for (const content of parts) {
-      await target.send({ content, allowedMentions: { parse: [] } });
+      await target.send({ content, ...QUIET_MESSAGE });
       sent++;
     }
   } catch (error) {

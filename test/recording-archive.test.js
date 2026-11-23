@@ -59,3 +59,17 @@ test('archiving keeps the recording start point next to the MP3', async (t) => {
   assert.ok(!files.some((f) => f.endsWith('.pcm')));
   assert.equal(await recordingOriginMs(dir), 4000);
 });
+
+test('the archive encoder opens its input with only local file and pipe protocols', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'parley-archive-guard-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, 'u1_1000.pcm'), Buffer.alloc(48000 * 2 * 2));
+  let seen = null;
+  await archiveRecording(dir, { transcriptionComplete: false, run: async (_cmd, args) => {
+    seen = args;
+    await writeFile(args.at(-1), 'mp3');
+  } });
+  const guard = seen.indexOf('-protocol_whitelist');
+  assert.ok(guard >= 0 && guard < seen.indexOf('-i'), seen.join(' '));
+  assert.equal(seen[guard + 1], 'file,pipe');
+});

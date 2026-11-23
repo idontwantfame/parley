@@ -22,7 +22,7 @@ export const IMPORT_INTERRUPTED = 'Parley restarted while this recording was bei
 // transcript was already saved (then a retry can still re-summarize it).
 async function reconcileImport(db, meeting, audioRoot, { remove, log }) {
   db.setImportError(meeting.id, IMPORT_INTERRUPTED);
-  if (db.listUtterances(meeting.id).length > 0) return;
+  if (db.hasUtterances(meeting.id)) return;
   db.setAudioRetained(meeting.id, false);
   try {
     await remove(join(audioRoot, String(meeting.id)), { recursive: true, force: true });

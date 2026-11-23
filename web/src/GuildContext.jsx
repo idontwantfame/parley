@@ -63,13 +63,19 @@ export function GuildProvider({ children }) {
         if (!disposed) setLoading(false);
       }
     }
+    // Background tabs skip the periodic refresh; coming back refreshes at once.
+    function tick() {
+      if (!document.hidden) void load();
+    }
     void load();
-    const timer = setInterval(load, REFRESH_MS);
+    const timer = setInterval(tick, REFRESH_MS);
     window.addEventListener('focus', load);
+    document.addEventListener('visibilitychange', tick);
     return () => {
       disposed = true;
       clearInterval(timer);
       window.removeEventListener('focus', load);
+      document.removeEventListener('visibilitychange', tick);
     };
   }, []);
 

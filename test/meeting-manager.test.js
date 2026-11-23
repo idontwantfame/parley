@@ -264,3 +264,38 @@ test('a failing flush does not leave a phantom in-flight entry', async () => {
   await assert.rejects(mgr.stop('g', 'c'), /flush boom/);
   assert.deepEqual(await mgr.waitForFinalize(10), { timedOut: false, pending: 0 });
 });
+
+test('a failure after the flush (e.g. saving the processing status) still settles and never leaves it recording', async () => {
+  const db = openDb(':memory:');
+  const real = db.setMeetingStatus.bind(db);
+  const flaky = { ...db, setMeetingStatus: (id, status, ...rest) => {
+    if (status === 'processing') throw new Error('database is locked');
+    return real(id, status, ...rest);
+  } };
+  let finalized = 0;
+  const mgr = new MeetingManager({
+    db: flaky, audioRoot: '/tmp/audio',
+    startCapture: () => ({ registry: { list: () => [] }, stopAll: async () => {} }),
+    finalize: async () => { finalized++; },
+    now: () => '2026-06-04T10:00:00Z',
+  });
+  const id = mgr.start({ guildId: 'g', channelId: 'c', channelName: 'x', connection: {}, guild: {}, attendees: [] });
+  await assert.rejects(mgr.stop('g', 'c'), /database is locked/);
+  assert.deepEqual(await mgr.waitForFinalize(10), { timedOut: false, pending: 0 });
+  assert.equal(mgr.listProcessing().length, 0);
+  assert.equal(finalized, 0);
+  assert.equal(db.getMeeting(id).status, 'transcription_failed', 'a retry can pick it up from the saved audio');
+});
+
+test('a failing flush marks the meeting failed instead of leaving it recording', async () => {
+  const db = openDb(':memory:');
+  const mgr = new MeetingManager({
+    db, audioRoot: '/tmp/audio',
+    startCapture: () => ({ registry: { list: () => [] }, stopAll: async () => { throw new Error('flush boom'); } }),
+    finalize: async () => {},
+    now: () => '2026-06-04T10:00:00Z',
+  });
+  const id = mgr.start({ guildId: 'g', channelId: 'c', channelName: 'x', connection: {}, guild: {}, attendees: [] });
+  await assert.rejects(mgr.stop('g', 'c'), /flush boom/);
+  assert.equal(db.getMeeting(id).status, 'transcription_failed');
+});

@@ -32,6 +32,8 @@ Imports (src/pipeline/import.js, src/web/import-routes.js): admins upload a reco
 
 Dashboard SSO (OIDC, off by default): src/web/oidc*.js + auth-settings-routes.js, settings in src/config/auth-settings.js / src/store/oidc-settings.js (env OIDC_*, PUBLIC_URL, PASSWORD_LOGIN; dashboard writes .env via persistEnv). Uses openid-client v6 (code flow + PKCE); identity = users.(oidc_issuer, oidc_subject); link by verified email only; optional admin-group sync never demotes the last admin; password login can't be turned off unless the acting admin is SSO-linked, and only takes effect once an admin SSO sign-in has verified the current settings fingerprint (OIDC_VERIFIED in .env; any provider/URL/group change clears it). Recovery: PASSWORD_LOGIN=true + restart.
 
+Security/ops conventions: the server sends a strict Content-Security-Policy (src/web/security-headers.js) — any new external script, style, font, image or API origin used by the UI must be added there. Requests get a 5-minute deadline (src/web/request-deadline.js); only admin import uploads get 2 h. The first-run admin password is random and printed once to the log. Parley↔sidecar auth: optional shared STT_API_KEY (Bearer), see src/adapters/stt-access.js and stt_sidecar/request_guard.py; the sidecar returns 503 busy + Retry-After when its queue is full, which the client waits on. Imports run one at a time (createSerialQueue in src/pipeline/import.js).
+
 Slash commands: /join /leave /summary /history /search /ask /recap /journal /campaign /setup (src/commands/). Auto-join when >1 human, auto-leave when ≤1 (src/voice/decisions.js).
 
 ## Key conventions / gotchas

@@ -1,4 +1,5 @@
 /** Pure rendering functions: StructuredNotes + talk-time stats → Discord markdown. */
+import { neutralizeMaskedLinks } from './discord-safe.js';
 
 const LABELS = {
   en: {
@@ -168,7 +169,10 @@ export function renderNotes(notes, talktime, meta = {}) {
 /** Split Discord messages while repeating section and topic context on continuation. */
 export function renderNotesChunks(notes, talktime, meta = {}, limit = 1900) {
   const continued = LABELS[language(meta)].continued;
-  const sections = sectionsFor(notes, talktime, meta);
+  // Notes are model output: no masked links in what Discord shows.
+  const sections = sectionsFor(notes, talktime, meta).map((section) => ({
+    ...section, heading: neutralizeMaskedLinks(section.heading), lines: section.lines.map(neutralizeMaskedLinks),
+  }));
   const out = [];
   let current = '';
   const flush = () => { if (current) { out.push(current); current = ''; } };

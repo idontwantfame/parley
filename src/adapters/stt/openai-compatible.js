@@ -1,5 +1,4 @@
-import { basename } from 'node:path';
-import { errorBodySnippet, fileBlob, isTimeoutError } from '../http.js';
+import { errorBodySnippet, fileBlob, isTimeoutError, uploadName } from '../http.js';
 
 // One adapter for every OpenAI-compatible speech-to-text endpoint
 // (POST {baseUrl}/audio/transcriptions). OpenAI and other OpenAI-compatible
@@ -27,7 +26,7 @@ async function wavDurationSec(blob) {
 
 function buildForm(file, filePath, opts) {
   const form = new FormData();
-  form.append('file', file, basename(filePath));
+  form.append('file', file, uploadName(filePath));
   if (opts.model) form.append('model', opts.model);
   if (supportsWordTimestamps(opts.model)) {
     form.append('response_format', 'verbose_json');

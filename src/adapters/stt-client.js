@@ -1,6 +1,10 @@
-import { basename } from 'node:path';
 import { config } from '../config/env.js';
-import { errorBodySnippet, fetchWithTimeouts, fileBlob, isTimeoutError } from './http.js';
+import { errorBodySnippet, fetchWithTimeouts, fileBlob, isTimeoutError, uploadName } from './http.js';
+import {
+  busyBudget, isBusyReply, retryAfterMs, sidecarRefusal, sttAuthHeaders, SIDECAR_KEY_REJECTED, SIDECAR_NEEDS_KEY,
+} from './stt-access.js';
+
+export { SIDECAR_KEY_REJECTED, SIDECAR_NEEDS_KEY };
 
 // Generous: one call transcribes a whole speaking turn, which on CPU can take
 // minutes for the larger models. This only fires on a stalled (silent) sidecar;
@@ -29,25 +33,37 @@ export function sidecarErrorDetail(body) {
 
 const ERROR_DETAIL_MAX = 300;
 
+// The error for a sidecar reply that isn't OK.
+function sidecarError(res, detail) {
+  const { status } = res;
+  if (isBusyReply(status, detail)) {
+    return Object.assign(new Error('The transcription sidecar is busy with other recordings.'),
+      { status, busy: true, retryAfterMs: retryAfterMs(res.headers?.get?.('retry-after')) });
+  }
+  if (status < 400 || status >= 500) return Object.assign(new Error(`STT sidecar HTTP ${status}${detail ? `: ${detail}` : ''}`), { status });
+  // 4xx is a client error (bad request/model/payload, wrong access key) —
+  // retrying re-uploads the whole file to fail again. Its reason reaches the user.
+  const userMessage = sidecarRefusal(status, detail);
+  const message = status === 401 || status === 403 ? userMessage : `STT sidecar HTTP ${status}${detail ? `: ${detail}` : ''}`;
+  return Object.assign(new Error(message), { status, noRetry: true, userMessage });
+}
+
 async function postTrack(url, file, filePath, opts, { fetchImpl, timeoutMs }) {
   const form = new FormData();
-  form.append('file', file, basename(filePath));
+  form.append('file', file, uploadName(filePath));
   form.append('model', opts.model || 'small');
   form.append('language', opts.language || 'auto');
   if (opts.vocabulary) form.append('vocabulary', opts.vocabulary);
   appendDiarization(form, opts);
-  const res = await fetchImpl(url, { method: 'POST', body: form, signal: AbortSignal.timeout(timeoutMs) });
+  const res = await fetchImpl(url, { method: 'POST', body: form, headers: sttAuthHeaders(), signal: AbortSignal.timeout(timeoutMs) });
   if (res.ok) return res.json();
   // Always consume the body so the connection is released, and keep the
   // sidecar's reason (e.g. {"detail":"Unsupported model"}) for the user.
   const detail = sidecarErrorDetail(await errorBodySnippet(res, 1000)).slice(0, ERROR_DETAIL_MAX);
-  const err = new Error(`STT sidecar HTTP ${res.status}${detail ? `: ${detail}` : ''}`);
-  err.status = res.status;
-  // 4xx is a client error (bad request/model/payload) — retrying re-uploads
-  // the whole file to fail again. Only retry 5xx / network errors.
-  if (res.status >= 400 && res.status < 500) err.noRetry = true;
-  throw err;
+  throw sidecarError(res, detail);
 }
+
+const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export async function transcribeFile(filePath, opts = {}, deps = {}) {
   const baseUrl = deps.baseUrl || config.sttUrl;
@@ -55,9 +71,11 @@ export async function transcribeFile(filePath, opts = {}, deps = {}) {
   const fetchImpl = deps.fetchImpl || fetchWithTimeouts(timeoutMs);
   const retries = deps.retries ?? 1;
   const backoffMs = deps.backoffMs ?? 500;
+  const sleep = deps.sleep ?? defaultSleep;
+  const busy = busyBudget(deps.random);
   const file = await fileBlob(filePath, deps);
-  let lastErr;
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  let attempt = 0;
+  for (;;) {
     try {
       return await postTrack(`${baseUrl}/transcribe`, file, filePath, opts, { fetchImpl, timeoutMs });
     } catch (err) {
@@ -66,15 +84,16 @@ export async function transcribeFile(filePath, opts = {}, deps = {}) {
       if (isTimeoutError(err)) {
         throw new Error(`STT sidecar timed out after ${Math.round(timeoutMs / 1000)}s`, { cause: err });
       }
-      lastErr = err;
-      if (err?.noRetry) break; // don't burn retries on a permanent client error
+      // Busy (its queue is full): wait as asked, without using up a retry.
+      const wait = err?.busy ? busy.next(err.retryAfterMs) : null;
+      if (wait !== null) { await sleep(wait); continue; }
+      // Don't burn retries on a permanent client error, or a sidecar still busy.
+      if (err?.noRetry || err?.busy || attempt >= retries) throw err;
+      attempt += 1;
       // Back off before retrying a transient failure (stalled/booting sidecar).
-      if (attempt < retries && backoffMs > 0) {
-        await new Promise((r) => setTimeout(r, backoffMs * (attempt + 1)));
-      }
+      if (backoffMs > 0) await sleep(backoffMs * attempt);
     }
   }
-  throw lastErr;
 }
 
 export const OUTDATED_SIDECAR_REASON = "This sidecar version doesn't support speaker detection; update it to the -full image.";
@@ -102,18 +121,23 @@ function capabilityFromHealth(body) {
 export async function sidecarCapability({ baseUrl = config.sttUrl, fetchImpl = fetch, timeoutMs = HEALTH_TIMEOUT_MS } = {}) {
   let res;
   try {
-    res = await fetchImpl(`${baseUrl}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    res = await fetchImpl(`${baseUrl}/health`, { headers: sttAuthHeaders(), signal: AbortSignal.timeout(timeoutMs) });
   } catch (err) {
     const why = isTimeoutError(err) ? `it did not answer within ${Math.round(timeoutMs / 1000)}s` : 'connection failed';
     return unavailable(`The local speech-to-text sidecar is not reachable (${why}). Start it and try again.`);
   }
   if (!res.ok) {
-    await errorBodySnippet(res);
+    const detail = sidecarErrorDetail(await errorBodySnippet(res)).slice(0, ERROR_DETAIL_MAX);
+    if (res.status === 401 || res.status === 403) return unavailable(sidecarRefusal(res.status, detail));
     return unavailable(`The local speech-to-text sidecar answered HTTP ${res.status}. Check its logs and try again.`);
   }
+  let body;
   try {
-    return capabilityFromHealth(await res.json());
+    body = await res.json();
   } catch {
     return unavailable('The local speech-to-text sidecar sent an unreadable health report.');
   }
+  // It would refuse every upload without the key Parley doesn't have.
+  if (body?.auth === 'key' && !config.sttApiKey) return unavailable(SIDECAR_NEEDS_KEY);
+  return capabilityFromHealth(body);
 }

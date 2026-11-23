@@ -23,7 +23,7 @@ import { autoExportMeeting } from '../delivery/meeting-export.js';
 import { campaignContextFor, foldMeetingIntoJournal } from '../campaign/journal.js';
 import { withMeetingProgress } from './progress.js';
 import { deliverSavedNotes } from '../delivery/status.js';
-import { retainRecording } from '../voice/recording-archive.js';
+import { canDiscardAudio, retainRecording } from '../voice/recording-archive.js';
 
 // Statuses the UI should offer a retry for. Never 'recording': that would
 // transcribe partial PCM while capture is still writing it, mark the meeting
@@ -83,7 +83,7 @@ export function regeneratePlan(db, meetingId) {
       ? 'This meeting is still being recorded or processed.'
       : 'Only completed meetings can be regenerated — use Retry for failed ones.' };
   }
-  if (db.listUtterances(meetingId).length === 0) {
+  if (!db.hasUtterances(meetingId)) {
     return { ok: false, meeting, reason: 'This meeting has no transcript to summarize.' };
   }
   return { ok: true, meeting };
@@ -135,7 +135,7 @@ async function settleRetriedAudio(db, meeting, cfg, audioDir, progress) {
 export function retryPlan(db, meetingId, { dataDir, exists = readdirSync } = {}) {
   const meeting = db.getMeeting(meetingId);
   if (!meeting) return { ok: false, action: 'none', reason: 'Meeting not found.' };
-  const hasUtterances = db.listUtterances(meetingId).length > 0;
+  const hasUtterances = db.hasUtterances(meetingId);
   let pcmCount = 0;
   try { pcmCount = exists(join(dataDir, 'audio', String(meetingId))).filter((f) => f.endsWith('.pcm')).length; }
   catch { pcmCount = 0; }
@@ -204,9 +204,11 @@ export async function retryMeeting(db, meetingId, { dataDir, deliver = null } = 
     const { notes, empty, exported, exports, exportError, audioRetained } =
       await processMeeting(db, meetingId, { tracks, cfg, deliver });
     // Success (or a confirmed-empty meeting): the PCM has served its purpose, so
-    // drop the audio dir. The bot's own finalize does this too, but a retry runs
-    // outside that path and would otherwise leak the directory forever.
-    if (!audioRetained) await rm(audioDir, { recursive: true, force: true }).catch(() => {});
+    // drop the audio dir — like the bot's finalize, only once the transcript is
+    // complete; a still-partial one keeps it for another retry.
+    if (canDiscardAudio({ audioRetained }, db.getMeeting(meetingId))) {
+      await rm(audioDir, { recursive: true, force: true }).catch(() => {});
+    }
     return { ok: true, action: 'retranscribe', status: db.getMeeting(meetingId)?.status,
       empty: !notes || !!empty, exported, exports, exportError };
   } catch (err) {

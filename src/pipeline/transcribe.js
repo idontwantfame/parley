@@ -1,4 +1,3 @@
-import { convertPcmToWav } from '../voice/audio.js';
 import { getSTT, resolveSttModel } from '../adapters/stt/index.js';
 import { unlink } from 'node:fs/promises';
 
@@ -148,8 +147,12 @@ export function diarizedLines({ text = '', words = [], segments = [] } = {}) {
 // meeting (audit A2): failures are caught per-track and collected instead
 // of thrown, and the good utterances are still returned. Callers decide
 // whether "some/all tracks failed" is fatal.
+// The STT adapters upload a .pcm track as WAV straight from the PCM file
+// (adapters/http.js fileBlob), so by default nothing is converted on disk.
+// `deps.convert(pcmPath, wavPath)` (tests) still writes a separate file, which
+// is then cleaned up.
 export async function transcribeTracks(tracks, cfg = {}, deps = {}) {
-  const convert = deps.convert || convertPcmToWav;
+  const convert = deps.convert || null;
   // Resolve the configured STT provider (sidecar | openai) once per
   // meeting. The provider default can be overridden via deps.stt in tests.
   const transcribe = getSTT(cfg, deps.env, deps.sttDeps);
@@ -169,11 +172,11 @@ export async function transcribeTracks(tracks, cfg = {}, deps = {}) {
     while (nextTrack < tracks.length) {
       const i = nextTrack++;
       const t = tracks[i];
-      const wavPath = t.pcmPath.replace(/\.pcm$/, '.wav');
+      const wavPath = convert ? t.pcmPath.replace(/\.pcm$/, '.wav') : null;
       let failed = false;
       try {
-        await convert(t.pcmPath, wavPath);
-        const lines = transcriptLines(await stt(wavPath, cfg));
+        if (convert) await convert(t.pcmPath, wavPath);
+        const lines = transcriptLines(await stt(wavPath ?? t.pcmPath, cfg));
         if (!lines.length) continue; // silent track — not a failure, just nothing said
         results[i] = lines.map((line) => ({
           userId: t.userId,
@@ -186,7 +189,7 @@ export async function transcribeTracks(tracks, cfg = {}, deps = {}) {
         failed = true;
         failures.push({ userId: t.userId, displayName: t.displayName, error: err.message || String(err) });
       } finally {
-        await cleanup(wavPath);
+        if (wavPath) await cleanup(wavPath);
         deps.onTrackDone?.({ failed });
       }
     }

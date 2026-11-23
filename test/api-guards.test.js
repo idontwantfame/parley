@@ -92,6 +92,42 @@ test('merge refuses sources that are being processed or delivered', async (t) =>
   } finally { release(); await running; }
 });
 
+const PENDING_RETRY_MERGE = "Retry this meeting's transcription before merging (some speakers' audio is still waiting to be transcribed).";
+
+test('merge refuses a target or source whose partial transcript still awaits re-transcription', async (t) => {
+  const dir = sandbox(t);
+  const db = openDb(':memory:');
+  db.sql.prepare(`INSERT INTO guild_config (guild_id, summarizer_provider) VALUES ('g1', 'fake')`).run();
+  const partial = meeting(db, { text: 'first half' });
+  db.setTranscriptionComplete(partial, false);
+  addAudio(dir, partial);
+  const complete = meeting(db, { text: 'second half' });
+  db.setTranscriptionComplete(complete, true);
+  const call = await serve(t, db);
+
+  for (const [target, source] of [[partial, complete], [complete, partial]]) {
+    const res = await call('POST', `/meetings/${target}/merge`, { sourceIds: [source] });
+    assert.equal(res.status, 409, `merge ${source} into ${target}`);
+    assert.deepEqual(await res.json(), { error: PENDING_RETRY_MERGE });
+  }
+  assert.ok(db.getMeeting(complete));
+  assert.equal(db.listUtterances(partial).length, 1);
+  assert.ok(existsSync(join(dir, 'audio', String(partial))));
+});
+
+test('merge allows a partial transcript once its audio is gone (nothing left to re-transcribe)', async (t) => {
+  sandbox(t);
+  const db = openDb(':memory:');
+  db.sql.prepare(`INSERT INTO guild_config (guild_id, summarizer_provider) VALUES ('g1', 'fake')`).run();
+  const target = meeting(db, { text: 'first half' });
+  db.setTranscriptionComplete(target, false);
+  const source = meeting(db, { text: 'second half' });
+  const call = await serve(t, db);
+
+  assert.equal((await call('POST', `/meetings/${target}/merge`, { sourceIds: [source] })).status, 200);
+  assert.equal(db.listUtterances(target).length, 2);
+});
+
 test('merge keeps ticked action items, refreshes the target export and removes the sources files', async (t) => {
   const dir = sandbox(t);
   const db = openDb(':memory:');
@@ -131,17 +167,64 @@ test('deleting a meeting removes its exported transcript files too', async (t) =
   assert.equal(existsSync(join(dir, 'audio', String(id))), false);
 });
 
-test('non-admins can change benign settings but not transcription, auto-join or prompts', async (t) => {
+test('non-admins can change benign settings but not transcription, summarizer, delivery, auto-join or prompts', async (t) => {
   const db = openDb(':memory:');
   meeting(db);
   const call = await serve(t, db, { user: { id: 2, username: 'bob', isAdmin: false } });
   for (const patch of [{ sttProvider: 'sidecar' }, { sttModel: 'whisper-1' }, { whisperModel: 'large-v3' }, { autoJoin: false }, { autoJoinMinPeople: 3 },
-    { autoJoinChannelIds: null }, { summaryPrompt: 'x' }, { overviewPrompt: 'y' }, { keepAudio: true }]) {
+    { autoJoinChannelIds: null }, { summaryPrompt: 'x' }, { overviewPrompt: 'y' }, { keepAudio: true },
+    { provider: 'fake' }, { model: 'm' }, { fallbackProvider: 'none' }, { fallbackModel: 'm' }, { notesChannelId: '123' }]) {
     assert.equal((await call('PATCH', '/guilds/g1/config', patch)).status, 403, JSON.stringify(patch));
   }
-  const ok = await call('PATCH', '/guilds/g1/config', { language: 'en', useThread: false });
+  const ok = await call('PATCH', '/guilds/g1/config', { language: 'en', useThread: false, summary_language: 'en' });
   assert.equal(ok.status, 200);
   assert.equal((await ok.json()).config.language, 'en');
+});
+
+// A live Discord client with one guild holding a text and a voice channel.
+function liveClient() {
+  const channels = new Map([
+    ['111111111111111111', { id: '111111111111111111', type: 0, name: 'notes' }],
+    ['222222222222222222', { id: '222222222222222222', type: 2, name: 'Voice' }],
+  ]);
+  channels.filter = (fn) => new Map([...channels].filter(([, c]) => fn(c)));
+  const guild = { id: 'g1', name: 'G', channels: { cache: channels } };
+  return { guilds: { cache: new Map([['g1', guild]]) }, channels: { cache: new Map() } };
+}
+
+test('notesChannelId must be a text channel of that server while the bot is connected', async (t) => {
+  const db = openDb(':memory:');
+  meeting(db);
+  const app = express();
+  app.use(express.json());
+  app.use('/api', apiRouter({ db, client: liveClient() }));
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise((r) => server.once('listening', r));
+  t.after(() => server.close());
+  const patch = (notesChannelId) => fetch(`http://127.0.0.1:${server.address().port}/api/guilds/g1/config`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ notesChannelId }),
+  });
+  for (const bad of ['222222222222222222', '333333333333333333', 'not-a-channel']) {
+    const res = await patch(bad);
+    assert.equal(res.status, 400, bad);
+    assert.match((await res.json()).error, /text channel/);
+  }
+  const ok = await patch('111111111111111111');
+  assert.equal(ok.status, 200);
+  assert.equal((await ok.json()).config.notesChannelId, '111111111111111111');
+  assert.equal((await patch(null)).status, 200, 'clearing it is always allowed');
+});
+
+test('stopping a live recording from the dashboard is admin-only', async (t) => {
+  const db = openDb(':memory:');
+  const stopped = [];
+  const bot = { liveMeetings: () => [], stopMeeting: async (g, c) => { stopped.push([g, c]); return { ok: true }; } };
+  const viewer = await serve(t, db, { bot, user: { id: 2, username: 'bob', isAdmin: false } });
+  assert.equal((await viewer('POST', '/guilds/g1/live/c1/stop')).status, 403);
+  assert.deepEqual(stopped, []);
+  const admin = await serve(t, db, { bot, user: { id: 1, username: 'root', isAdmin: true } });
+  assert.equal((await admin('POST', '/guilds/g1/live/c1/stop')).status, 200);
+  assert.deepEqual(stopped, [['g1', 'c1']]);
 });
 
 test('config PATCH rejects unknown servers and non-string ids', async (t) => {

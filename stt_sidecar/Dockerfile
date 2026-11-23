@@ -4,6 +4,13 @@
 # (mounted volume) so they survive container restarts. Build with
 # --build-arg WITH_DIARIZATION=1 for the *-full image with speaker detection
 # (WhisperX); its alignment/diarization models also cache under /models.
+#
+# SECURITY: the sidecar has no authentication unless STT_API_KEY is set; then
+# every endpoint but /health needs "Authorization: Bearer <STT_API_KEY>" (give
+# the bot the same value). Without a key, never publish port 8000 beyond the
+# compose network or a trusted LAN: anyone who reaches it can make it transcribe
+# (CPU/GPU time, uploads up to STT_MAX_UPLOAD_BYTES). Other limits:
+# STT_MAX_CONCURRENCY, STT_MAX_QUEUE, STT_MAX_DIARIZE_SECONDS (see server.py).
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
@@ -40,13 +47,14 @@ ENV TORCH_HOME=/models/torch \
     HF_HUB_DISABLE_TELEMETRY=1 \
     PYANNOTE_METRICS_ENABLED=false
 
-COPY stt_sidecar/server.py stt_sidecar/diarize.py stt_sidecar/whisperx_backend.py \
-     stt_sidecar/speaker_transcript.py ./
+COPY stt_sidecar/server.py stt_sidecar/request_guard.py stt_sidecar/diarize.py \
+     stt_sidecar/whisperx_backend.py stt_sidecar/speaker_transcript.py ./
 
 # The server runs as the unprivileged `stt` user. The container starts as root
-# only so the entrypoint can hand an existing (root-owned) /models volume to
-# `stt` once, then it drops privileges with setpriv (util-linux, in the base
-# image). A new named volume copies the ownership below on first use.
+# only so the entrypoint can hand an existing (root-owned) /models volume, and
+# HF_HOME/TORCH_HOME inside it, to `stt` once; then it drops privileges with
+# setpriv --no-new-privs (util-linux, in the base image). A new named volume
+# copies the ownership below on first use.
 RUN useradd --system --uid 10001 --user-group --no-create-home --home-dir /models \
       --shell /usr/sbin/nologin stt \
     && mkdir -p /models \

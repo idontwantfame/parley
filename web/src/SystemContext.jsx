@@ -53,10 +53,18 @@ export function SystemProvider({ children }) {
   const botStarting = Boolean(status?.managed && ['starting', 'stopping'].includes(status.bot?.state));
   const sidecarStarting = status?.sidecar?.state === 'starting';
   const pollMs = botStarting || sidecarStarting ? STARTING_POLL_MS : error ? ERROR_RETRY_MS : null;
+  // Hidden tabs skip the poll; becoming visible again refreshes immediately.
   useEffect(() => {
     if (!pollMs) return undefined;
-    const t = setInterval(refresh, pollMs);
-    return () => clearInterval(t);
+    function tick() {
+      if (!document.hidden) void refresh();
+    }
+    const t = setInterval(tick, pollMs);
+    document.addEventListener('visibilitychange', tick);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener('visibilitychange', tick);
+    };
   }, [pollMs, refresh]);
 
   const value = useMemo(() => ({ status, error, loading, refresh }), [status, error, loading, refresh]);

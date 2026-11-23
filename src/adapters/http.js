@@ -11,7 +11,9 @@
 // depends on it). Its own fetch is used with its own Agent so the two always
 // come from the same version.
 import { openAsBlob } from 'node:fs';
+import { basename } from 'node:path';
 import { Agent, fetch as undiciFetch } from 'undici';
+import { wavHeader } from '../voice/audio.js';
 
 const agents = new Map(); // timeoutMs -> Agent (reused so connections are pooled)
 
@@ -36,14 +38,23 @@ export function isTimeoutError(err) {
   return err.name === 'TimeoutError' || TIMEOUT_CODES.has(err.code) || TIMEOUT_CODES.has(err.cause?.code);
 }
 
+const isPcm = (filePath) => /\.pcm$/i.test(filePath);
+
 /**
  * The file as a Blob that streams from disk when sent, instead of reading a
- * (possibly 100+ MB) track into memory. An injected `readFile` (tests,
- * in-memory audio) still works.
+ * (possibly 100+ MB) track into memory. A raw `.pcm` track is sent as a WAV:
+ * a 44-byte header in front of the PCM file itself, so no WAV copy is ever
+ * written to disk. An injected `readFile` (tests, in-memory audio) still works.
  */
 export async function fileBlob(filePath, { readFile } = {}) {
-  if (readFile) return new Blob([await readFile(filePath)]);
-  return openAsBlob(filePath);
+  const data = readFile ? new Blob([await readFile(filePath)]) : await openAsBlob(filePath);
+  if (!isPcm(filePath)) return data;
+  return new Blob([wavHeader(data.size), data], { type: 'audio/wav' });
+}
+
+/** The name a file is uploaded under (a raw .pcm track goes out as .wav). */
+export function uploadName(filePath) {
+  return basename(filePath).replace(/\.pcm$/i, '.wav');
 }
 
 /**

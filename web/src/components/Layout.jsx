@@ -1,5 +1,13 @@
 import { Suspense, useState } from 'react';
-import { Link, NavLink, Outlet, useNavigate } from 'react-router-dom';
+import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { useGuild } from '../GuildContext.jsx';
+import { useTheme } from '../ThemeContext.jsx';
+import { useAuth } from '../AuthContext.jsx';
+import { useLive } from '../LiveContext.jsx';
+import { useDismissable } from '../hooks/useDismissable.js';
+import { Icon, Logo, Avatar } from './ui.jsx';
+import { RecDot } from './Live.jsx';
+import ErrorBoundary from './ErrorBoundary.jsx';
 
 function RouteFallback() {
   return (
@@ -8,13 +16,20 @@ function RouteFallback() {
     </div>
   );
 }
-import { useGuild } from '../GuildContext.jsx';
-import { useTheme } from '../ThemeContext.jsx';
-import { useAuth } from '../AuthContext.jsx';
-import { useLive } from '../LiveContext.jsx';
-import { useDismissable } from '../hooks/useDismissable.js';
-import { Icon, Logo, Avatar } from './ui.jsx';
-import { RecDot } from './Live.jsx';
+
+// A background session refresh (e.g. after saving sign-in settings) failed.
+// The current session stays usable; say so without taking over the page.
+function SessionRefreshNotice() {
+  const { refreshError, refresh, dismissRefreshError } = useAuth();
+  if (!refreshError) return null;
+  return (
+    <div className="mx-4 sm:mx-6 mt-4 flex flex-wrap items-center gap-2 rounded-sm bg-error-soft px-3 py-2 text-xs text-error" role="alert">
+      <span className="min-w-0 flex-1">Couldn't refresh your session: {refreshError}</span>
+      <button type="button" onClick={refresh} className="underline">Retry</button>
+      <button type="button" onClick={dismissRefreshError} className="underline">Dismiss</button>
+    </div>
+  );
+}
 
 const NAV = [
   { to: '/', label: 'Dashboard', icon: Icon.Home, end: true },
@@ -116,6 +131,7 @@ function NavItem({ to, label, icon: IconC, end, live }) {
 export default function Layout() {
   const { theme, toggle } = useTheme();
   const navigate = useNavigate();
+  const { pathname } = useLocation();
   const [q, setQ] = useState('');
   const [navOpen, setNavOpen] = useState(false); // mobile drawer
   const drawerRef = useDismissable(navOpen, () => setNavOpen(false));
@@ -130,12 +146,14 @@ export default function Layout() {
     <div className="flex h-screen overflow-hidden bg-bg">
       {/* Mobile backdrop */}
       {navOpen && <div className="fixed inset-0 bg-black/40 z-30 md:hidden" aria-hidden="true" />}
-      {/* ── Sidebar (static ≥md, slide-in drawer <md) ───────────────── */}
+      {/* ── Sidebar (static ≥md, slide-in drawer <md). The closed drawer is
+          visibility:hidden so its links drop out of the Tab order and the
+          accessibility tree; visibility switches after the slide-out. ── */}
       <aside
         ref={drawerRef}
         className={`shrink-0 flex flex-col bg-bg-2 border-r border-border z-40
-          max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:transition-transform
-          ${navOpen ? 'max-md:translate-x-0' : 'max-md:-translate-x-full'}`}
+          max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:transition-[transform,visibility]
+          ${navOpen ? 'max-md:translate-x-0' : 'max-md:-translate-x-full max-md:invisible'}`}
         style={{ width: 'var(--sidebar-w)' }}
       >
         <Link to="/" onClick={() => setNavOpen(false)} className="flex items-center gap-2.5 px-5 h-[60px] shrink-0 no-underline">
@@ -160,15 +178,16 @@ export default function Layout() {
       <div className="flex-1 flex flex-col min-w-0">
         <header className="shrink-0 h-[60px] border-b border-border bg-bg/80 backdrop-blur flex items-center gap-3 px-4 sm:px-6">
           {/* Hamburger — only below md, where the sidebar is a drawer. */}
-          <button onClick={() => setNavOpen(true)} aria-label="Open navigation"
+          <button onClick={() => setNavOpen(true)} aria-label="Open navigation" aria-expanded={navOpen}
             className="md:hidden h-9 w-9 grid place-items-center rounded-sm border border-border text-muted hover:text-ink hover:bg-surface-2 transition-colors">
             <Icon.Menu width={18} height={18} />
           </button>
           <GuildSwitcher />
 
-          <form onSubmit={onSearch} className="relative ml-2 hidden sm:block">
-            <Icon.Search width={15} height={15} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted" />
+          <form onSubmit={onSearch} role="search" className="relative ml-2 hidden sm:block">
+            <Icon.Search width={15} height={15} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted" aria-hidden="true" />
             <input
+              aria-label="Search transcripts"
               value={q}
               onChange={(e) => setQ(e.target.value)}
               placeholder="Search transcripts…"
@@ -191,10 +210,15 @@ export default function Layout() {
         </header>
 
         <main className="flex-1 overflow-y-auto">
-          {/* Route pages are lazy-loaded; keep the shell visible meanwhile. */}
-          <Suspense fallback={<RouteFallback />}>
-            <Outlet />
-          </Suspense>
+          <SessionRefreshNotice />
+          {/* Route pages are lazy-loaded; keep the shell visible meanwhile. A
+              crashed page (or a chunk missing after an update) is contained
+              here and cleared by navigating elsewhere. */}
+          <ErrorBoundary resetKey={pathname}>
+            <Suspense fallback={<RouteFallback />}>
+              <Outlet />
+            </Suspense>
+          </ErrorBoundary>
         </main>
       </div>
     </div>

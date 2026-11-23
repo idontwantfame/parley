@@ -606,3 +606,33 @@ test('PATCH config botNickname saves even when Discord refuses the nickname', as
     assert.match(body.nicknameError, /Missing Permissions/);
   } finally { close(); }
 });
+
+test('PUT /system/connection sets and removes the sidecar access key; status reports only whether it is set', async (t) => {
+  const { config: liveEnv } = await import('../src/config/env.js');
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'parley-api-sttkey-'));
+  const previous = { key: liveEnv.sttApiKey, envFile: process.env.PARLEY_ENV_FILE };
+  process.env.PARLEY_ENV_FILE = join(dir, '.env');
+  t.after(() => {
+    liveEnv.sttApiKey = previous.key;
+    if (previous.envFile === undefined) delete process.env.PARLEY_ENV_FILE; else process.env.PARLEY_ENV_FILE = previous.envFile;
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const db = openDb(':memory:');
+  const { base, close } = await listen(appWithUser(db, { id: 1, username: 'root', isAdmin: true }));
+  t.after(close);
+  const put = (body) => fetch(`${base}/api/system/connection`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const setRes = await put({ sttApiKey: 'abc123' });
+  assert.equal(setRes.status, 200);
+  assert.equal((await setRes.json()).connection.sttApiKeySet, true);
+  const status = await (await fetch(`${base}/api/system/status`)).json();
+  assert.equal(status.connection.sttApiKeySet, true);
+  assert.equal(JSON.stringify(status).includes('abc123'), false);
+  assert.equal((await put({ sttApiKey: '' })).status, 200);
+  assert.equal((await (await fetch(`${base}/api/system/status`)).json()).connection.sttApiKeySet, false);
+  assert.equal(liveEnv.sttApiKey, undefined);
+});

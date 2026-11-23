@@ -4,18 +4,28 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { openDb } from '../src/store/db.js';
 import { installUsers, USERNAME_MAX } from '../src/store/users.js';
-import { AUTH_DEFAULTS } from '../src/config/auth-settings.js';
+import { AUTH_DEFAULTS, autoCreateEffective } from '../src/config/auth-settings.js';
 import { profileFromClaims, resolveSsoAccount, usernameFor } from '../src/web/oidc-accounts.js';
+
+// The seeded admin's first-run password is random; pin it to 'admin' here.
+const ADMIN_SEED = { firstRunPassword: 'admin', log: { warn() {}, info() {}, log() {} } };
 
 const ISS = 'https://auth.example.com/application/o/parley/';
 
+// Automatic account creation needs a group allowlist, so unless a test sets
+// its own, everyone signing in here is in the allowed MEMBERS group.
+const MEMBERS = 'parley-users';
+const withMembers = (groups) => [...(Array.isArray(groups) ? groups : []), MEMBERS];
+
 function setup(extra = {}) {
-  const users = installUsers(openDb(':memory:'));
+  const users = installUsers(openDb(':memory:'), ADMIN_SEED);
   const warnings = [];
-  const settings = { ...AUTH_DEFAULTS, enabled: true, ...extra };
+  const ownAllowlist = extra.allowedGroups !== undefined;
+  const settings = { ...AUTH_DEFAULTS, enabled: true, allowedGroups: [MEMBERS], ...extra };
   const signIn = (claims) => resolveSsoAccount({
     users, settings, log: { warn: (m) => warnings.push(m), info() {} },
-    profile: profileFromClaims({ iss: ISS, sub: 'sub-1', ...claims }, settings.groupsClaim),
+    profile: profileFromClaims({ iss: ISS, sub: 'sub-1', ...claims,
+      ...(ownAllowlist ? {} : { groups: withMembers(claims.groups) }) }, settings.groupsClaim),
   });
   return { users, warnings, signIn };
 }
@@ -183,4 +193,22 @@ test('linking an account with a real password keeps that password', async () => 
   users.createUser({ username: 'kim', email: 'kim@example.com', password: 'pw123456' });
   signIn({ email: 'kim@example.com', email_verified: 'true' });
   assert.ok(await users.authenticate('kim', 'pw123456'));
+});
+
+test('auto-create takes effect only with a group allowlist; otherwise only existing accounts may sign in', () => {
+  const users = installUsers(openDb(':memory:'), ADMIN_SEED);
+  const settings = { ...AUTH_DEFAULTS, enabled: true, autoCreate: true, allowedGroups: [] };
+  const signIn = (claims) => resolveSsoAccount({ users, settings, log: { warn() {}, info() {} },
+    profile: profileFromClaims({ iss: ISS, sub: 'sub-x', ...claims }, settings.groupsClaim) });
+  assert.deepEqual(signIn({ preferred_username: 'stranger' }), { error: 'no_account' });
+  assert.equal(users.countUsers(), 1);
+  users.createUser({ username: 'kim', email: 'kim@example.com', password: 'pw123456' });
+  assert.equal(signIn({ email: 'kim@example.com', email_verified: true }).user.username, 'kim');
+  assert.equal(signIn({}).user.username, 'kim', 'the linked account keeps working');
+});
+
+test('autoCreateEffective needs auto-create on and a non-empty group allowlist', () => {
+  assert.equal(autoCreateEffective({ autoCreate: true, allowedGroups: [] }), false);
+  assert.equal(autoCreateEffective({ autoCreate: true, allowedGroups: ['staff'] }), true);
+  assert.equal(autoCreateEffective({ autoCreate: false, allowedGroups: ['staff'] }), false);
 });

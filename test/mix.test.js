@@ -140,3 +140,14 @@ test('recordingOriginMs falls back to the raw tracks, then to null', async () =>
     assert.equal(await recordingOriginMs(dir), 8000);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('recordingOriginMs skips empty raw tracks (the mix starts at the first audible one)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'parley-origin-empty-'));
+  try {
+    writeFileSync(join(dir, 'u1_7000.pcm'), Buffer.alloc(0));
+    writeFileSync(join(dir, 'u2_7500.pcm'), Buffer.alloc(1));
+    writeFileSync(join(dir, 'u3_9000.pcm'), Buffer.alloc(320));
+    writeFileSync(join(dir, 'u4_8000.pcm'), Buffer.alloc(320));
+    assert.equal(await recordingOriginMs(dir), 8000);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

@@ -267,3 +267,56 @@ test('a client that gives up mid-upload leaves no file and no meeting behind', a
     rmSync(ctx.dir, { recursive: true, force: true });
   }
 });
+
+test('a client that gives up while the upload is still being checked leaves no file behind', async () => {
+  const { connect } = await import('node:net');
+  let probes = 0;
+  const slowCapability = async () => { probes++; await new Promise((resolve) => setTimeout(resolve, 200)); return READY; };
+  const ctx = setup({ capability: READY, maxBytes: 1e9 });
+  const app = express();
+  app.use((req, _res, next) => { req.authResolved = true; req.user = { isAdmin: true }; next(); });
+  app.use('/api', apiRouter({ db: ctx.db, imports: { capability: slowCapability, dataDir: ctx.dir, maxBytes: 1e9,
+    log: { error: () => {} }, startImport: async () => assert.fail('nothing to import') } }));
+  app.use(jsonErrorHandler({ error: () => {} }));
+  const { base, close } = await listen(app);
+  try {
+    const socket = connect(Number(new URL(base).port), '127.0.0.1');
+    await new Promise((resolve) => socket.once('connect', resolve));
+    socket.write('POST /api/guilds/g1/imports HTTP/1.1\r\nHost: x\r\nContent-Type: audio/mpeg\r\nContent-Length: 100000\r\n\r\n');
+    socket.write(Buffer.alloc(1000));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    socket.destroy(); // gone while the sidecar capability check is still running
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(probes, 1);
+    assert.deepEqual(uploads(ctx.dir), []);
+    assert.equal(meetingCount(ctx.db), 0);
+  } finally {
+    close();
+    rmSync(ctx.dir, { recursive: true, force: true });
+  }
+});
+
+test('every refused upload closes the connection', async () => {
+  await withServer({ maxBytes: 1000 }, async ({ base }) => {
+    const refusals = [
+      await upload(base, '?speakers=maybe'),
+      await upload(base, '', Buffer.alloc(0)),
+      await upload(base, '', Buffer.alloc(1001)),
+    ];
+    let sent = 0;
+    const body = new ReadableStream({
+      async pull(controller) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        if (sent > 5000) return controller.close();
+        sent += 500;
+        controller.enqueue(new Uint8Array(500));
+      },
+    });
+    refusals.push(await fetch(`${base}/api/guilds/g1/imports`, { method: 'POST', body, duplex: 'half',
+      headers: { 'content-type': 'application/octet-stream' } }));
+    for (const res of refusals) {
+      assert.ok(res.status >= 400, `status ${res.status}`);
+      assert.equal(res.headers.get('connection'), 'close', `status ${res.status}`);
+    }
+  });
+});

@@ -75,7 +75,7 @@ function PasswordForm({ login }) {
 }
 
 export default function Login() {
-  const { login, defaultPasswordActive, sso, passwordLogin } = useAuth();
+  const { login, defaultPasswordActive, firstRunPasswordInLog, sso, passwordLogin } = useAuth();
   const [ssoError] = useState(takeSsoError);
   const showPassword = passwordLogin || !sso.enabled;
 
@@ -105,8 +105,15 @@ export default function Login() {
 
         {defaultPasswordActive && showPassword && (
           <p className="text-[11px] text-faint text-center leading-relaxed mt-5">
-            First time? The default account is <code className="text-muted">admin</code> / <code className="text-muted">admin</code>.
-            You'll be asked to change it right after you sign in.
+            {firstRunPasswordInLog ? (
+              <>
+                First time? Sign in as <code className="text-muted">admin</code> with the first-run password printed in the
+                server log (<code className="text-muted">docker compose logs bot</code>).
+              </>
+            ) : (
+              <>First time? The default account is <code className="text-muted">admin</code> / <code className="text-muted">admin</code>.</>
+            )}
+            {' '}You'll be asked to change it right after you sign in.
           </p>
         )}
       </div>

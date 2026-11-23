@@ -1,21 +1,6 @@
-import io, wave, struct
 from fastapi.testclient import TestClient
 from server import app, _state
-
-def make_silent_wav(seconds=1, rate=16000):
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
-        w.writeframes(struct.pack("<" + "h" * rate * seconds, *([0] * rate * seconds)))
-    buf.seek(0)
-    return buf
-
-class FakeModel:
-    def transcribe(self, path, **kwargs):
-        seg = type("S", (), {"text": "hello world", "start": 0.0, "end": 1.0,
-                             "words": [type("W", (), {"word": "hello", "start": 0.0, "end": 0.5})()]})()
-        info = type("I", (), {"language": "en"})()
-        return [seg], info
+from conftest import FakeModel, make_silent_wav, reset_state
 
 def test_health():
     client = TestClient(app)
@@ -30,9 +15,6 @@ def test_transcribe_returns_text(monkeypatch):
     body = r.json()
     assert body["text"] == "hello world"
     assert body["words"][0]["word"] == "hello"
-
-def reset_state():
-    _state.update(model=None, model_name=None, device=None, compute=None)
 
 def test_cuda_preload_skips_nvblas_which_would_hijack_cpu_blas(monkeypatch):
     # libnvblas (shipped in nvidia-cublas-cu12) interposes the BLAS symbols of
@@ -249,15 +231,15 @@ def stt_temp_files():
     return {f for f in os.listdir(tempfile.gettempdir()) if f.startswith("stt-")}
 
 
-def test_upload_temp_file_is_removed_when_writing_it_fails(monkeypatch):
-    import server
+def test_upload_is_decoded_from_the_received_file_without_a_second_copy(monkeypatch):
+    # The multipart parser already spooled the upload to disk; copying it to a
+    # second temp file stored every recording twice.
     before = stt_temp_files()
-    def boom(src, dst, *a, **kw): raise OSError("disk full")
-    monkeypatch.setattr(server.shutil, "copyfileobj", boom)
+    def no_second_copy(*a, **kw): raise AssertionError("the upload was copied to another file")
+    monkeypatch.setattr(tempfile, "mkstemp", no_second_copy)
     _state.update(model=FakeModel(), model_name="small")
-    r = TestClient(app, raise_server_exceptions=False).post(
-        "/transcribe", files={"file": ("a.wav", make_silent_wav(), "audio/wav")})
-    assert r.status_code == 500
+    r = TestClient(app).post("/transcribe", files={"file": ("a.wav", make_silent_wav(), "audio/wav")})
+    assert r.status_code == 200
     assert stt_temp_files() == before
 
 
@@ -289,7 +271,6 @@ def test_transcribe_returns_sentence_segments(monkeypatch):
 
 
 # ── speaker detection (diarize=true) ─────────────────────────────────────────
-import copy
 import numpy as np
 import pytest
 import diarize
@@ -297,66 +278,7 @@ import diarize
 DIARIZE_PREFIX = "Speaker detection is not enabled on this sidecar: "
 
 
-class FakeDiarizationBackend:
-    """Stands in for WhisperX: labels by overlap with `turns`, leaving words and
-    segments that overlap no turn unlabelled (as whisperx.assign_word_speakers does)."""
-    def __init__(self, reason=None, turns=(), load_error=None):
-        self.reason, self.turns, self.load_error = reason, list(turns), load_error
-        self.loads, self.calls = 0, []
-
-    def unavailable_reason(self):
-        return self.reason
-
-    def _speaker(self, item):
-        hits = [(min(item["end"], e) - max(item["start"], s), spk) for s, e, spk in self.turns
-                if min(item["end"], e) > max(item["start"], s)]
-        return max(hits)[1] if hits else None
-
-    def _label(self, item):
-        speaker = self._speaker(item)
-        return {**item, "speaker": speaker} if speaker else dict(item)
-
-    def load(self):
-        self.loads += 1
-        if self.load_error:
-            raise self.load_error
-        def label(segments, audio, language, min_speakers, max_speakers):
-            self.calls.append((copy.deepcopy(segments), audio, language, min_speakers, max_speakers))
-            return [{**self._label(seg), "words": [self._label(w) for w in seg["words"]]} for seg in segments]
-        return label
-
-
-class TwoSpeakerModel:
-    """Alice says 'hi there' (0-1 s), Bob answers 'hello' (2-3 s)."""
-    def __init__(self):
-        self.inputs = []
-
-    def transcribe(self, audio, **kwargs):
-        self.inputs.append(audio)
-        W = lambda word, start, end: type("W", (), {"word": word, "start": start, "end": end})()
-        S = lambda text, start, end, words: type("S", (), {"text": text, "start": start, "end": end, "words": words})()
-        segs = [S(" hi there", 0.0, 1.0, [W(" hi", 0.0, 0.4), W(" there", 0.5, 1.0)]),
-                S(" hello", 2.0, 3.0, [W(" hello", 2.0, 3.0)])]
-        return segs, type("I", (), {"language": "en"})()
-
-
-@pytest.fixture
-def speaker_env(monkeypatch):
-    import server
-    diarize._state.update(labeller=None, error=None)
-    model = TwoSpeakerModel()
-    monkeypatch.setattr(server, "get_model", lambda name: model)
-    monkeypatch.setattr(server, "get_batched", lambda m: None)
-    def with_backend(backend):
-        monkeypatch.setattr(diarize, "BACKEND", backend)
-        return backend
-    yield model, with_backend
-    diarize._state.update(labeller=None, error=None)
-
-
-def post_wav(data=None):
-    return TestClient(app).post("/transcribe", files={"file": ("a.wav", make_silent_wav(), "audio/wav")},
-                                data=data or {})
+from conftest import FakeDiarizationBackend, post_wav  # noqa: E402
 
 
 def test_health_reports_whether_speaker_detection_is_available(speaker_env):
@@ -389,7 +311,8 @@ def test_without_diarize_the_response_is_unchanged(speaker_env, data):
                   {"word": " hello", "start": 2.0, "end": 3.0}],
         "segments": [{"start": 0.0, "end": 1.0, "text": "hi there"}, {"start": 2.0, "end": 3.0, "text": "hello"}],
         "language": "en"}
-    assert isinstance(model.inputs[0], str)  # the uploaded file path, as before
+    # Decoded to 16 kHz mono up front (faster-whisper would decode the file the same way).
+    assert isinstance(model.inputs[0], np.ndarray) and model.inputs[0].shape == (16000,)
     assert backend.loads == 0 and backend.calls == []
 
 
@@ -464,3 +387,70 @@ def test_diarization_model_load_failure_is_a_400(speaker_env):
     assert "terms not accepted" in r.json()["detail"]
     assert model.inputs == []  # the model load is checked before transcribing
     assert "terms not accepted" in TestClient(app).get("/health").json()["diarization"]["reason"]
+
+
+# ── model cache and /health accuracy ─────────────────────────────────────────
+import gc
+import weakref
+
+
+class RealishModel(FakeModel):
+    feature_extractor = object()  # what BatchedInferencePipeline needs
+
+
+def test_a_batched_pipeline_for_a_swapped_out_model_is_not_cached(monkeypatch):
+    # Caching it would pin the old model (and its GPU memory) next to the new one.
+    import server
+    current, stale = RealishModel(), RealishModel()
+    _state.update(model=current, model_name="small", batched=None, batched_for=None)
+    monkeypatch.setattr(server, "BatchedInferencePipeline", lambda model: ("pipeline", model))
+    monkeypatch.setattr(server, "STT_BATCH_SIZE", 4)
+    assert server.get_batched(stale) == ("pipeline", stale)
+    assert _state["batched"] is None and _state["batched_for"] is None
+    assert server.get_batched(current) == ("pipeline", current)
+    assert _state["batched_for"] is current
+
+
+def test_a_model_swap_lets_go_of_the_old_model_before_building_the_new_one(monkeypatch):
+    import server
+    reset_state()
+    old = FakeModel()
+    old_ref = weakref.ref(old)
+    _state.update(model=old, model_name="large", device="cpu", compute="int8")
+    del old
+    alive_during_build = []
+    def ctor(name, device, compute_type):
+        gc.collect()
+        alive_during_build.append(old_ref() is not None)
+        return FakeModel()
+    monkeypatch.setattr(server, "WhisperModel", ctor)
+    server.get_model("small")
+    assert alive_during_build == [False]
+    assert _state["model_name"] == "small"
+
+
+def test_health_batch_size_is_unknown_until_the_device_is(monkeypatch):
+    import server
+    reset_state()
+    monkeypatch.setattr(server, "STT_BATCH_SIZE", None)
+    monkeypatch.setattr(server, "STT_DEVICE", "auto")
+    assert TestClient(app).get("/health").json()["batch_size"] is None
+    monkeypatch.setattr(server, "STT_DEVICE", "cpu")
+    assert TestClient(app).get("/health").json()["batch_size"] == 4
+
+
+def test_health_reports_sequential_when_the_batched_pipeline_is_unavailable(monkeypatch):
+    import server
+    model = RealishModel()
+    reset_state()
+    _state.update(model=model, model_name="small", device="cuda", compute="float16")
+    builds = []
+    def unsupported(model):
+        builds.append(model)
+        raise RuntimeError("unsupported")
+    monkeypatch.setattr(server, "BatchedInferencePipeline", unsupported)
+    monkeypatch.setattr(server, "STT_BATCH_SIZE", None)
+    assert server.get_batched(model) is None
+    assert server.get_batched(model) is None
+    assert builds == [model]  # not rebuilt (and re-logged) on every request
+    assert TestClient(app).get("/health").json()["batch_size"] == 0

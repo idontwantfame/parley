@@ -44,13 +44,22 @@ function dirTracks(audioDir) {
 
 const earliestStart = (tracks) => (tracks.length ? Math.min(...tracks.map((t) => t.startMs)) : null);
 
+// The start of the earliest non-empty track. Tracks are tried in time order,
+// so usually one stat() answers it instead of one per speaking turn.
+async function earliestAudibleStart(tracks) {
+  for (const track of [...tracks].sort((a, b) => a.startMs - b.startMs)) {
+    if ((await sizedTracks([track])).length) return track.startMs;
+  }
+  return null;
+}
+
 /** Epoch ms at which the meeting's mixed recording starts, or null if unknown. */
 export async function recordingOriginMs(audioDir) {
   try {
     const { originMs } = JSON.parse(await readFile(join(audioDir, MIX_ORIGIN_NAME), 'utf8'));
     if (Number.isFinite(originMs)) return originMs;
   } catch { /* not mixed yet, or archived before origins were recorded */ }
-  return earliestStart(await sizedTracks(dirTracks(audioDir)));
+  return earliestAudibleStart(dirTracks(audioDir));
 }
 
 /**

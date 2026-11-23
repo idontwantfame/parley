@@ -4,7 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { apiRouter } from './api.js';
-import { IMPORT_REQUEST_TIMEOUT_MS } from './import-routes.js';
+import { securityHeaders } from './security-headers.js';
+import { applyServerTimeouts, requestDeadline, signedInIdleTimeout, REQUEST_TIMEOUT_MS } from './request-deadline.js';
 import { installUsers } from '../store/users.js';
 import { authRouter, attachUser, requireAuth, requirePasswordChanged, sameOrigin } from './auth.js';
 import { oidcRouter } from './oidc.js';
@@ -45,8 +46,16 @@ function endPasswordOnlySessionsIfOff(users, oidc) {
   if (!oidc.passwordLoginEnabled()) users.revokePasswordOnlySessions();
 }
 
-export function createWebServer({ db, bot = null, client = null, sidecar = null, users = installUsers(db), oidc = createOidcService() }) {
+export function createWebServer({
+  db, bot = null, client = null, sidecar = null, users = installUsers(db), oidc = createOidcService(),
+  requestTimeoutMs = REQUEST_TIMEOUT_MS, distDir = DIST,
+}) {
   const app = express();
+  app.disable('x-powered-by');
+  app.use(securityHeaders);
+  // Every request must arrive within the deadline (an admin's recording upload
+  // extends its own, see import-routes.js).
+  app.use(requestDeadline({ timeoutMs: requestTimeoutMs }));
   // Trust only the loopback proxy so req.secure / req.ip reflect a *local*
   // reverse proxy's X-Forwarded-* headers. Trusting every hop (`true`) let any
   // direct client spoof X-Forwarded-For and dodge the per-IP login rate limit.
@@ -67,12 +76,16 @@ export function createWebServer({ db, bot = null, client = null, sidecar = null,
   app.use('/api', sameOrigin);
   app.use('/api', authRouter({ users, oidc }));
   app.use('/api', oidcRouter({ users, oidc }));
-  app.use('/api', requireAuth(users), requirePasswordChanged(users), apiRouter({ db, bot, client, sidecar, oidc, users }));
+  app.use('/api', requireAuth(users), requirePasswordChanged(users), signedInIdleTimeout(),
+    apiRouter({ db, bot, client, sidecar, oidc, users }));
 
-  if (existsSync(DIST)) {
-    app.use(express.static(DIST));
+  if (existsSync(distDir)) {
+    app.use(express.static(distDir));
+    // A hashed bundle file that isn't there (a tab open across an upgrade asks
+    // for the old chunk) is a 404, never the app shell served as a script.
+    app.use('/assets', (_req, res) => res.status(404).type('text/plain').send('Not found'));
     // SPA fallback for client-side routes (but never /api)
-    app.get(/^\/(?!api).*/, (_req, res) => res.sendFile(join(DIST, 'index.html')));
+    app.get(/^\/(?!api).*/, (_req, res) => res.sendFile(join(distDir, 'index.html')));
   }
   app.use(jsonErrorHandler());
   return app;
@@ -80,16 +93,21 @@ export function createWebServer({ db, bot = null, client = null, sidecar = null,
 
 const FALLBACK_ATTEMPTS = 10;
 
-export async function startWebServer({ db, bot = null, client = null, sidecar = null, port = 3000, host = process.env.WEB_UI_HOST || '127.0.0.1', maxAttempts = FALLBACK_ATTEMPTS }) {
+// `timeouts` (tests): { requestMs, headersMs, idleMs } — see request-deadline.js.
+export async function startWebServer({
+  db, bot = null, client = null, sidecar = null, port = 3000, host = process.env.WEB_UI_HOST || '127.0.0.1',
+  maxAttempts = FALLBACK_ATTEMPTS, timeouts = {},
+}) {
   db.backfillTodos();
   const users = installUsers(db);
   const oidc = createOidcService();
   // Connect to the identity provider in the background (never blocks boot).
   oidc.start().catch((e) => console.warn('[oidc] startup check failed:', e.message));
-  const app = createWebServer({ db, bot, client, sidecar, users, oidc });
+  const app = createWebServer({ db, bot, client, sidecar, users, oidc, requestTimeoutMs: timeouts.requestMs });
   const server = await listenWithFallback(app, port, host, maxAttempts);
-  // Recording imports stream large request bodies (see import-routes.js).
-  server.requestTimeout = IMPORT_REQUEST_TIMEOUT_MS;
+  // Bounded header reads and idle sockets; the whole-request deadline is the
+  // requestDeadline middleware's (so an import upload can extend its own).
+  applyServerTimeouts(server, timeouts);
   const purge = setInterval(() => {
     try { users.purgeExpiredSessions(); } catch (e) { console.warn('[web] session purge failed:', e.message); }
   }, SESSION_PURGE_INTERVAL_MS).unref();

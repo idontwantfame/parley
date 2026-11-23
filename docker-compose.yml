@@ -13,6 +13,23 @@ services:
       # Pin the whisper size here; the bot also passes a per-guild model.
       STT_HOST: 0.0.0.0
       STT_PORT: "8000"
+      # Optional shared access key (the bot sends the same STT_API_KEY from
+      # .env). Inside this private compose network it is not required; set it
+      # whenever the sidecar is reachable from anything else (published port,
+      # another host, a shared Docker network).
+      STT_API_KEY: ${STT_API_KEY:-}
+    # Least privilege: no setuid escalation, no Linux capabilities except what
+    # the entrypoint needs to chown /models and drop to uid 10001 (setpriv).
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
     volumes:
       # Whisper model weights persist here (first transcription downloads them).
       - whisper-models:/models
@@ -44,9 +61,17 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    # Runs as the unprivileged node user and needs no Linux capabilities.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     environment:
       # Reach the sidecar by its compose service name, not localhost.
       STT_URL: http://sidecar:8000
+      # The sidecar's optional access key (see the sidecar service above); set
+      # STT_API_KEY in .env (or from the dashboard) to use the same value.
+      STT_API_KEY: ${STT_API_KEY:-}
       DATA_DIR: /data
       WEB_UI: "1"
       WEB_UI_PORT: "3000"

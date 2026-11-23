@@ -54,12 +54,13 @@ if (webEnabled) {
     console.error(`[web] failed to bind ${host}:${port}:`, e.message);
     process.exit(1);
   }
-  // Loud warning if we're reachable off-box while an account still uses the
-  // seeded default password — that combination is a full-takeover risk.
+  // Loud warning if we're reachable off-box while the admin still has its
+  // initial password (the first-run one from the log, or admin/admin on older
+  // installs) — until it is changed, whoever has it owns the dashboard.
   if (host !== '127.0.0.1' && host !== 'localhost' && defaultPasswordActive(db)) {
     console.warn(
-      `[web] ⚠ SECURITY: the dashboard is bound to ${host} (not localhost) and an account still uses the\n` +
-      `      default password. Change it immediately, and only expose the dashboard behind a TLS proxy.`
+      `[web] ⚠ SECURITY: the dashboard is bound to ${host} (not localhost) and the admin account still has its\n` +
+      `      initial password. Sign in and change it now, and only expose the dashboard behind a TLS proxy.`
     );
   }
 }

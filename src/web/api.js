@@ -34,6 +34,7 @@ import {
 import { mountCampaignRoutes } from './campaign-routes.js';
 import { mountImportRoutes } from './import-routes.js';
 import { mountAuthSettingsRoutes } from './auth-settings-routes.js';
+import { createRegenerationState } from './regeneration-state.js';
 
 function audioDir(id) {
   return join(env.dataDir, 'audio', String(id));
@@ -61,13 +62,17 @@ function requireAdminForFields(fields) {
 
 const artifactDirs = () => ({ dataDir: env.dataDir, exportDir: env.exportDir });
 
+export const PENDING_RETRY_MERGE =
+  "Retry this meeting's transcription before merging (some speakers' audio is still waiting to be transcribed).";
+
 // A Discord user id, or a speaker of an imported recording (import-<meeting>-<n>).
 const SPEAKER_ID = /^(?:[1-9]\d{16,19}|import-[1-9]\d{0,15}-\d{1,3})$/;
 
 export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAudio = ensureMixedWav, imports = {}, oidc = null, users = null }) {
   const r = Router();
-  // Meeting ids with a summary regeneration in flight (guards double-submits).
-  const regeneration = new Map();
+  // Summary regeneration status per meeting (guards double-submits; finished
+  // results expire after a while).
+  const regeneration = createRegenerationState();
   // Meeting id -> in-flight WAV mix, so concurrent downloads share one mix.
   const mixes = new Map();
   // The live Discord client may not exist yet (bot starts lazily once creds are
@@ -84,7 +89,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
     if (meeting.status === 'recording' || botSessions().some((s) => Number(s.meetingId) === meeting.id)) {
       return 'This meeting is still being recorded or processed.';
     }
-    if (meetingProgress(meeting.id) || regeneration.get(meeting.id)?.state === 'running') {
+    if (meetingProgress(meeting.id) || regeneration.isRunning(meeting.id)) {
       return 'This meeting is already being processed.';
     }
     if (meeting.delivery_status === 'sending') return 'Discord delivery is in progress.';
@@ -149,7 +154,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
 
   // Stop a live recording from the dashboard. Finalizes the meeting (transcribe
   // + summarize + deliver) and disconnects the bot from the voice channel.
-  r.post('/guilds/:g/live/:channelId/stop', async (req, res) => {
+  r.post('/guilds/:g/live/:channelId/stop', requireAdmin, async (req, res) => {
     if (!bot || typeof bot.stopMeeting !== 'function') {
       return res.status(400).json({ error: 'Live recording is not managed by this server.' });
     }
@@ -183,7 +188,8 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
     const audioFiles = await readdir(audioDir(id)).catch(() => null);
     // The retry/regenerate planners re-read the meeting, its transcript and
     // its audio folder; hand them what this request already loaded instead.
-    const loaded = { ...db, getMeeting: () => meeting, listUtterances: () => utterances };
+    const loaded = { ...db, getMeeting: () => meeting, listUtterances: () => utterances,
+      hasUtterances: () => utterances.length > 0 };
     const listAudio = () => { if (!audioFiles) throw new Error('No audio folder.'); return audioFiles; };
     const plan = retryPlan(loaded, id, { dataDir: env.dataDir, exists: listAudio });
     const regen = regeneratePlan(loaded, id);
@@ -225,7 +231,7 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
     const id = Number(req.params.id);
     const meeting = db.getMeeting(id);
     if (!meeting) return res.status(404).json({ error: 'Meeting not found.' });
-    if (meeting.status !== 'done' || meetingProgress(id) || regeneration.get(id)?.state === 'running') {
+    if (meeting.status !== 'done' || meetingProgress(id) || regeneration.isRunning(id)) {
       return res.status(409).json({ error: 'Wait for the meeting to finish processing.' });
     }
     const client = liveClient();
@@ -329,13 +335,13 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
     if (!plan.ok) return res.status(409).json({ error: plan.reason });
     const busy = busyReason(plan.meeting);
     if (busy) return res.status(409).json({ error: busy });
-    regeneration.set(id, { state: 'running' });
+    regeneration.start(id);
     res.status(202).json({ state: 'running' });
     void regenerateSummary(db, id).then((result) => {
-      regeneration.set(id, result.ok ? { state: 'done' } : { state: 'failed', error: result.reason });
+      regeneration.finish(id, result.ok ? { state: 'done' } : { state: 'failed', error: result.reason });
     }).catch((error) => {
       console.error(`[summarizer] regeneration for meeting ${id} failed:`, error.message);
-      regeneration.set(id, { state: 'failed', error: 'The new summary could not be saved.' });
+      regeneration.finish(id, { state: 'failed', error: 'The new summary could not be saved.' });
     });
   });
 
@@ -372,6 +378,12 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
     db.replaceSummary(target.id, target.guild_id, notes, computeTalkTime(utterances), modelUsed, target.started_at);
   }
 
+  // Would a retry re-transcribe this meeting from the PCM still on disk?
+  function awaitsRetranscription(meeting) {
+    const plan = retryPlan(db, meeting.id, { dataDir: env.dataDir });
+    return plan.action === 'retranscribe' && retryEligible(meeting, plan);
+  }
+
   // Look up merge sources: an error { status, error } or { sources }.
   function mergeSources(target, rawIds) {
     const ids = [...new Set((Array.isArray(rawIds) ? rawIds : []).map(Number))]
@@ -385,6 +397,9 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
       const busy = busyReason(m);
       if (busy) return { status: 409, error: `Meeting ${m.id}: ${busy}` };
     }
+    // A retry would rebuild the target's transcript from its own PCM only (and
+    // a source's PCM is deleted by the merge), so merged lines would be lost.
+    if ([target, ...sources].some(awaitsRetranscription)) return { status: 409, error: PENDING_RETRY_MERGE };
     return { sources };
   }
 
@@ -507,12 +522,22 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
     }
   }
 
+  // While the bot is connected, a notes channel must be one of this server's
+  // text channels (without it only the shape is checked). Clearing is allowed.
+  function notesChannelError(guildId, channelId) {
+    if (channelId === undefined || channelId === null || channelId === '') return null;
+    const guild = liveClient()?.guilds?.cache?.get(guildId);
+    if (!guild) return null;
+    return guild.channels?.cache?.get(channelId)?.type === ChannelType.GuildText
+      ? null : 'Choose a text channel of this server for the notes.';
+  }
+
   // Open to every user for everyday settings; ADMIN_CONFIG_FIELDS need an admin.
   r.patch('/guilds/:g/config', requireAdminForFields(ADMIN_CONFIG_FIELDS), async (req, res) => {
     const isKnown = db.isKnownGuild(req.params.g) || !!liveClient()?.guilds?.cache?.has?.(req.params.g);
     if (!isKnown) return res.status(404).json({ error: 'Unknown server.' });
     const input = req.body ?? {};
-    const inputError = configInputError(input);
+    const inputError = configInputError(input) || notesChannelError(req.params.g, input.notesChannelId);
     if (inputError) return res.status(400).json({ error: inputError });
     // Validate against the guild's stored settings (e.g. a bare sttModel must
     // suit the provider already saved, not one the client claims).
@@ -608,9 +633,11 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
   // apply live, and (re)start the bot if it's managed and creds are present.
   r.put('/system/connection', requireAdmin, async (req, res) => {
     const patch = {};
-    for (const k of ['discordToken', 'discordClientId', 'sttUrl', 'ollamaUrl']) {
+    for (const k of ['discordToken', 'discordClientId', 'sttUrl', 'ollamaUrl', 'sttApiKey']) {
       if (typeof req.body?.[k] === 'string') patch[k] = req.body[k];
     }
+    // The access key is write-only: null removes it, like ''.
+    if (req.body?.sttApiKey === null) patch.sttApiKey = '';
     if (Object.keys(patch).length === 0) return res.status(400).json({ error: 'No recognized settings to update.' });
     let connection;
     try {

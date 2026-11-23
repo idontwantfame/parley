@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api.js';
 import { useGuild } from '../GuildContext.jsx';
@@ -26,26 +26,46 @@ function toLocalInput(date) {
 const titleFrom = (name) => name.replace(/\.[^.]+$/, '').trim().slice(0, TITLE_MAX);
 
 // Whether the transcription sidecar can detect speakers (pyannote + token).
+// `loading` is only the first check: a re-check keeps showing the previous
+// answer (and the form under it) with `checking` set, so it never unmounts
+// the form mid-upload.
 function useImportCapability() {
-  const [cap, setCap] = useState({ loading: true });
-  const load = () => {
-    setCap({ loading: true });
+  const [cap, setCap] = useState({ loading: true, checking: true });
+  const seq = useRef(0);
+  const load = useCallback(() => {
+    const mine = ++seq.current;
+    setCap((c) => ({ ...c, checking: true }));
     api.importCapability()
-      .then((c) => setCap({ loading: false, ...c }))
-      .catch((e) => setCap({ loading: false, available: false, reason: e?.message || 'Could not check the transcription sidecar.' }));
-  };
-  useEffect(load, []);
+      .then((c) => { if (seq.current === mine) setCap({ ...c, loading: false, checking: false }); })
+      .catch((e) => {
+        if (seq.current !== mine) return;
+        setCap({ loading: false, checking: false, available: false, reason: e?.message || 'Could not check the transcription sidecar.' });
+      });
+  }, []);
+  useEffect(() => {
+    load();
+    return () => { seq.current += 1; };
+  }, [load]);
   return { ...cap, reload: load };
 }
 
-function CapabilityNote({ cap }) {
+function CheckAgain({ cap, uploading }) {
+  return (
+    <button className="btn btn-ghost !py-1.5 mt-3" onClick={cap.reload} disabled={uploading || cap.checking}
+      title={uploading ? 'Wait for the upload to finish.' : undefined}>
+      {cap.checking ? 'Checking…' : 'Check again'}
+    </button>
+  );
+}
+
+function CapabilityNote({ cap, uploading }) {
   if (cap.loading) return <div className="h-14 skeleton rounded-[14px] mb-5" />;
   if (!cap.available) {
     return (
       <div className="card p-4 mb-5 border-l-2" style={{ borderColor: 'var(--error)' }} role="status">
         <p className="text-sm font-semibold text-ink">Imports aren't available right now</p>
         <p className="text-[13px] text-muted mt-1">{cap.reason}</p>
-        <button className="btn btn-ghost !py-1.5 mt-3" onClick={cap.reload}>Check again</button>
+        <CheckAgain cap={cap} uploading={uploading} />
       </div>
     );
   }
@@ -66,7 +86,7 @@ function CapabilityNote({ cap }) {
         <code className="text-ink-2">HF_TOKEN</code> (see “Importing recordings” in the README).
       </p>
       {cap.reason && <p className="text-xs text-faint mt-2">{cap.reason}</p>}
-      <button className="btn btn-ghost !py-1.5 mt-3" onClick={cap.reload}>Check again</button>
+      <CheckAgain cap={cap} uploading={uploading} />
     </div>
   );
 }
@@ -104,7 +124,7 @@ function useNotesChannel(guildId) {
   return state;
 }
 
-function ImportForm({ guildId, cap }) {
+function ImportForm({ guildId, cap, onUploadingChange }) {
   const navigate = useNavigate();
   const notes = useNotesChannel(guildId);
   const [file, setFile] = useState(null);
@@ -120,6 +140,9 @@ function ImportForm({ guildId, cap }) {
 
   // Leaving the page mid-upload cancels it instead of finishing in the background.
   useEffect(() => () => upload.current?.abort(), []);
+  const uploading = progress !== null;
+  useEffect(() => { onUploadingChange(uploading); }, [uploading, onUploadingChange]);
+  useEffect(() => () => onUploadingChange(false), [onUploadingChange]);
 
   function pick(event) {
     const f = event.target.files?.[0] ?? null;
@@ -156,7 +179,7 @@ function ImportForm({ guildId, cap }) {
   }
 
   const tooBig = Boolean(file && cap.maxBytes && file.size > cap.maxBytes);
-  const busy = progress !== null;
+  const busy = uploading;
   return (
     <form className="card p-5 space-y-4" onSubmit={submit}>
       <Field label="Recording" hint={`Audio or video (MP3, M4A, WAV, OGG, MP4…)${cap.maxBytes ? `, up to ${fmtSize(cap.maxBytes)}` : ''}.`}>
@@ -218,6 +241,7 @@ export default function Import() {
   const { guildId } = useGuild();
   const isAdmin = useIsAdmin();
   const cap = useImportCapability();
+  const [uploading, setUploading] = useState(false);
   return (
     <Page max="720px">
       <PageHead title="Import a recording"
@@ -226,8 +250,10 @@ export default function Import() {
         : !guildId ? <Empty icon={Icon.Upload} title="No server selected" body="Pick the server this recording belongs to in the sidebar." />
         : (
           <>
-            <CapabilityNote cap={cap} />
-            {!cap.loading && <ImportForm key={String(cap.speakerDetection)} guildId={guildId} cap={cap} />}
+            <CapabilityNote cap={cap} uploading={uploading} />
+            {!cap.loading && (
+              <ImportForm key={String(cap.speakerDetection)} guildId={guildId} cap={cap} onUploadingChange={setUploading} />
+            )}
           </>
         )}
     </Page>

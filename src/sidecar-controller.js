@@ -10,11 +10,15 @@
 //   • start() health-checks first. If something is already listening (e.g. you
 //     ran `npm run sidecar` yourself, or a leftover process), we adopt it as
 //     "external" instead of spawning a duplicate and colliding on the port.
-//   • stop() only kills a process WE spawned; it can't kill an external one.
+//   • stop() only kills a process WE spawned; it can't kill an external one. It
+//     waits for that process to exit (SIGTERM, then SIGKILL), so a restart never
+//     finds the dying process still answering /health and adopts it.
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { config } from './config/env.js';
+import { sttAuthHeaders, SIDECAR_NEEDS_KEY } from './adapters/stt-access.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -24,6 +28,22 @@ function isLocalHost(host) {
 
 const DEFAULT_STT_URL = 'http://127.0.0.1:8000';
 const HEALTH_POLL_MS = 500;
+// How long stop() waits for our child to exit after SIGTERM (the sidecar
+// finishes its in-flight request), and then after SIGKILL.
+const STOP_WAIT_MS = 10_000;
+const KILL_WAIT_MS = 2_000;
+export const STILL_STOPPING_ERROR = 'The previous sidecar is still shutting down; try again in a moment.';
+
+// Resolves true once `exited` settles, or false after `ms`.
+function waitForExit(exited, ms) {
+  let timer;
+  const timedOut = new Promise((resolve) => { timer = setTimeout(resolve, ms, false); });
+  return Promise.race([exited.then(() => true), timedOut]).finally(() => clearTimeout(timer));
+}
+
+function signal(child, name) {
+  try { child.kill(name); } catch { /* already gone */ }
+}
 
 export class SidecarController {
   // `sttUrl` may be a string or a function returning the current URL — pass a
@@ -36,6 +56,12 @@ export class SidecarController {
     this.generation = 0;     // bumped by stop(); a start() from an older generation gives up
     this.fetchImpl = deps.fetch || fetch;
     this.exists = deps.exists || existsSync;
+    this.stopWaitMs = deps.stopWaitMs ?? STOP_WAIT_MS;
+    this.killWaitMs = deps.killWaitMs ?? KILL_WAIT_MS;
+    this.authHeaders = deps.authHeaders || (() => sttAuthHeaders());
+    this.exits = new WeakMap(); // child -> promise settled on its 'exit'
+    this.stopping = null;       // in-flight stop() (waiting for our child to exit)
+    this.unconfirmed = null;    // a child we signalled whose exit never arrived
     this.pythonPath = deps.pythonPath || join(ROOT, 'stt_sidecar', '.venv', 'bin', 'python');
     this.serverPath = deps.serverPath || join(ROOT, 'stt_sidecar', 'server.py');
 
@@ -63,12 +89,17 @@ export class SidecarController {
 
   async healthy(timeoutMs = 1500) {
     try {
-      const res = await this.fetchImpl(`${this.sttUrl.replace(/\/+$/, '')}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+      const res = await this.fetchImpl(`${this.sttUrl.replace(/\/+$/, '')}/health`, {
+        headers: this.authHeaders(), signal: AbortSignal.timeout(timeoutMs),
+      });
       // Capture the health body (device/compute/model/batch_size) so the UI can
       // show whether STT is on GPU or the slow CPU fallback. Best-effort: older
       // sidecars or the test fake may not return JSON.
       if (res.ok) {
         try { this.health = typeof res.json === 'function' ? await res.json() : null; } catch { /* keep last */ }
+      } else {
+        // Read the error body so the connection is released.
+        await res.text?.().catch(() => {});
       }
       return res.ok;
     } catch { return false; }
@@ -95,23 +126,34 @@ export class SidecarController {
   }
 
   async _start(waitMs) {
+    // A restart: let our previous process finish exiting first, so the probe
+    // below can't mistake it for an already-running sidecar.
+    if (this.stopping) await this.stopping;
     const generation = this.generation;
     // Already serving (started by us earlier, by the user, or another process)?
     const healthy = await this.healthy();
     // stop() ran during the probe (e.g. SIGTERM right after boot): don't spawn a
     // process nobody will ever kill.
     if (generation !== this.generation) return { ok: false, error: 'Sidecar was stopped.' };
-    if (healthy) {
-      if (!this.child) this.external = true;
-      this.state = 'running'; this.error = null;
-      return { ok: true, state: this.state, external: this.external };
-    }
+    if (healthy) return this._adoptResponder();
     if (!this.child) {
       const spawned = this._spawn();
       if (!spawned.ok) return spawned;
     }
     this.state = 'starting'; this.error = null;
     return this._awaitHealthy(waitMs);
+  }
+
+  // Something answers /health: our own child, or an external sidecar. Never
+  // adopt our own signalled-but-not-exited process as "external".
+  _adoptResponder() {
+    if (!this.child && this.unconfirmed) {
+      this.state = 'error'; this.error = STILL_STOPPING_ERROR;
+      return { ok: false, error: this.error };
+    }
+    if (!this.child) this.external = true;
+    this.state = 'running'; this.error = null;
+    return { ok: true, state: this.state, external: this.external };
   }
 
   _spawn() {
@@ -130,6 +172,7 @@ export class SidecarController {
       });
       this.child = child;
       this.external = false;
+      this.exits.set(child, new Promise((resolve) => child.once('exit', resolve)));
       child.stdout?.on('data', (d) => this._pushLog(d.toString()));
       child.stderr?.on('data', (d) => this._pushLog(d.toString()));
       child.on('exit', (code) => {
@@ -166,21 +209,35 @@ export class SidecarController {
     return { ok: false, error: this.error };
   }
 
-  // Stop a sidecar WE spawned. An adopted external process is left alone.
+  // Stop a sidecar WE spawned and wait for it to exit (SIGTERM, then SIGKILL).
+  // An adopted external process is left alone.
   async stop() {
     const child = this.child;
     this.generation++;
     this.state = 'stopped'; this.error = null;
+    if (this.stopping) return this.stopping;
     if (child) {
       this.child = null;
-      try { child.kill('SIGTERM'); } catch { /* ignore */ }
-      return { ok: true, state: 'stopped' };
+      this.stopping = this._terminate(child).finally(() => { this.stopping = null; });
+      return this.stopping;
     }
     if (this.external) {
       this.external = false;
       return { ok: true, state: 'stopped', note: 'External sidecar left running (not managed by this process).' };
     }
     return { ok: true, state: 'stopped' };
+  }
+
+  async _terminate(child) {
+    const exited = this.exits.get(child) ?? Promise.resolve();
+    signal(child, 'SIGTERM');
+    if (await waitForExit(exited, this.stopWaitMs)) return { ok: true, state: 'stopped' };
+    signal(child, 'SIGKILL');
+    if (await waitForExit(exited, this.killWaitMs)) return { ok: true, state: 'stopped' };
+    // Still not gone: remember it so start() won't adopt it as external.
+    this.unconfirmed = child;
+    exited.then(() => { if (this.unconfirmed === child) this.unconfirmed = null; });
+    return { ok: false, state: 'stopped', error: 'The sidecar process did not exit after SIGKILL.' };
   }
 
   async restart() {
@@ -190,9 +247,11 @@ export class SidecarController {
 
   status() {
     const h = this.health || {};
+    // The sidecar refuses requests without the key Parley doesn't have.
+    const needsKey = h.auth === 'key' && !config.sttApiKey;
     return {
       state: this.state,
-      error: this.error,
+      error: this.error ?? (needsKey ? SIDECAR_NEEDS_KEY : null),
       running: this.state === 'running',
       managed: this.managed(),
       external: this.external,

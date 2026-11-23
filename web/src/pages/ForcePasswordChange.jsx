@@ -7,7 +7,7 @@ import { Logo } from '../components/ui.jsx';
 // backend blocks the rest of the API (403 PASSWORD_CHANGE_REQUIRED) until this
 // is done, so this is a hard gate, not a dismissible nudge.
 export default function ForcePasswordChange() {
-  const { user, refresh, logout } = useAuth();
+  const { user, refresh, refreshError, logout } = useAuth();
   const [next, setNext] = useState('');
   const [confirm, setConfirm] = useState('');
   const [busy, setBusy] = useState(false);
@@ -21,11 +21,15 @@ export default function ForcePasswordChange() {
     try {
       // mustChangePassword accounts don't need the current password.
       await api.changePassword('', next);
-      await refresh(); // clears mustChangePassword → gate falls through to the app
     } catch (e2) {
       setErr(e2?.message || 'Failed to set password.');
       setBusy(false);
+      return;
     }
+    // Clears mustChangePassword → the gate falls through to the app. If this
+    // refresh fails, stay here and offer to retry it (the password is set).
+    await refresh();
+    setBusy(false);
   }
 
   return (
@@ -52,7 +56,13 @@ export default function ForcePasswordChange() {
               <input id="fpc-confirm" className="input" type="password" value={confirm} autoComplete="new-password"
                 onChange={(e) => setConfirm(e.target.value)} required />
             </div>
-            {err && <p className="text-sm text-error bg-error-soft rounded-sm px-3 py-2">{err}</p>}
+            {err && <p className="text-sm text-error bg-error-soft rounded-sm px-3 py-2" role="alert">{err}</p>}
+            {!err && refreshError && (
+              <p className="text-sm text-error bg-error-soft rounded-sm px-3 py-2" role="alert">
+                Your password was changed, but the dashboard couldn't reload: {refreshError}{' '}
+                <button type="button" className="underline" onClick={refresh}>Retry</button>
+              </p>
+            )}
             <button type="submit" disabled={busy || next.length < 8}
               className="btn btn-primary !py-2.5 w-full justify-center">
               {busy ? 'Saving…' : 'Set password & continue'}

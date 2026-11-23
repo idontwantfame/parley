@@ -2,9 +2,10 @@
 # ── Parley bot + web dashboard ────────────────────────────────────────────────
 # Multi-stage: build the React UI and compile native deps (@discordjs/opus),
 # then ship a slim runtime. Node 24 LTS ships node:sqlite stable (no flag).
+# The base image is pinned to an exact release; bump all three FROM lines together.
 
 # 1) Build the web dashboard (Vite → web/dist)
-FROM node:24-bookworm-slim AS web
+FROM node:24.21.0-bookworm-slim AS web
 WORKDIR /app/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
@@ -12,7 +13,7 @@ COPY web/ ./
 RUN npm run build
 
 # 2) Install production node_modules (needs build tools for @discordjs/opus)
-FROM node:24-bookworm-slim AS deps
+FROM node:24.21.0-bookworm-slim AS deps
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 make g++ \
@@ -23,7 +24,7 @@ COPY scripts/patch-discord-voice.mjs ./scripts/
 RUN node scripts/patch-discord-voice.mjs
 
 # 3) Runtime
-FROM node:24-bookworm-slim AS runtime
+FROM node:24.21.0-bookworm-slim AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 # Encode retained recordings as MP3 after transcription.

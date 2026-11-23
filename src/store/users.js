@@ -5,8 +5,9 @@
 // tokens stored server-side and referenced by an httpOnly cookie. No JWTs, no
 // external auth service — everything lives in the same SQLite db as meetings.
 //
-// On first run a default `admin` / `admin` account is seeded so a fresh
-// self-hoster can log in immediately; the UI nudges them to change it. Admins
+// On first run an `admin` account is seeded with a random password printed
+// once to the server log, so a fresh self-hoster can sign in right away (and
+// must then choose their own); there is no well-known default password. Admins
 // can add more users (email + password); any user can change their own password.
 // Accounts can also be linked to an OpenID Connect identity (issuer + subject,
 // see src/web/oidc.js); SSO-only accounts store an unusable password hash.
@@ -33,6 +34,9 @@ CREATE TABLE IF NOT EXISTS sessions (
   expires_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY, value TEXT NOT NULL
+);
 `;
 
 // Stored instead of a hash for accounts created by single sign-on. It is not a
@@ -41,6 +45,11 @@ const UNUSABLE_PASSWORD = '!sso';
 const PASSWORD_SCHEME = 'scrypt$';
 
 const SCRYPT_KEYLEN = 64;
+// 15 random bytes → 20 base64url characters for the first-run admin password.
+const FIRST_RUN_PASSWORD_BYTES = 15;
+// app_settings key marking an install whose seeded password went to the log
+// (older versions seeded admin/admin and never set it).
+const FIRST_RUN_MARKER = 'first_run_password_in_log';
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 // Usernames longer than this are rejected at creation and at login (so a huge
 // login body never reaches the rate limiter or the database).
@@ -109,13 +118,29 @@ function publicUser(row) {
 }
 const isUsableHash = (hash) => typeof hash === 'string' && hash.startsWith(PASSWORD_SCHEME);
 
+const randomFirstRunPassword = () => randomBytes(FIRST_RUN_PASSWORD_BYTES).toString('base64url');
+
+function logFirstRunPassword(log, username, password) {
+  const rule = '='.repeat(72);
+  log.warn([
+    rule,
+    '[auth] First run: created the dashboard administrator account.',
+    `[auth]   username: ${username}`,
+    `[auth]   password: ${password}`,
+    '[auth] Sign in with it and choose your own password (you will be asked to).',
+    '[auth] It is shown only this once.',
+    rule,
+  ].join('\n'));
+}
+
 export function normalizeUsername(name) {
   return String(name ?? '').trim().toLowerCase();
 }
 
 // Attach user/session helpers onto an open db handle (the object returned by
-// openDb). Idempotent: creates the tables and seeds the default admin once.
-export function installUsers(db, { now = () => new Date().toISOString() } = {}) {
+// openDb). Idempotent: creates the tables and seeds the first admin once.
+// `firstRunPassword` (tests) replaces the random first-run password.
+export function installUsers(db, { now = () => new Date().toISOString(), firstRunPassword = null, log = console } = {}) {
   const sql = db.sql;
   sql.exec(SCHEMA);
   migrateOidcColumns(sql);
@@ -174,7 +199,7 @@ export function installUsers(db, { now = () => new Date().toISOString() } = {}) 
     },
     // Link a local account to an SSO identity. The user must not be forced to
     // set a password afterwards, so a pending forced change is lifted — and the
-    // temporary password it guarded (e.g. the seeded admin/admin) is retired
+    // temporary password it guarded (e.g. the seeded first-run one) is retired
     // rather than left usable without that gate. A real password is kept.
     linkOidc(userId, issuer, subject) {
       sql.prepare(`UPDATE users SET oidc_issuer = ?, oidc_subject = ?,
@@ -220,6 +245,11 @@ export function installUsers(db, { now = () => new Date().toISOString() } = {}) 
       return sql.prepare(
         `SELECT COUNT(*) AS c FROM users WHERE is_admin = 1 AND must_change_password = 1`
       ).get().c > 0;
+    },
+    // True for installs whose first admin password was random and printed to
+    // the server log (so the login hint points there, not at admin/admin).
+    firstRunPasswordInLog() {
+      return sql.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(FIRST_RUN_MARKER)?.value === '1';
     },
 
     // ── Auth ────────────────────────────────────────────────────────────────
@@ -274,11 +304,14 @@ export function installUsers(db, { now = () => new Date().toISOString() } = {}) 
     },
   };
 
-  // Seed a default admin the first time the app boots with no users, so a fresh
-  // self-hoster can log in right away. Flagged must_change_password so the UI
-  // can prompt them to set a real password.
+  // Seed the first admin the first time the app boots with no users, so a fresh
+  // self-hoster can sign in right away with the password from the log. Flagged
+  // must_change_password: the dashboard stays locked until they choose their own.
   if (api.countUsers() === 0) {
-    api.createUser({ username: 'admin', email: null, password: 'admin', isAdmin: true, mustChangePassword: true });
+    const password = firstRunPassword ?? randomFirstRunPassword();
+    const admin = api.createUser({ username: 'admin', email: null, password, isAdmin: true, mustChangePassword: true });
+    sql.prepare(`INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, '1')`).run(FIRST_RUN_MARKER);
+    logFirstRunPassword(log, admin.username, password);
   }
 
   return api;

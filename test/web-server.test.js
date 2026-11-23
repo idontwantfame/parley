@@ -4,6 +4,10 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:net';
 import { openDb } from '../src/store/db.js';
 import { startWebServer } from '../src/web/server.js';
+import { installUsers } from '../src/store/users.js';
+
+// The seeded admin's first-run password is random; pin it to 'admin' here.
+const ADMIN_SEED = { firstRunPassword: 'admin', log: { warn() {}, info() {}, log() {} } };
 
 function occupy(port = 0) {
   return new Promise((resolve, reject) => {
@@ -38,6 +42,7 @@ test('startWebServer binds 127.0.0.1 and serves api + backfills (authed)', async
   const db = openDb(':memory:');
   const mId = db.createMeeting({ guildId: 'g1', channelId: 'c', channelName: 'g', startedAt: 'now' });
   db.saveSummary(mId, { actionItems: [{ assignee: 'A', task: 'backfilled' }] }, [], 'test:m');
+  installUsers(db, ADMIN_SEED);
   const server = await startWebServer({ db, client: null, port: 0 });
   const { address, port } = server.address();
   const base = `http://127.0.0.1:${port}`;

@@ -1,12 +1,17 @@
-import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
-import { useParams, Link, useNavigate } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useParams, Link } from 'react-router-dom';
 import { api } from '../api.js';
 import { useIsAdmin } from '../AuthContext.jsx';
 import { ProgressText } from '../components/Live.jsx';
 import { Avatar, AvatarStack, Icon, Empty, TalkBar } from '../components/ui.jsx';
-import { fmtDateLong, fmtTime, fmtDuration, fmtClock, fmtMs, colorOf } from '../lib/format.js';
-import { useDismissable } from '../hooks/useDismissable.js';
-import Markdown from '../components/Markdown.jsx';
+import { fmtDateLong, fmtTime, fmtDuration, fmtMs, colorOf } from '../lib/format.js';
+import Markdown from '../components/LazyMarkdown.jsx';
+import MeetingActions from '../components/meeting/MeetingActions.jsx';
+import RecordingTranscript from '../components/meeting/RecordingTranscript.jsx';
+
+// Meeting ids are numeric; anything else in the URL is not a meeting (and
+// must never reach a request path).
+const MEETING_ID = /^\d+$/;
 
 /* ── retry banner (failed / stuck meetings) ───────────────────────────── */
 const STATUS_COPY = {
@@ -109,111 +114,6 @@ function ActionItem({ item, todo, onToggle }) {
   );
 }
 
-/* ── recording player + transcript ───────────────────────────────────── */
-// Index of the line playing at `atMs`: the last one starting at or before it.
-function lineAt(lines, atMs) {
-  let lo = 0;
-  let hi = lines.length - 1;
-  let found = -1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    if (lines[mid].start_ms <= atMs) { found = mid; lo = mid + 1; } else { hi = mid - 1; }
-  }
-  return found;
-}
-
-// Keeps the in-page player and the transcript in step: clicking a line seeks
-// the recording to it, and the line being played is highlighted.
-function useRecordingSync(lines, originMs) {
-  const audioRef = useRef(null);
-  const [activeId, setActiveId] = useState(null);
-  const onTime = useCallback(() => {
-    const audio = audioRef.current;
-    if (!audio || originMs == null) return;
-    const idx = lineAt(lines, originMs + audio.currentTime * 1000);
-    const id = idx >= 0 ? lines[idx].id : null;
-    setActiveId((cur) => (cur === id ? cur : id));
-  }, [lines, originMs]);
-  const seek = useCallback((u) => {
-    const audio = audioRef.current;
-    if (!audio || originMs == null) return;
-    audio.currentTime = Math.max(0, (u.start_ms - originMs) / 1000);
-    audio.play().catch(() => { /* autoplay refused: the position is still set */ });
-  }, [originMs]);
-  return { audioRef, activeId, onTime, seek };
-}
-
-function RecordingPlayer({ meetingId, sync }) {
-  return (
-    <section className="mt-9 card p-4 sticky top-3 z-10" aria-label="Recording">
-      <audio ref={sync.audioRef} controls preload="metadata" className="w-full"
-        src={api.meetingAudioUrl(meetingId, { inline: true })} onTimeUpdate={sync.onTime} onSeeked={sync.onTime} />
-      <p className="text-xs text-muted mt-1.5">Click a line in the transcript to play from there.</p>
-    </section>
-  );
-}
-
-const TranscriptLine = memo(function TranscriptLine({ u, label, active, onSeek }) {
-  // The whole line seeks, unless the click was the end of a text selection.
-  const seekFromRow = onSeek ? () => { if (window.getSelection()?.isCollapsed !== false) onSeek(u); } : undefined;
-  return (
-    <div className={`flex items-start gap-3 rounded-sm -mx-2 px-2 py-1 transition-colors ${active ? 'bg-primary-soft' : ''} ${onSeek ? 'cursor-pointer hover:bg-surface-2' : ''}`}
-      onClick={seekFromRow} aria-current={active ? 'true' : undefined}>
-      <Avatar name={u.display_name} size={28} />
-      <div className="min-w-0">
-        <div className="flex items-baseline gap-2">
-          <span className="text-[13px] font-semibold" style={{ color: colorOf(u.display_name) }}>{u.display_name}</span>
-          {onSeek ? (
-            <button type="button" onClick={(e) => { e.stopPropagation(); onSeek(u); }}
-              className="text-[11px] text-primary tabular-nums hover:underline" aria-label={`Play from ${label}`}>{label}</button>
-          ) : <span className="text-[11px] text-faint tabular-nums">{label}</span>}
-        </div>
-        <p className="text-[14px] text-ink-2 leading-relaxed mt-0.5">{u.text}</p>
-      </div>
-    </div>
-  );
-});
-
-// `lines` are sorted by start; times are shown from `baseMs` (the recording's
-// start when there is one, else the first line), not as raw epoch values.
-function Transcript({ lines, baseMs, activeId = null, onSeek = null }) {
-  const [open, setOpen] = useState(false);
-  const [q, setQ] = useState('');
-  // Filtering a multi-hour transcript on every keystroke is expensive; let the
-  // input stay responsive and filter against the deferred query.
-  const deferredQ = useDeferredValue(q);
-  const filtered = useMemo(() => {
-    const needle = deferredQ.trim().toLowerCase();
-    return needle ? lines.filter((u) => u.text.toLowerCase().includes(needle)) : lines;
-  }, [lines, deferredQ]);
-  if (!lines.length) return null;
-
-  return (
-    <section className="mt-10 pt-8 border-t border-border">
-      <div className="flex items-center justify-between gap-3 mb-4">
-        <button onClick={() => setOpen((o) => !o)} className="flex items-center gap-2 text-sm font-bold text-ink" aria-expanded={open}>
-          <Icon.Chevron width={16} height={16} className={`transition-transform ${open ? 'rotate-90' : ''}`} />
-          Transcript
-          <span className="chip">{lines.length} lines</span>
-        </button>
-        {open && (
-          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Find in transcript…"
-            aria-label="Find in transcript" className="input !w-52 !py-1.5 text-[13px]" />
-        )}
-      </div>
-      {open && (
-        <div className="space-y-2">
-          {filtered.length === 0 && <p className="text-sm text-muted">No lines match "{q}".</p>}
-          {filtered.map((u, i) => (
-            <TranscriptLine key={u.id ?? i} u={u} label={fmtClock(u.start_ms - baseMs)}
-              active={u.id === activeId} onSeek={onSeek} />
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
 /* ── ask box ──────────────────────────────────────────────────────────── */
 function AskBox({ guildId, meetingId }) {
   const [question, setQuestion] = useState('');
@@ -262,131 +162,6 @@ function AskBox({ guildId, meetingId }) {
   );
 }
 
-/* ── meeting actions (export / regenerate / merge / delete) ────────────── */
-// Merge candidates: other meetings from this meeting's own server (never the
-// server-switcher's selection), loaded only when the merge picker opens.
-function useMergeCandidates(meeting, active) {
-  const [state, setState] = useState({ rows: null, error: null });
-  useEffect(() => {
-    if (!active) return undefined;
-    let stale = false;
-    setState({ rows: null, error: null });
-    api.meetings(meeting.guild_id)
-      .then((rows) => {
-        if (stale) return;
-        const list = (Array.isArray(rows) ? rows : [])
-          .filter((m) => m.id !== meeting.id && ((m.utterance_count ?? 1) > 0 || m.failed));
-        setState({ rows: list, error: null });
-      })
-      .catch((e) => { if (!stale) setState({ rows: [], error: e?.message || 'Could not load meetings.' }); });
-    return () => { stale = true; };
-  }, [meeting.id, meeting.guild_id, active]);
-  return state;
-}
-
-function MeetingActions({ meeting, regenerate, regenerating, onRegenerate, hasAudio, onReload }) {
-  const isAdmin = useIsAdmin();
-  const navigate = useNavigate();
-  const [open, setOpen] = useState(false);
-  const [mode, setMode] = useState(false); // false | 'pick' | 'busy'
-  const [sources, setSources] = useState(() => new Set());
-  const [err, setErr] = useState(null);
-  const candidates = useMergeCandidates(meeting, !!mode);
-  const others = candidates.rows ?? [];
-  // Close the menu/merge popover on outside click or Escape (a11y).
-  const ref = useDismissable(open || !!mode, () => { setOpen(false); if (mode !== 'busy') setMode(false); });
-
-  async function del() {
-    setOpen(false);
-    if (!window.confirm('Delete this meeting, its transcript, summary and action items? This cannot be undone.')) return;
-    try { await api.deleteMeeting(meeting.id); navigate('/meetings'); }
-    catch (e) { setErr(e?.message || 'Delete failed'); }
-  }
-  function toggle(id) { setSources((p) => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; }); }
-  async function merge() {
-    if (sources.size === 0) return;
-    setMode('busy'); setErr(null);
-    try { await api.mergeMeetings(meeting.id, [...sources]); setMode(false); setSources(new Set()); onReload?.(); }
-    catch (e) { setErr(e?.message || 'Merge failed'); setMode('pick'); }
-  }
-
-  return (
-    <div className="relative shrink-0" ref={ref}>
-      <button onClick={() => { setOpen((v) => !v); setMode(false); }} aria-label="Meeting actions"
-        aria-haspopup="menu" aria-expanded={open || !!mode}
-        className="h-9 w-9 grid place-items-center rounded-sm border border-border text-muted hover:text-ink hover:bg-surface-2 transition-colors">
-        <Icon.Dots width={18} height={18} />
-      </button>
-      {open && !mode && (
-        <div role="menu" className="absolute right-0 mt-1.5 w-52 card shadow-lg py-1 z-20">
-          <a href={api.exportMeetingUrl(meeting.id, 'md')} role="menuitem" onClick={() => setOpen(false)}
-            className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-ink hover:bg-surface-2 no-underline">
-            <Icon.Download width={15} height={15} /> Export (markdown)
-          </a>
-          {hasAudio && (
-            <a href={api.meetingAudioUrl(meeting.id)} role="menuitem" onClick={() => setOpen(false)}
-              className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-ink hover:bg-surface-2 no-underline">
-              <Icon.Download width={15} height={15} /> Download recording
-            </a>
-          )}
-          {hasAudio && isAdmin && (
-            <button role="menuitem" onClick={async () => {
-              setOpen(false);
-              if (!window.confirm('Delete this recording? The transcript and notes will stay.')) return;
-              try { await api.deleteMeetingAudio(meeting.id); onReload?.(); }
-              catch (error) { setErr(error.message); }
-            }} className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-error hover:bg-error-soft">
-              <Icon.Trash width={15} height={15} /> Delete recording
-            </button>
-          )}
-          {isAdmin && (
-            <>
-              <button role="menuitem" onClick={() => { setOpen(false); onRegenerate?.(); }}
-                disabled={!regenerate?.eligible || regenerating}
-                title={!regenerate?.eligible && regenerate?.reason ? regenerate.reason : 'Re-run the summary with the current summarizer settings'}
-                className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-ink hover:bg-surface-2 disabled:opacity-40">
-                <Icon.Refresh width={15} height={15} /> Regenerate summary
-              </button>
-              <button role="menuitem" onClick={() => { setErr(null); setMode('pick'); setOpen(false); }}
-                className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-ink hover:bg-surface-2">
-                <Icon.Merge width={15} height={15} /> Merge another meeting
-              </button>
-              <button role="menuitem" onClick={del} className="w-full flex items-center gap-2.5 text-left px-3 py-2 text-sm text-error hover:bg-error-soft">
-                <Icon.Trash width={15} height={15} /> Delete meeting
-              </button>
-            </>
-          )}
-        </div>
-      )}
-      {mode && (
-        <div className="absolute right-0 mt-1.5 w-80 card shadow-lg p-3 z-20">
-          <p className="text-sm font-semibold text-ink mb-2">Merge into this note</p>
-          <div className="max-h-64 overflow-y-auto -mx-1 px-1 space-y-0.5">
-            {candidates.rows === null && <p className="text-xs text-muted px-2 py-1.5">Loading meetings…</p>}
-            {candidates.error && <p className="text-xs text-error px-2 py-1.5">{candidates.error}</p>}
-            {candidates.rows?.length === 0 && !candidates.error && <p className="text-xs text-muted px-2 py-1.5">No other meetings to merge.</p>}
-            {others.map((m) => (
-              <label key={m.id} className="flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-surface-2 cursor-pointer text-sm">
-                <input type="checkbox" className="pcheck h-4 w-4" checked={sources.has(m.id)} onChange={() => toggle(m.id)} disabled={mode === 'busy'} />
-                <span className="text-ink truncate">{fmtDateLong(m.started_at)}</span>
-                <span className="text-muted text-xs ml-auto shrink-0">{fmtTime(m.started_at)}</span>
-              </label>
-            ))}
-          </div>
-          {err && <p className="text-xs text-error mt-2">{err}</p>}
-          <div className="flex items-center justify-end gap-2 mt-3">
-            <button onClick={() => { setMode(false); setSources(new Set()); setErr(null); }} disabled={mode === 'busy'} className="btn btn-ghost !py-1.5">Cancel</button>
-            <button onClick={merge} disabled={sources.size === 0 || mode === 'busy'} className="btn btn-primary !py-1.5">
-              {mode === 'busy' ? 'Merging…' : `Merge ${sources.size || ''}`.trim()}
-            </button>
-          </div>
-        </div>
-      )}
-      {err && !mode && <p className="text-xs text-error mt-1 absolute right-0 whitespace-nowrap">{err}</p>}
-    </div>
-  );
-}
-
 /* ── prev/next meeting nav ────────────────────────────────────────────── */
 function MeetingNav({ neighbors }) {
   const older = neighbors?.older;
@@ -414,19 +189,21 @@ function MeetingNav({ neighbors }) {
 // Imported recordings label voices "Speaker 1", "Speaker 2"…; naming them here
 // applies to this recording only. Regenerating the summary puts the names
 // into the notes too.
-function SpeakerNamesPanel({ meeting, attendees, canRegenerate, onRegenerate, onReload }) {
+// `saved` lives in the note: the panel is re-created from the server's names
+// after a save, and the regenerate offer must survive that.
+function SpeakerNamesPanel({ meeting, attendees, saved, onSaved, canRegenerate, onRegenerate, onReload }) {
   const [drafts, setDrafts] = useState(() => Object.fromEntries(attendees.map((a) => [a.user_id, a.display_name])));
   const [busy, setBusy] = useState(false);
-  const [saved, setSaved] = useState(false);
   const [err, setErr] = useState(null);
 
   async function save(event) {
     event.preventDefault();
+    if (busy) return;
     setBusy(true); setErr(null);
     try {
       const changed = attendees.filter((a) => (drafts[a.user_id] ?? '').trim() !== a.display_name);
       for (const a of changed) await api.setSpeakerName(meeting.guild_id, a.user_id, (drafts[a.user_id] ?? '').trim());
-      if (changed.length) { setSaved(true); onReload?.(); }
+      if (changed.length) { onSaved(); onReload?.(); }
     } catch (e) {
       setErr(e?.message || 'Could not save the names.');
     } finally {
@@ -516,6 +293,79 @@ function useMeetingProgress(meeting, initial, onReload) {
   return { progress, watching, outcome, watchRetry };
 }
 
+const REGEN_POLL_MS = 2000;
+const DISMISSED_PREFIX = 'parley-regen-dismissed:';
+
+// A dismissed regeneration error stays dismissed for this meeting for the rest
+// of the browser session (the server keeps reporting it for a while).
+function readDismissed(meetingId) {
+  try { return sessionStorage.getItem(DISMISSED_PREFIX + meetingId); } catch { return null; }
+}
+function writeDismissed(meetingId, error) {
+  try {
+    if (error) sessionStorage.setItem(DISMISSED_PREFIX + meetingId, error);
+    else sessionStorage.removeItem(DISMISSED_PREFIX + meetingId);
+  } catch { /* storage unavailable: the error just shows again next visit */ }
+}
+
+// Summary regeneration for one meeting: start it, follow it (paused while the
+// tab is hidden), and report or dismiss its failure.
+function useRegeneration(meeting, initial, onReload) {
+  const [regen, setRegen] = useState(() => {
+    const err = initial?.error ?? null;
+    return { busy: initial?.state === 'running', err: err && err === readDismissed(meeting.id) ? null : err };
+  });
+  const [starting, setStarting] = useState(false);
+
+  useEffect(() => {
+    if (!regen.busy) return undefined;
+    let stop = false;
+    let timer;
+    async function poll() {
+      if (stop) return;
+      if (!document.hidden) {
+        try {
+          const status = await api.regenerationStatus(meeting.id);
+          if (stop) return;
+          if (status.state !== 'running') {
+            setRegen({ busy: false, err: status.error ?? (status.state === 'idle' ? 'The regeneration was interrupted.' : null) });
+            if (status.state === 'done') onReload?.();
+            return;
+          }
+        } catch { /* A temporary disconnect should not end a running job. */ }
+      }
+      if (!stop) timer = setTimeout(poll, REGEN_POLL_MS);
+    }
+    void poll();
+    return () => { stop = true; clearTimeout(timer); };
+  }, [regen.busy, meeting.id, onReload]);
+
+  // Resolves true once a regeneration has started.
+  const start = useCallback(async () => {
+    if (starting || regen.busy) return false;
+    if (!window.confirm('Regenerate the summary with the current summarizer settings? The current notes will be replaced; action items you already checked off stay checked if they reappear.')) return false;
+    setStarting(true);
+    try {
+      await api.regenerateSummary(meeting.id);
+      writeDismissed(meeting.id, null); // a new failure must show again
+      setRegen({ busy: true, err: null });
+      return true;
+    } catch (e) {
+      setRegen({ busy: false, err: e?.message || 'Regeneration failed.' });
+      return false;
+    } finally {
+      setStarting(false);
+    }
+  }, [starting, regen.busy, meeting.id]);
+
+  const dismiss = useCallback(() => {
+    writeDismissed(meeting.id, regen.err);
+    setRegen((r) => ({ ...r, err: null }));
+  }, [meeting.id, regen.err]);
+
+  return { busy: regen.busy, err: regen.err, starting, start, dismiss };
+}
+
 function findTodo(todos, item) {
   return todos.find((t) => t.task === item.task && (t.assignee ?? null) === (item.assignee ?? null))
     ?? todos.find((t) => t.task === item.task) ?? null;
@@ -530,46 +380,15 @@ function Note({ data, onReload }) {
   const lines = useMemo(() => [...(utterances ?? [])].sort((a, b) => a.start_ms - b.start_ms), [utterances]);
   const playable = data.hasAudio && data.audioOriginMs != null;
   const isAdmin = useIsAdmin();
-  const sync = useRecordingSync(lines, playable ? data.audioOriginMs : null);
   const running = !!progress;
   const isFailed = !running && !watching && ['transcription_failed', 'summary_failed', 'processing'].includes(meeting.status);
-  const [regen, setRegen] = useState(() => ({
-    busy: data.regenerate?.state === 'running', err: data.regenerate?.error ?? null,
-  }));
-  const [starting, setStarting] = useState(false);
-
-  useEffect(() => {
-    if (!regen.busy) return;
-    let stop = false;
-    let timer;
-    async function poll() {
-      try {
-        const status = await api.regenerationStatus(meeting.id);
-        if (stop) return;
-        if (status.state !== 'running') {
-          setRegen({ busy: false, err: status.error ?? (status.state === 'idle' ? 'The regeneration was interrupted.' : null) });
-          if (status.state === 'done') onReload?.();
-          return;
-        }
-      } catch { /* A temporary disconnect should not end a running job. */ }
-      if (!stop) timer = setTimeout(poll, 2000);
-    }
-    void poll();
-    return () => { stop = true; clearTimeout(timer); };
-  }, [regen.busy, meeting.id, onReload]);
-
-  async function regenerateSummary() {
-    if (!window.confirm('Regenerate the summary with the current summarizer settings? The current notes will be replaced; action items you already checked off stay checked if they reappear.')) return;
-    setStarting(true);
-    try {
-      await api.regenerateSummary(meeting.id);
-      setRegen({ busy: true, err: null });
-    } catch (e) {
-      setRegen({ busy: false, err: e?.message || 'Regeneration failed.' });
-    } finally {
-      setStarting(false);
-    }
-  }
+  const regen = useRegeneration(meeting, data.regenerate, onReload);
+  const { start: startRegeneration } = regen;
+  // Offer "Regenerate notes with these names" after a rename, until it's used.
+  const [namesSaved, setNamesSaved] = useState(false);
+  const regenerateSummary = useCallback(async () => {
+    if (await startRegeneration()) setNamesSaved(false);
+  }, [startRegeneration]);
 
   return (
     <article className="max-w-[760px] mx-auto pb-12 animate-fade-up">
@@ -594,7 +413,7 @@ function Note({ data, onReload }) {
             </p>
           </div>
           <MeetingActions meeting={meeting} regenerate={data.regenerate}
-            regenerating={starting || regen.busy} onRegenerate={regenerateSummary} hasAudio={data.hasAudio} onReload={onReload} />
+            regenerating={regen.starting || regen.busy} onRegenerate={regenerateSummary} hasAudio={data.hasAudio} onReload={onReload} />
         </div>
 
         {attendees?.length > 0 && (
@@ -606,7 +425,8 @@ function Note({ data, onReload }) {
 
       {meeting.source === 'import' && isAdmin && attendees?.length > 0 && (
         <SpeakerNamesPanel key={attendees.map((a) => `${a.user_id}=${a.display_name}`).join('|')}
-          meeting={meeting} attendees={attendees} canRegenerate={!!data.regenerate?.eligible && !regen.busy}
+          meeting={meeting} attendees={attendees} saved={namesSaved} onSaved={() => setNamesSaved(true)}
+          canRegenerate={!!data.regenerate?.eligible && !regen.busy && !regen.starting}
           onRegenerate={regenerateSummary} onReload={onReload} />
       )}
       {isFailed && <RetryBanner meeting={meeting} retry={retry} outcome={outcome} onStarted={watchRetry} />}
@@ -629,7 +449,7 @@ function Note({ data, onReload }) {
             <p className="text-[13px] text-error mt-1">{regen.err}</p>
             <p className="text-[13px] text-muted mt-1">The previous notes were kept.</p>
           </div>
-          <button onClick={() => setRegen({ busy: false, err: null })} className="btn btn-ghost !py-1 !px-2 text-xs shrink-0">Dismiss</button>
+          <button onClick={regen.dismiss} className="btn btn-ghost !py-1 !px-2 text-xs shrink-0">Dismiss</button>
         </div>
       )}
 
@@ -719,9 +539,7 @@ function Note({ data, onReload }) {
         </section>
       )}
 
-      {playable && <RecordingPlayer meetingId={meeting.id} sync={sync} />}
-      <Transcript lines={lines} baseMs={playable ? data.audioOriginMs : (lines[0]?.start_ms ?? 0)}
-        activeId={playable ? sync.activeId : null} onSeek={playable ? sync.seek : null} />
+      <RecordingTranscript meetingId={meeting.id} lines={lines} originMs={playable ? data.audioOriginMs : null} />
       {meeting.guild_id && <AskBox guildId={meeting.guild_id} meetingId={meeting.id} />}
       <MeetingNav neighbors={data.neighbors} />
     </article>
@@ -792,6 +610,7 @@ function NoteSkeleton() {
 
 export default function Reading() {
   const { id } = useParams();
+  const validId = MEETING_ID.test(id ?? '');
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [reloadError, setReloadError] = useState(null);
@@ -814,12 +633,19 @@ export default function Reading() {
   useEffect(() => {
     let stale = false;
     setError(null); setReloadError(null); setData(null);
+    if (!validId) return undefined;
     api.meeting(id)
       .then((m) => { if (!stale) setData(m); })
       .catch((e) => { if (!stale) setError(e?.message || 'Failed to load meeting'); });
     return () => { stale = true; };
-  }, [id]);
+  }, [id, validId]);
 
+  if (!validId) return (
+    <div className="px-8 py-10">
+      <Empty icon={Icon.Doc} title="Meeting not found" body="There's no meeting at this address."
+        action={<Link to="/meetings" className="btn btn-primary !py-2">All meetings</Link>} />
+    </div>
+  );
   if (error) return <div className="px-8 py-10"><Empty icon={Icon.Doc} title="Couldn't load meeting" body={error} /></div>;
   if (!data) return <NoteSkeleton />;
 

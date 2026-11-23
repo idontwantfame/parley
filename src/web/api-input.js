@@ -21,12 +21,14 @@ export function intQuery(value, max, fallback) {
 }
 
 // Guild settings only admins may change: which STT backend and model receive
-// the audio (cloud API cost, or the model the local sidecar must load), when
-// the bot joins calls on its own, the summarizer's instructions, and audio
-// retention, and the bot's visible name in the server.
+// the audio (cloud API cost, or the model the local sidecar must load), which
+// summarizer and fallback receive the transcript (cost, data leaving the box),
+// where the notes are posted, when the bot joins calls on its own, the
+// summarizer's instructions, audio retention, and the bot's visible name.
 export const ADMIN_CONFIG_FIELDS = [
   'sttProvider', 'sttModel', 'whisperModel', 'autoJoin', 'autoJoinMinPeople', 'autoJoinChannelIds',
   'summaryPrompt', 'overviewPrompt', 'keepAudio', 'botNickname',
+  'provider', 'model', 'fallbackProvider', 'fallbackModel', 'notesChannelId',
 ];
 
 // Free-text settings validateSetup stores as given; they must be strings.

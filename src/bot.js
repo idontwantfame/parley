@@ -25,10 +25,12 @@ import { shouldAutoJoin, shouldAutoLeave, botMovedAway } from './voice/decisions
 import { nicknameFor } from './voice/nickname.js';
 import { validateSetup, formatConfigReply } from './commands/setup-logic.js';
 import { handleAutocomplete } from './commands/autocomplete.js';
+import { ADMIN_ONLY_REPLY, lacksManageGuild } from './commands/permissions.js';
 import { resolveGuildMeeting, renderStatus, renderHistory } from './commands/meeting-lookup.js';
 import { joinRefusal, joinOutcomeReply } from './commands/voice-replies.js';
 import { renderNotesChunks, chunk } from './delivery/discord-notes.js';
 import { postNotes, notesThreadName } from './delivery/post.js';
+import { QUIET_MESSAGE, neutralizeMaskedLinks } from './delivery/discord-safe.js';
 import { askCampaign, recapCampaign, resolveCampaign } from './campaign/ask.js';
 
 // Minimal, non-privileged intents (MessageContent would fail login). Mentions
@@ -381,6 +383,7 @@ export function startBot({ db, audioRoot }) {
     if (interaction.isAutocomplete()) return handleAutocomplete(interaction, { db, env: config });
     if (!interaction.isChatInputCommand()) return;
     const { commandName, guild, member } = interaction;
+    if (lacksManageGuild(interaction)) return interaction.reply({ content: ADMIN_ONLY_REPLY, ephemeral: true }).catch(() => {});
     try {
       if (commandName === 'join') {
         const vc = member.voice?.channel ?? null;
@@ -415,8 +418,8 @@ export function startBot({ db, audioRoot }) {
           endedAt: m.ended_at,
           summaryLanguage: resolveSummaryLanguage(cfg),
         });
-        await interaction.reply({ content: parts[0], ephemeral: true });
-        for (const p of parts.slice(1)) await interaction.followUp({ content: p, ephemeral: true });
+        await interaction.reply({ content: parts[0], ephemeral: true, ...QUIET_MESSAGE });
+        for (const p of parts.slice(1)) await interaction.followUp({ content: p, ephemeral: true, ...QUIET_MESSAGE });
         return;
       }
       if (commandName === 'post') {
@@ -437,7 +440,7 @@ export function startBot({ db, audioRoot }) {
             .create({ name: notesThreadName(m.channel_name, m.started_at) })
             .catch(() => interaction.channel);
         }
-        for (const p of parts) await target.send(p);
+        for (const p of parts) await target.send({ content: p, ...QUIET_MESSAGE });
         const where = target === interaction.channel ? 'this channel' : `thread <#${target.id}>`;
         return interaction.editReply(`✅ Posted summary for meeting #${m.id} in ${where}.`);
       }
@@ -471,8 +474,8 @@ export function startBot({ db, audioRoot }) {
         const kw = interaction.options.getString('keyword');
         const hits = db.searchUtterances(guild.id, kw);
         if (!hits.length) return interaction.reply({ content: `No matches for "${kw}".`, ephemeral: true });
-        const text = hits.slice(0, 10).map((h) => `#${h.meeting_id} ${h.display_name}: ${h.text}`).join('\n');
-        return interaction.reply({ content: chunk(text)[0], ephemeral: true });
+        const text = neutralizeMaskedLinks(hits.slice(0, 10).map((h) => `#${h.meeting_id} ${h.display_name}: ${h.text}`).join('\n'));
+        return interaction.reply({ content: chunk(text)[0], ephemeral: true, ...QUIET_MESSAGE });
       }
       if (commandName === 'ask' || commandName === 'recap' || commandName === 'journal') {
         const campaign = resolveCampaign(db, guild.id, {
@@ -485,9 +488,9 @@ export function startBot({ db, audioRoot }) {
         if (commandName === 'journal') {
           const fresh = db.getCampaign(campaign.id);
           const body = fresh.journal?.trim() || '_The journal is empty. It fills in automatically after each session in this campaign._';
-          const parts = chunk(`📜 **${fresh.name} — Campaign journal**\n\n${body}`);
-          await interaction.reply({ content: parts[0], ephemeral: true });
-          for (const p of parts.slice(1)) await interaction.followUp({ content: p, ephemeral: true });
+          const parts = chunk(neutralizeMaskedLinks(`📜 **${fresh.name} — Campaign journal**\n\n${body}`));
+          await interaction.reply({ content: parts[0], ephemeral: true, ...QUIET_MESSAGE });
+          for (const p of parts.slice(1)) await interaction.followUp({ content: p, ephemeral: true, ...QUIET_MESSAGE });
           return;
         }
         const ephemeral = !interaction.options.getBoolean('public');
@@ -501,9 +504,9 @@ export function startBot({ db, audioRoot }) {
           const recap = await recapCampaign(db, campaign.id, { sessions: interaction.options.getInteger('sessions') ?? 1 });
           text = `🎲 **Previously on ${campaign.name}…**\n\n${recap}`;
         }
-        const parts = chunk(text);
-        await interaction.editReply(parts[0]);
-        for (const p of parts.slice(1)) await interaction.followUp({ content: p, ephemeral });
+        const parts = chunk(neutralizeMaskedLinks(text));
+        await interaction.editReply({ content: parts[0], ...QUIET_MESSAGE });
+        for (const p of parts.slice(1)) await interaction.followUp({ content: p, ephemeral, ...QUIET_MESSAGE });
         return;
       }
       if (commandName === 'campaign') {

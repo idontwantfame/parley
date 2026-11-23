@@ -231,3 +231,92 @@ test('stop() during the initial health probe prevents the spawn (no orphan)', as
   assert.equal(spawned.length, 0);
   assert.equal(sc.state, 'stopped');
 });
+
+// ── restart race: stop() waits for our child, never adopts it as external ────
+// A child that takes `exitAfterMs` to exit after SIGTERM, ignores SIGTERM
+// entirely (`ignoreTerm`), or never exits at all (`immortal`).
+function slowChild({ exitAfterMs = 30, ignoreTerm = false, immortal = false } = {}) {
+  const child = fakeChild();
+  child.alive = true;
+  child.signals = [];
+  child.kill = (sig) => {
+    child.signals.push(sig);
+    if (immortal || (ignoreTerm && sig === 'SIGTERM')) return true;
+    setTimeout(() => { child.alive = false; child.emit('exit', null, sig); }, sig === 'SIGKILL' ? 1 : exitAfterMs);
+    return true;
+  };
+  return child;
+}
+
+// /health answers while any spawned child is alive (the dying one too).
+function makeLive(childOpts) {
+  const spawned = [];
+  const fetch = async () => {
+    if (!spawned.some((c) => c.alive)) throw new Error('ECONNREFUSED');
+    return new Response('{}', { status: 200 });
+  };
+  const spawn = () => { const c = slowChild(childOpts); spawned.push(c); return c; };
+  const sc = new SidecarController({ sttUrl: 'http://127.0.0.1:8000', deps: { spawn, fetch, exists: () => true, pollMs: 5, stopWaitMs: 100 } });
+  return { sc, spawned };
+}
+
+test('stop() resolves only after the spawned child has exited', async () => {
+  const { sc, spawned } = makeLive({ exitAfterMs: 40 });
+  await sc.start({ waitMs: 500 });
+  await sc.stop();
+  assert.equal(spawned[0].alive, false);
+});
+
+test('stop() escalates to SIGKILL when the child ignores SIGTERM', async () => {
+  const { sc, spawned } = makeLive({ ignoreTerm: true });
+  await sc.start({ waitMs: 500 });
+  await sc.stop();
+  assert.deepEqual(spawned[0].signals, ['SIGTERM', 'SIGKILL']);
+  assert.equal(spawned[0].alive, false);
+});
+
+test('restart() spawns a fresh sidecar instead of adopting the dying one as external', async () => {
+  const { sc, spawned } = makeLive({ exitAfterMs: 40 });
+  await sc.start({ waitMs: 500 });
+  const r = await sc.restart();
+  assert.equal(r.ok, true);
+  assert.equal(spawned.length, 2);
+  assert.equal(sc.external, false);
+  assert.equal(sc.child, spawned[1]);
+  assert.equal(spawned[1].alive, true);
+});
+
+test('start() never adopts a responder while our signalled child has not confirmed its exit', async () => {
+  const { sc, spawned } = makeLive({ immortal: true });
+  await sc.start({ waitMs: 500 });
+  await sc.stop();
+  const r = await sc.start({ waitMs: 50 });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /still shutting down/);
+  assert.equal(sc.external, false);
+  assert.equal(spawned.length, 1);
+});
+
+test('healthy() reads and releases a non-OK /health body', async () => {
+  const res = new Response('busy', { status: 503 });
+  const sc = new SidecarController({ sttUrl: 'http://127.0.0.1:8000', deps: { fetch: async () => res, exists: () => true } });
+  assert.equal(await sc.healthy(), false);
+  assert.equal(res.bodyUsed, true);
+});
+
+test('health checks send the access key, and a sidecar that needs one Parley lacks is reported', async (t) => {
+  const { config } = await import('../src/config/env.js');
+  const previous = config.sttApiKey;
+  t.after(() => { config.sttApiKey = previous; });
+  let auth = null;
+  const fetch = async (_url, init) => { auth = new Headers(init.headers).get('authorization'); return new Response('{"auth":"key"}', { status: 200 }); };
+  const sc = new SidecarController({ sttUrl: 'http://127.0.0.1:8000', deps: { fetch, exists: () => true } });
+  config.sttApiKey = undefined;
+  await sc.start();
+  assert.equal(auth, null);
+  assert.match(sc.status().error, /requires an access key; set STT_API_KEY/);
+  config.sttApiKey = 'k';
+  await sc.healthy();
+  assert.equal(auth, 'Bearer k');
+  assert.equal(sc.status().error, null);
+});

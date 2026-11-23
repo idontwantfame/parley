@@ -2,7 +2,8 @@
 
 A cheap availability report for /health, a lazy load-once under a lock
 (mirroring the Whisper model cache in server.py), a remembered load failure
-that the next request retries, and one labelling run at a time. The model
+that the next request retries, and one labelling run at a time, after which
+cached GPU memory is handed back. The model
 work itself is BACKEND's (whisperx_backend.py), kept behind two methods so
 tests (and any future backend) can swap it.
 """
@@ -15,7 +16,7 @@ from typing import Optional, Protocol
 
 import numpy as np
 
-from whisperx_backend import Labeller, WhisperXBackend
+from whisperx_backend import Labeller, WhisperXBackend, release_memory
 
 log = logging.getLogger("stt_sidecar.diarize")
 
@@ -83,4 +84,9 @@ def label_speakers(segments: list[dict], audio: np.ndarray, language: str,
     if audio.size == 0:
         return segments
     with _run_lock:
-        return labeller(segments, audio, language, min_speakers, max_speakers)
+        try:
+            return labeller(segments, audio, language, min_speakers, max_speakers)
+        finally:
+            # Alignment and pyannote leave GBs in torch's GPU cache; hand them
+            # back between recordings (a no-op on CPU).
+            release_memory()

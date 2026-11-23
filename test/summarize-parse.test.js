@@ -66,8 +66,8 @@ test('OpenAI JSON mode is requested only from api.openai.com, for JSON-capable m
 });
 
 test('Gemini summarize throws when the reply hit MAX_TOKENS', async () => {
-  const s = new GeminiSummarizer('gemini-2.5-flash', 'test-key');
-  s.model = { generateContent: async () => ({ response: { text: () => '{"tldr": "cut', candidates: [{ finishReason: 'MAX_TOKENS' }] } }) };
+  const reply = { candidates: [{ finishReason: 'MAX_TOKENS', content: { parts: [{ text: '{"tldr": "cut' }] } }] };
+  const s = new GeminiSummarizer('gemini-2.5-flash', 'test-key', { fetchImpl: async () => new Response(JSON.stringify(reply)) });
   await assert.rejects(s.summarize('t', {}), /output limit/);
 });
 

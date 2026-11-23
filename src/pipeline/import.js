@@ -7,11 +7,9 @@
 //
 // One file holds every speaker, so speakers are per-recording ids
 // (import-<meetingId>-<n>, "Speaker n") that can be renamed afterwards.
-import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
 import { config } from '../config/env.js';
 import { createSidecarSTT } from '../adapters/stt/sidecar.js';
 import { resolveSttModel } from '../adapters/stt/index.js';
@@ -20,6 +18,7 @@ import { getGuildConfig } from '../store/config.js';
 import { getVocabulary } from '../store/vocabulary.js';
 import { MIX_ORIGIN_NAME } from '../voice/mix.js';
 import { MP3_NAME } from '../voice/recording-archive.js';
+import { FFMPEG_INPUT_GUARD, runFfmpeg } from '../voice/ffmpeg.js';
 import { diarizedLines, transcriptLines, vocabularyHint } from './transcribe.js';
 import { finishMeeting } from './orchestrator.js';
 import { withMeetingProgress } from './progress.js';
@@ -27,6 +26,9 @@ import { withMeetingProgress } from './progress.js';
 // Progress stage while converting + transcribing (the dashboard shows
 // "Transcribing and detecting speakers…").
 export const IMPORT_STAGE = 'importing';
+// Progress stage while waiting for an earlier import to finish transcribing
+// (the dashboard shows "Waiting for another import to finish…").
+export const QUEUED_STAGE = 'queued';
 export const UNKNOWN_SPEAKER = 'Unknown speaker';
 export const NO_SPEECH = 'No speech was detected in the recording.';
 
@@ -87,7 +89,7 @@ async function convertUpload(uploadPath, audioDir, originMs, runFfmpeg) {
   const output = join(audioDir, MP3_NAME);
   const temporary = join(audioDir, `.${randomUUID()}.mp3`);
   try {
-    await runFfmpeg('ffmpeg', ['-nostdin', '-v', 'error', '-y', '-i', uploadPath, '-vn', '-sn', '-dn',
+    await runFfmpeg('ffmpeg', ['-nostdin', '-v', 'error', '-y', ...FFMPEG_INPUT_GUARD, '-i', uploadPath, '-vn', '-sn', '-dn',
       '-ac', '1', '-ar', MP3_SAMPLE_RATE, '-codec:a', 'libmp3lame', '-b:a', MP3_BITRATE, '-f', 'mp3', temporary],
     { timeout: FFMPEG_TIMEOUT_MS });
     if ((await stat(temporary)).size === 0) throw new Error('ffmpeg produced an empty recording.');
@@ -136,12 +138,35 @@ async function transcribeImport(db, meetingId, { job, cfg, originMs, deps }) {
   }
 }
 
+/**
+ * A FIFO line of async tasks run one at a time; a failed task never blocks the
+ * next. Returns run(task) → the task's own promise.
+ */
+export function createSerialQueue() {
+  let tail = Promise.resolve();
+  return (task) => {
+    const result = tail.then(() => task());
+    tail = result.catch(() => {});
+    return result;
+  };
+}
+
+// Imports convert and transcribe one at a time. The sidecar runs two jobs at
+// once, so a single import (hours of audio) leaves the other slot free for
+// Discord meeting tracks instead of two imports taking both.
+const importSlot = createSerialQueue();
+
 async function importPipeline(db, meetingId, job, deps, progress) {
   const meeting = db.getMeeting(meetingId);
   const guildCfg = getGuildConfig(db, meeting.guild_id);
   const cfg = { ...guildCfg, language: job.language || guildCfg.language };
-  const started = deps.now();
-  await transcribeImport(db, meetingId, { job, cfg, originMs: Date.parse(meeting.started_at), deps });
+  progress.stage = QUEUED_STAGE;
+  let started;
+  await deps.queue(() => {
+    progress.stage = IMPORT_STAGE;
+    started = deps.now();
+    return transcribeImport(db, meetingId, { job, cfg, originMs: Date.parse(meeting.started_at), deps });
+  });
   progress.completed = 1;
   return finishMeeting(db, meetingId, {
     cfg, summarizer: deps.summarizer ?? getSummarizer(cfg), deliver: job.deliver ?? null, progress,
@@ -155,7 +180,7 @@ function recordImportFailure(db, meetingId, err) {
   const meeting = db.getMeeting(meetingId);
   if (!meeting || meeting.status === 'done') return;
   if (meeting.status === 'processing') {
-    db.setMeetingStatus(meetingId, db.listUtterances(meetingId).length ? 'summary_failed' : 'transcription_failed');
+    db.setMeetingStatus(meetingId, db.hasUtterances(meetingId) ? 'summary_failed' : 'transcription_failed');
   }
   db.setImportError(meetingId, err?.userMessage || err?.message || String(err));
 }
@@ -170,18 +195,17 @@ function defaultTranscribe(filePath, opts) {
 /**
  * Run an import for a meeting created by db.createImportedMeeting. `job`:
  * { uploadPath, language?, speakers?, minSpeakers?, maxSpeakers?, deliver? }.
- * Registers progress (stage 'importing', then the shared summarize stages),
+ * Registers progress at once (stage 'queued' while an earlier import is still
+ * transcribing, then 'importing', then the shared summarize stages),
  * always deletes the upload, and on failure records the meeting's
  * import_error and rejects with a userMessage.
  */
 export function runImport(db, meetingId, job, deps = {}) {
   const resolved = {
-    dataDir: config.dataDir, runFfmpeg: promisify(execFile), transcribe: defaultTranscribe, now: Date.now, ...deps,
+    dataDir: config.dataDir, runFfmpeg, transcribe: defaultTranscribe, now: Date.now,
+    queue: importSlot, ...deps,
   };
-  return withMeetingProgress(meetingId, 1, (progress) => {
-    progress.stage = IMPORT_STAGE;
-    return importPipeline(db, meetingId, job, resolved, progress);
-  })
+  return withMeetingProgress(meetingId, 1, (progress) => importPipeline(db, meetingId, job, resolved, progress))
     .catch((err) => {
       recordImportFailure(db, meetingId, err);
       throw err;

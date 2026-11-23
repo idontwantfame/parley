@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { renderNotes, renderNotesChunks, groupActionItems, chunk } from '../src/delivery/discord-notes.js';
 import { LANGUAGES } from '../src/adapters/summarizer/languages.js';
 import { postNotes } from '../src/delivery/post.js';
+import { neutralizeMaskedLinks } from '../src/delivery/discord-safe.js';
+import { MessageFlags, MessageFlagsBitField } from 'discord.js';
 
 const notes = {
   tldr: 'We discussed the launch.',
@@ -218,4 +220,34 @@ test('Discord delivery creates threads with a safe name', async () => {
   });
   assert.equal(created.length, 1);
   assert.ok(created[0].length <= 100);
+});
+
+test('masked links in model or transcript text are shown with their real destination', () => {
+  assert.equal(neutralizeMaskedLinks('see [the docs](https://evil.example/x) now'), 'see the docs (https://evil.example/x) now');
+  assert.equal(neutralizeMaskedLinks('[a](<https://e.example>) and [b](https://f.example "title")'),
+    'a (https://e.example) and b (https://f.example)');
+  assert.equal(neutralizeMaskedLinks('[[nested]](https://g.example)'), '[nested] (https://g.example)');
+  assert.equal(neutralizeMaskedLinks('a plain [note] and (aside)'), 'a plain [note] and (aside)');
+});
+
+test('Discord notes neutralise masked links; the Markdown export keeps the text as written', () => {
+  const tricky = { ...notes, tldr: 'Read [this](https://phish.example/login)', decisions: ['Use [x](https://y.example)'] };
+  const discord = renderNotesChunks(tricky, [], { channelName: '[c](https://z.example)' }).join('\n');
+  assert.doesNotMatch(discord, /\]\(/);
+  assert.match(discord, /this \(https:\/\/phish\.example\/login\)/);
+  assert.match(renderNotes(tricky, [], {}), /\[this\]\(https:\/\/phish\.example\/login\)/);
+});
+
+test('posted notes suppress link previews (embeds) and mentions', async () => {
+  const sent = [];
+  await postNotes({
+    client: { channels: { fetch: async () => ({ send: async (message) => sent.push(message) }) } },
+    meeting: { channel_id: 'voice', channel_name: 'Crew', started_at: '2026-10-01T10:00:00Z' },
+    cfg: {}, notes, talktime: [],
+  });
+  assert.ok(sent.length > 0);
+  for (const message of sent) {
+    assert.equal(new MessageFlagsBitField(message.flags).has(MessageFlags.SuppressEmbeds), true);
+    assert.deepEqual(message.allowedMentions, { parse: [] });
+  }
 });

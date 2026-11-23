@@ -10,8 +10,11 @@ import { authRouter, attachUser, requireAuth, requirePasswordChanged, sameOrigin
 // cookie, the auth routes are public, and a protected probe stands in for the
 // rest of the API. `gated` mirrors the production stack (same-origin + password
 // change gate) for the tests that exercise those layers.
+// The seeded admin's first-run password is random; these tests pin it to
+// 'admin' so they can sign in with it.
+const quiet = { warn() {}, info() {}, log() {} };
 function appWith(db, { trustProxy = false, now, gated = false } = {}) {
-  const users = installUsers(db);
+  const users = installUsers(db, { firstRunPassword: 'admin', log: quiet });
   const app = express();
   if (trustProxy) app.set('trust proxy', true);
   app.use(express.json());
@@ -368,10 +371,40 @@ test('/auth/me reports defaultPasswordActive while the seeded admin is unchanged
   try {
     const me1 = await (await fetch(`${base}/api/auth/me`)).json();
     assert.equal(me1.defaultPasswordActive, true);
+    assert.equal(me1.firstRunPasswordInLog, true, 'a new install points at the password in the server log');
     // Change the admin password, then it should report false.
     const cookie = cookieOf(await jpost(base, '/api/auth/login', { username: 'admin', password: 'admin' }));
     await jpost(base, '/api/auth/password', { newPassword: 'a-real-password' }, cookie);
     const me2 = await (await fetch(`${base}/api/auth/me`)).json();
     assert.equal(me2.defaultPasswordActive, false);
+  } finally { close(); }
+});
+
+test('/auth/me does not point at the server log for an older install seeded with admin/admin', async () => {
+  const db = openDb(':memory:');
+  installUsers(db, { firstRunPassword: 'admin', log: quiet });
+  db.sql.prepare('DELETE FROM app_settings WHERE key = ?').run('first_run_password_in_log'); // older versions never set it
+  const { base, close } = await listen(appWith(db).app);
+  try {
+    const me = await (await fetch(`${base}/api/auth/me`)).json();
+    assert.equal(me.defaultPasswordActive, true);
+    assert.equal(me.firstRunPasswordInLog, false);
+  } finally { close(); }
+});
+
+test('guessing the current password on POST /auth/password is rate-limited per account', async () => {
+  const db = openDb(':memory:');
+  const { base, close } = await listen(appWith(db).app);
+  try {
+    let cookie = cookieOf(await jpost(base, '/api/auth/login', { username: 'admin', password: 'admin' }));
+    const changed = await jpost(base, '/api/auth/password', { newPassword: 'first-real-pass' }, cookie);
+    cookie = cookieOf(changed) ?? cookie;
+    for (let i = 0; i < 5; i++) {
+      const wrong = await jpost(base, '/api/auth/password', { currentPassword: `guess-${i}`, newPassword: 'x-new-pass-1' }, cookie);
+      assert.equal(wrong.status, 400, `guess ${i}`);
+    }
+    const locked = await jpost(base, '/api/auth/password', { currentPassword: 'first-real-pass', newPassword: 'x-new-pass-1' }, cookie);
+    assert.equal(locked.status, 429);
+    assert.ok(Number(locked.headers.get('retry-after')) > 0);
   } finally { close(); }
 });

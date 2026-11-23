@@ -179,3 +179,12 @@ test('utterancesBetween applies speaker renames', () => {
   const rows = db.utterancesBetween(id, 10, 20);
   assert.deepEqual(rows.map((u) => [u.text, u.display_name]), [['line 1', 'Character'], ['line 2', 'Character']]);
 });
+
+test('hasUtterances answers whether a meeting has any transcript line, without loading them', () => {
+  const db = openDb(':memory:');
+  const id = db.createMeeting({ guildId: 'g', channelId: 'c', channelName: 'x', startedAt: 'now' });
+  assert.equal(db.hasUtterances(id), false);
+  db.addUtterance({ meetingId: id, userId: 'u', displayName: 'A', startMs: 0, endMs: 1, text: 'hi' });
+  assert.equal(db.hasUtterances(id), true);
+  assert.equal(db.hasUtterances(id + 1), false);
+});

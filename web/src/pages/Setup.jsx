@@ -9,6 +9,8 @@ import { Page, PageHead } from '../components/Page.jsx';
 import { Icon, Empty } from '../components/ui.jsx';
 import { ModelPicker } from '../components/ModelPicker.jsx';
 import { ConnectionForm, BotStatusBadge } from '../components/Connection.jsx';
+import SecretEditor from '../components/SecretEditor.jsx';
+import SidecarControl from '../components/SidecarControl.jsx';
 
 const WHISPER = ['tiny', 'base', 'small', 'medium', 'large-v3', 'large-v3-turbo'];
 
@@ -166,7 +168,9 @@ function Switch({ checked, onChange, label, desc }) {
       </span>
       <span className="relative shrink-0 mt-0.5">
         <input type="checkbox" checked={checked} onChange={onChange} className="peer sr-only" />
-        <span className="block h-6 w-10 rounded-full bg-surface-3 peer-checked:bg-primary transition-colors" />
+        <span className="block h-6 w-10 rounded-full bg-surface-3 peer-checked:bg-primary transition-colors
+          peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-primary
+          peer-disabled:opacity-50" />
         <span className="absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform peer-checked:translate-x-4" />
       </span>
     </label>
@@ -178,147 +182,27 @@ function Chevron() {
 }
 
 /* ── API key editor ───────────────────────────────────────────────────────
-   Shows a "set / not set" badge; lets the user paste a new key (saved to .env,
-   applied live) or clear it. The value is never read back from the server. */
+   A provider's key, saved to .env and applied live. Never read back. */
 function KeyEditor({ provider, present, onChanged, autoEdit = false }) {
   const envVar = KEYED[provider];
-  const [editing, setEditing] = useState(autoEdit && !present);
-  const [value, setValue] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [reveal, setReveal] = useState(false);
-  const [err, setErr] = useState(null);
-
-  async function save() {
-    setBusy(true); setErr(null);
-    try { await api.setProviderKey(provider, value.trim()); setValue(''); setEditing(false); onChanged?.(); }
-    catch (e) { setErr(e?.message || 'Failed to save key'); }
-    finally { setBusy(false); }
-  }
-  async function clear() {
-    if (!window.confirm(`Remove the ${provider} API key from .env?`)) return;
-    setBusy(true); setErr(null);
-    try { await api.setProviderKey(provider, ''); setValue(''); setEditing(false); onChanged?.(); }
-    catch (e) { setErr(e?.message || 'Failed to clear key'); }
-    finally { setBusy(false); }
-  }
-
   return (
-    <Field label="API key" hint={err ? undefined : <>Stored in <code className="text-ink-2">.env</code> as <code className="text-ink-2">{envVar}</code> · get one at {KEY_HELP[provider]}</>}>
-      {!editing ? (
-        <div className="flex items-center gap-2">
-          <span className={`inline-flex items-center gap-1.5 text-[13px] font-medium px-2.5 py-1.5 rounded-sm ${present ? 'text-accent bg-accent-soft' : 'text-warn bg-warn-soft'}`}>
-            <span style={{ width: 6, height: 6, borderRadius: 6, background: 'currentColor' }} />
-            {present ? 'Key set' : 'No key'}
-          </span>
-          <button onClick={() => setEditing(true)} className="btn btn-ghost !py-1.5">{present ? 'Replace' : 'Add key'}</button>
-          {present && <button onClick={clear} disabled={busy} className="btn btn-ghost !py-1.5 !text-error">Remove</button>}
-        </div>
-      ) : (
-        <div className="flex items-center gap-2">
-          <div className="relative flex-1">
-            <input
-              type={reveal ? 'text' : 'password'} value={value} autoFocus
-              onChange={(e) => setValue(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') save(); if (e.key === 'Escape') { setEditing(false); setValue(''); } }}
-              placeholder={`Paste ${provider} API key…`} className="input !pr-10" />
-            <button type="button" onClick={() => setReveal((r) => !r)}
-              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted hover:text-ink text-xs">{reveal ? 'Hide' : 'Show'}</button>
-          </div>
-          <button onClick={save} disabled={!value.trim() || busy} className="btn btn-primary !py-2">{busy ? 'Saving…' : 'Save'}</button>
-          <button onClick={() => { setEditing(false); setValue(''); }} disabled={busy} className="btn btn-ghost !py-2">Cancel</button>
-        </div>
-      )}
-      {err && <p className="text-xs text-error mt-1.5">{err}</p>}
-    </Field>
+    <SecretEditor label="API key" present={present} autoEdit={autoEdit}
+      hint={<>Stored in <code className="text-ink-2">.env</code> as <code className="text-ink-2">{envVar}</code> · get one at {KEY_HELP[provider]}</>}
+      inputLabel={`${provider} API key`} placeholder={`Paste ${provider} API key…`}
+      removeConfirm={`Remove the ${provider} API key from .env?`}
+      onSave={async (key) => { await api.setProviderKey(provider, key); onChanged?.(); }} />
   );
 }
 
-/* ── Local sidecar status + on/off control ─────────────────────────────────
-   The sidecar is the local faster-whisper process. It's a single global backend
-   (not per-guild), so this lives off `sys.sidecar` from /system/status. Shows a
-   live state pill and a Start/Stop button; hidden entirely when the sidecar is
-   unmanaged here (e.g. running as its own Docker container). */
-function SidecarControl({ sys, onChanged }) {
-  const sc = sys?.sidecar;
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState(null);
-  if (!sc) return null; // standalone web server with no controller attached
-
-  const map = {
-    running: { label: 'Running', color: 'var(--accent)', bg: 'var(--accent-soft)' },
-    starting: { label: 'Starting…', color: 'var(--warn)', bg: 'var(--warn-soft)' },
-    error: { label: 'Stopped', color: 'var(--error)', bg: 'var(--error-soft)' },
-    stopped: { label: 'Stopped', color: 'var(--muted)', bg: 'var(--surface-3)' },
-  };
-  const s = map[sc.state] || map.stopped;
-  const running = sc.state === 'running';
-
-  async function act(action) {
-    setBusy(true); setErr(null);
-    try { await api.sidecarAction(action); await onChanged?.(); }
-    catch (e) { setErr(e?.message || `Failed to ${action} sidecar`); }
-    finally { setBusy(false); }
-  }
-
-  if (!sc.managed) {
-    return (
-      <div className="rounded-md bg-surface-2 px-3.5 py-3 text-xs text-muted">
-        The local whisper sidecar is managed outside this process
-        {sc.url ? <> (<code className="text-ink-2">{sc.url}</code>)</> : null}. In Docker it runs as its
-        own container and starts/stops with <code className="text-ink-2">docker compose</code>.
-      </div>
-    );
-  }
-
+// Shared secret the sidecar can require (its STT_API_KEY) so other devices on
+// the network can't use it. Write-only, like the provider keys.
+function SidecarKeySetting({ present, onSaved }) {
   return (
-    <div className="rounded-md border border-border px-3.5 py-3">
-      <div className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-[13px] font-medium text-ink">Local sidecar</span>
-          <span className="inline-flex items-center gap-1.5 text-xs font-medium px-2 py-0.5 rounded-full" style={{ color: s.color, background: s.bg }}>
-            <span style={{ width: 6, height: 6, borderRadius: 6, background: s.color }} />
-            {s.label}{sc.external ? ' · external' : ''}
-          </span>
-          {running && sc.device && <DeviceBadge device={sc.device} model={sc.model} batchSize={sc.batchSize} />}
-        </div>
-        <div className="flex items-center gap-2">
-          {running
-            ? <button onClick={() => act('stop')} disabled={busy} className="btn btn-ghost !py-1.5">{busy ? '…' : 'Stop'}</button>
-            : <button onClick={() => act('start')} disabled={busy} className="btn btn-primary !py-1.5">{busy ? 'Starting…' : 'Start sidecar'}</button>}
-          {running && <button onClick={() => act('restart')} disabled={busy} className="btn btn-ghost !py-1.5">Restart</button>}
-        </div>
-      </div>
-      <p className="text-xs text-muted mt-2">
-        {running
-          ? 'Transcribing locally on this machine. Turn it off to free CPU/RAM when using a cloud API.'
-          : 'Off. Start it to transcribe locally without a cloud API.'}
-      </p>
-      {running && sc.device === 'cpu' && (
-        <p className="text-xs mt-2 rounded-sm px-2.5 py-2" style={{ color: 'var(--warn)', background: 'var(--warn-soft)' }}>
-          ⚠ Running on <b>CPU</b> — transcription is roughly 7x slower than GPU and is the usual cause of
-          lag on longer meetings. If this machine has an NVIDIA GPU, install the CUDA libraries so the
-          sidecar can use it (see the README GPU section).
-        </p>
-      )}
-      {(err || sc.error) && <p className="text-xs text-error mt-1.5">{err || sc.error}</p>}
-    </div>
-  );
-}
-
-// Small pill showing the STT compute backend + model + batch size, so users can
-// see at a glance whether transcription is GPU-accelerated (fast) or on the CPU
-// fallback (slow). Green for cuda, muted/amber for cpu.
-function DeviceBadge({ device, model, batchSize }) {
-  const gpu = device === 'cuda';
-  const color = gpu ? 'var(--accent)' : 'var(--warn)';
-  const bg = gpu ? 'var(--accent-soft)' : 'var(--warn-soft)';
-  const label = gpu ? 'GPU' : device === 'cpu' ? 'CPU' : device;
-  const detail = [model, batchSize ? `batch ${batchSize}` : null].filter(Boolean).join(' · ');
-  return (
-    <span className="inline-flex items-center gap-1.5 text-xs font-medium px-2 py-0.5 rounded-full"
-      style={{ color, background: bg }} title={`STT on ${device}${detail ? ` (${detail})` : ''}`}>
-      {label}{detail ? <span className="opacity-70">· {detail}</span> : null}
-    </span>
+    <SecretEditor label="Sidecar access key" present={present} addText="Set key"
+      hint="Optional. Set the same STT_API_KEY on the sidecar to stop other devices on your network from using it."
+      inputLabel="Sidecar access key" placeholder="Paste the sidecar's STT_API_KEY…"
+      removeConfirm="Remove the sidecar access key? Parley will call the sidecar without one."
+      onSave={async (key) => { await api.setConnection({ sttApiKey: key }); await onSaved?.(); }} />
   );
 }
 
@@ -405,10 +289,15 @@ export default function Setup() {
   // One catalog per model field: the primary provider's and the fallback's.
   const models = useCatalog(data?.config?.summarizerProvider);
   const fbModels = useCatalog(data?.config?.summarizerFallbackProvider);
+  // Older servers don't report the sidecar access key; leave the field out there.
+  const sttKeySet = sys?.connection?.sttApiKeySet;
   const sidecarUrlSetting = (!authEnabled || user?.isAdmin) && (
-    <ServiceUrlSetting setting="sttUrl" label="Whisper sidecar URL" onSaved={refreshSys}
-      url={sys?.connection?.sttUrl?.value} placeholder="http://sidecar:8000"
-      hint="Use an address reachable from Parley. An empty value restores http://127.0.0.1:8000." />
+    <>
+      <ServiceUrlSetting setting="sttUrl" label="Whisper sidecar URL" onSaved={refreshSys}
+        url={sys?.connection?.sttUrl?.value} placeholder="http://sidecar:8000"
+        hint="Use an address reachable from Parley. An empty value restores http://127.0.0.1:8000." />
+      {typeof sttKeySet === 'boolean' && <SidecarKeySetting present={sttKeySet} onSaved={refreshSys} />}
+    </>
   );
 
   if (!guildId) return (
@@ -435,9 +324,12 @@ export default function Setup() {
 
   const { config: c, providers, sttProviders, channels, voiceChannels, secrets = {}, defaultModels = {}, defaultSummaryPrompt, defaultOverviewPrompt } = data;
   const save = async (patch) => {
+    // The response belongs to the server it was saved for: if the switcher
+    // moved on meanwhile (or the page reset), it must not land on screen.
+    const forGuild = guildId;
     try {
-      const r = await api.saveConfig(guildId, patch);
-      setData((d) => ({ ...d, config: r.config }));
+      const r = await api.saveConfig(forGuild, patch);
+      if (current.current === forGuild) setData((d) => (d ? { ...d, config: r.config } : d));
       setMsg('Saved'); setMsgErr(false);
       // Switching the transcription backend may have auto-started/stopped the
       // local sidecar; refresh system status so its pill reflects reality.
@@ -511,6 +403,7 @@ export default function Setup() {
               if (c.summarizerProvider === 'ollama') models.reload();
               if (c.summarizerFallbackProvider === 'ollama') fbModels.reload();
             }} />
+          <AdminFieldset isAdmin={isAdmin}>
           <Field label="Provider" hint={sumDraft ? 'Add the API key below to switch to this provider.' : undefined}>
             <div className="relative">
               <select className={sel} value={sumProvider}
@@ -558,6 +451,7 @@ export default function Setup() {
             )}
           </Field>
           )}
+          </AdminFieldset>
           {isAdmin && <PromptEditor key={guildId} label="Summary prompt" value={c.summaryPrompt}
             hint="Instructions for the transcript. Keep the JSON output shape for structured notes and todos."
             defaultValue={defaultSummaryPrompt} onSave={(summaryPrompt) => save({ summaryPrompt })} />}
@@ -630,6 +524,7 @@ export default function Setup() {
         </Card>
 
         <Card title="Delivery" desc="Where and how notes are posted in Discord.">
+          <AdminFieldset isAdmin={isAdmin}>
           <Field label="Notes channel">
             <div className="relative">
               <select className={sel} value={c.notesChannelId || ''} onChange={(e) => save({ notesChannelId: e.target.value || null })}>
@@ -639,6 +534,7 @@ export default function Setup() {
               <Chevron />
             </div>
           </Field>
+          </AdminFieldset>
           <Field label="Summary language">
             <div className="relative">
               <select className={sel} value={c.summaryLanguage} onChange={(e) => save({ summary_language: e.target.value })}>

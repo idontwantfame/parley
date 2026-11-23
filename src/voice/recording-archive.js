@@ -1,13 +1,12 @@
-import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { open, readdir, rename, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
 import { ensureMixedWav, MIXED_WAV_NAME } from './mix.js';
+import { FFMPEG_INPUT_GUARD, runFfmpeg } from './ffmpeg.js';
 
 export const MP3_NAME = 'mixed.mp3';
-const encode = promisify(execFile);
+const encode = runFfmpeg;
 
 export async function archiveRecording(audioDir, { transcriptionComplete, run = encode } = {}) {
   const output = join(audioDir, MP3_NAME);
@@ -17,7 +16,7 @@ export async function archiveRecording(audioDir, { transcriptionComplete, run = 
     const temporary = join(audioDir, `.${randomUUID()}.mp3`);
     try {
       await (await open(temporary, 'wx', 0o600)).close();
-      await run('ffmpeg', ['-nostdin', '-v', 'error', '-y', '-i', wav,
+      await run('ffmpeg', ['-nostdin', '-v', 'error', '-y', ...FFMPEG_INPUT_GUARD, '-i', wav,
         '-codec:a', 'libmp3lame', '-b:a', '48k', '-f', 'mp3', temporary], { timeout: 900_000 });
       if ((await stat(temporary)).size === 0) throw new Error('The MP3 encoder returned an empty recording.');
       await rename(temporary, output);

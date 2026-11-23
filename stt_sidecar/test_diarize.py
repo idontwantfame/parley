@@ -152,3 +152,22 @@ def test_only_one_labelling_runs_at_a_time(monkeypatch):
 def test_whisperx_is_the_default_backend():
     import whisperx_backend
     assert isinstance(diarize.BACKEND, whisperx_backend.WhisperXBackend)
+
+
+def test_memory_is_given_back_after_every_labelling(monkeypatch):
+    releases = []
+    monkeypatch.setattr(diarize, "release_memory", lambda: releases.append(True))
+    use(monkeypatch, FakeBackend())
+    audio = np.zeros(16000, dtype=np.float32)
+    diarize.label_speakers(SEGMENTS, audio, "en")
+    assert releases == [True]
+    class Failing(FakeBackend):
+        def load(self):
+            def label(*args):
+                raise RuntimeError("CUDA out of memory")
+            return label
+    diarize._state.update(labeller=None, error=None)
+    use(monkeypatch, Failing())
+    with pytest.raises(RuntimeError):
+        diarize.label_speakers(SEGMENTS, audio, "en")
+    assert releases == [True, True]

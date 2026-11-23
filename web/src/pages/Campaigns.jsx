@@ -16,8 +16,15 @@ function CreateCampaign({ guildId, onCancel }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
 
+  // A slow answer for the previously selected server must not fill this
+  // server's channel list.
   useEffect(() => {
-    api.voiceChannels(guildId).then((rows) => setChannels(Array.isArray(rows) ? rows : [])).catch(() => setChannels([]));
+    let stale = false;
+    setChannels([]); setChannelId('');
+    api.voiceChannels(guildId)
+      .then((rows) => { if (!stale) setChannels(Array.isArray(rows) ? rows : []); })
+      .catch(() => { if (!stale) setChannels([]); });
+    return () => { stale = true; };
   }, [guildId]);
 
   async function submit(e) {

@@ -22,12 +22,16 @@ from __future__ import annotations
 
 import copy
 import functools
+import gc
 import importlib
 import importlib.util
 import logging
 import os
+import sys
 import threading
+import time
 import warnings
+from collections import OrderedDict
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -48,6 +52,14 @@ MODEL_ENV = "DIARIZATION_MODEL"
 # pyannote.audio 4 reports usage to otel.pyannote.ai unless this is "false".
 # A self-hosted bot shouldn't phone home by default; operators can opt in.
 TELEMETRY_ENV = "PYANNOTE_METRICS_ENABLED"
+
+# wav2vec2 alignment models kept loaded (each ~0.4-1.2 GB): the most recently
+# used languages; a third language evicts the least recently used one.
+MAX_ALIGN_MODELS = 2
+# A failed alignment-model load (e.g. a hub timeout) is not retried for this
+# long, so every request doesn't wait for the same timeout again.
+ALIGN_RETRY_SECONDS = 300
+_now = time.monotonic  # patched in tests
 
 # (segments, 16 kHz mono audio, language, min_speakers, max_speakers) -> labelled segments
 Labeller = Callable[[list[dict], np.ndarray, str, Optional[int], Optional[int]], list[dict]]
@@ -76,6 +88,23 @@ def _device() -> str:
 
 def _scrub(text: str, secret: str) -> str:
     return text.replace(secret, "***") if secret else text
+
+
+def release_memory() -> None:
+    """Collect garbage and hand torch's cached GPU memory back to the driver.
+
+    Never imports torch: if nothing loaded it there is nothing to free, and on
+    CPU (or a CPU-only torch) the cache flush is skipped.
+    """
+    gc.collect()
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as err:  # a broken CUDA context must not fail the request that just finished
+        log.warning("Could not release cached GPU memory (%s)", err)
 
 
 class WhisperXBackend:
@@ -109,7 +138,9 @@ class _Labeller:
     def __init__(self, pipeline: Any, device: str) -> None:
         self._pipeline = pipeline
         self._device = device
-        self._align_models: dict[str, Optional[AlignModel]] = {}
+        self._align_models: OrderedDict[str, AlignModel] = OrderedDict()  # LRU, newest last
+        self._no_align_model: set[str] = set()  # languages WhisperX has no aligner for
+        self._retry_after: dict[str, float] = {}  # language -> when a failed load may be retried
         self._align_lock = threading.Lock()
 
     def __call__(self, segments: list[dict], audio: np.ndarray, language: str,
@@ -139,24 +170,43 @@ class _Labeller:
             return []
 
     def _align_model(self, language: str) -> Optional[AlignModel]:
-        """The cached alignment model for `language`; None when WhisperX has
-        none (remembered) or it failed to load (retried next time)."""
+        """The alignment model for `language`, loaded on first use and kept
+        while among the MAX_ALIGN_MODELS most recent. None when WhisperX has
+        none (remembered) or it failed to load (retried after ALIGN_RETRY_SECONDS)."""
         with self._align_lock:
             if language in self._align_models:
+                self._align_models.move_to_end(language)
                 return self._align_models[language]
+            if language in self._no_align_model or _now() < self._retry_after.get(language, 0.0):
+                return None
             if not _has_align_model(language):
                 log.info("WhisperX has no alignment model for %r; keeping Whisper's word timings", language)
-                self._align_models[language] = None
+                self._no_align_model.add(language)
                 return None
-            try:
-                whisperx = importlib.import_module("whisperx")
-                model = whisperx.load_align_model(language_code=language, device=self._device)
-            except Exception as err:
-                log.warning("Could not load the %r alignment model (%s); keeping Whisper's word timings",
-                            language, err)
-                return None
-            self._align_models[language] = model
-            return model
+            self._make_room()
+            return self._load_align_model(language)
+
+    def _make_room(self) -> None:
+        """Evict least recently used models before loading, so three never coexist (caller holds _align_lock)."""
+        while len(self._align_models) >= MAX_ALIGN_MODELS:
+            evicted = next(iter(self._align_models))
+            del self._align_models[evicted]  # no reference may survive into release_memory()
+            log.info("Unloaded the %r alignment model (keeping the %d most recent)", evicted, MAX_ALIGN_MODELS)
+            release_memory()
+
+    def _load_align_model(self, language: str) -> Optional[AlignModel]:
+        """Load and cache, or remember the failure for a while (caller holds _align_lock)."""
+        try:
+            whisperx = importlib.import_module("whisperx")
+            model = whisperx.load_align_model(language_code=language, device=self._device)
+        except Exception as err:
+            self._retry_after[language] = _now() + ALIGN_RETRY_SECONDS
+            log.warning("Could not load the %r alignment model (%s); keeping Whisper's word timings "
+                        "(retrying in %d s)", language, err, ALIGN_RETRY_SECONDS)
+            return None
+        self._retry_after.pop(language, None)
+        self._align_models[language] = model
+        return model
 
 
 def _has_align_model(language: str) -> bool:

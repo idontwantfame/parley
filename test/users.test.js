@@ -12,16 +12,45 @@ test('hashPassword + verifyPassword round-trips and rejects wrong passwords', as
   assert.equal(await verifyPassword('hunter2', 'garbage'), false);
 });
 
-test('installUsers seeds a default admin / admin on first run', async () => {
+// Collects what installUsers logs (the first-run password box).
+function logCapture() {
+  const lines = [];
+  const push = (...args) => lines.push(args.join(' '));
+  return { lines, log: { warn: push, info: push, log: push } };
+}
+const loggedPassword = (lines) => /password:\s*(\S+)/.exec(lines.join('\n'))?.[1];
+
+test('installUsers seeds the admin with a random first-run password, printed to the log once', async () => {
   const db = openDb(':memory:');
-  const users = installUsers(db);
+  const { lines, log } = logCapture();
+  const users = installUsers(db, { log });
   assert.equal(users.countUsers(), 1);
-  const admin = await users.authenticate('admin', 'admin');
+  const password = loggedPassword(lines);
+  assert.ok(password && password.length >= 20, `logged password: ${password}`);
+  const admin = await users.authenticate('admin', password);
   assert.ok(admin);
   assert.equal(admin.isAdmin, true);
   assert.equal(admin.mustChangePassword, true);
-  // Wrong password fails.
-  assert.equal(await users.authenticate('admin', 'wrong'), null);
+  assert.equal(await users.authenticate('admin', 'admin'), null, 'no well-known default password');
+  assert.equal(users.firstRunPasswordInLog(), true);
+  assert.equal(users.defaultPasswordActive(), true);
+
+  const again = logCapture();
+  installUsers(db, { log: again.log });
+  assert.deepEqual(again.lines, [], 'printed only at first boot');
+  const other = logCapture();
+  installUsers(openDb(':memory:'), { log: other.log });
+  assert.notEqual(loggedPassword(other.lines), password, 'random per install');
+});
+
+test('an existing database keeps its admin/admin account; it is not reported as a logged first-run password', async () => {
+  const db = openDb(':memory:');
+  installUsers(db, { firstRunPassword: 'admin', log: logCapture().log });
+  db.sql.prepare(`DELETE FROM app_settings WHERE key = 'first_run_password_in_log'`).run(); // as written by older versions
+  const users = installUsers(db, { log: logCapture().log });
+  assert.ok(await users.authenticate('admin', 'admin'));
+  assert.equal(users.defaultPasswordActive(), true);
+  assert.equal(users.firstRunPasswordInLog(), false);
 });
 
 test('installUsers does not duplicate the admin on re-install', () => {
@@ -34,7 +63,7 @@ test('installUsers does not duplicate the admin on re-install', () => {
 
 test('username lookup is case-insensitive', async () => {
   const db = openDb(':memory:');
-  const users = installUsers(db);
+  const users = installUsers(db, { firstRunPassword: 'admin', log: logCapture().log });
   assert.ok(await users.authenticate('ADMIN', 'admin'));
 });
 
@@ -47,7 +76,7 @@ test('createUser enforces unique usernames', () => {
 
 test('setPassword clears must_change_password and changes the credential', async () => {
   const db = openDb(':memory:');
-  const users = installUsers(db);
+  const users = installUsers(db, { firstRunPassword: 'admin', log: logCapture().log });
   const admin = users.getUserByUsername('admin');
   users.setPassword(admin.id, 'newsecret');
   assert.equal(await users.authenticate('admin', 'admin'), null);

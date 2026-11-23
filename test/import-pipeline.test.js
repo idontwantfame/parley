@@ -221,3 +221,59 @@ test('the default sidecar client uses the import timeout and does not retry it',
     cleanup();
   }
 });
+
+test('imports run one at a time: a second import waits as "queued" until the first is transcribed', async () => {
+  const { dir, db, meetingId: first, uploadPath, cleanup } = setup();
+  try {
+    const second = db.createImportedMeeting({ guildId: 'g1', title: 'Second', startedAt: STARTED });
+    const secondUpload = join(dir, 'imports', 'second.m4a');
+    writeFileSync(secondUpload, 'more bytes');
+    const order = [];
+    let releaseFirst;
+    const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+    const deps = (name, gate) => ({ dataDir: dir, runFfmpeg: fakeFfmpeg(), summarizer: quietSummarizer(),
+      transcribe: async () => { order.push(`${name}:start`); await gate; order.push(`${name}:end`); return DIARIZED; } });
+
+    const a = runImport(db, first, { uploadPath, speakers: true }, deps('a', firstGate));
+    const b = runImport(db, second, { uploadPath: secondUpload, speakers: true }, deps('b', null));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(meetingProgress(second).stage, 'queued');
+    assert.deepEqual(order, ['a:start']);
+    releaseFirst();
+    await Promise.all([a, b]);
+
+    assert.deepEqual(order, ['a:start', 'a:end', 'b:start', 'b:end']);
+    assert.equal(db.getMeeting(second).status, 'done');
+  } finally { cleanup(); }
+});
+
+test('a failed import frees the import slot for the next one', async () => {
+  const { dir, db, meetingId: first, uploadPath, cleanup } = setup();
+  try {
+    const second = db.createImportedMeeting({ guildId: 'g1', title: 'Second', startedAt: STARTED });
+    const secondUpload = join(dir, 'imports', 'second.m4a');
+    writeFileSync(secondUpload, 'more bytes');
+    const failing = { dataDir: dir, runFfmpeg: fakeFfmpeg(), summarizer: quietSummarizer(),
+      transcribe: async () => { throw new Error('sidecar down'); } };
+    const working = { dataDir: dir, runFfmpeg: fakeFfmpeg(), summarizer: quietSummarizer(), transcribe: async () => DIARIZED };
+
+    const a = runImport(db, first, { uploadPath, speakers: true }, failing);
+    const b = runImport(db, second, { uploadPath: secondUpload, speakers: true }, working);
+    await assert.rejects(a, /sidecar down/);
+    await b;
+    assert.equal(db.getMeeting(second).status, 'done');
+  } finally { cleanup(); }
+});
+
+test('the upload is opened by ffmpeg with only local file and pipe protocols', async () => {
+  const { dir, db, meetingId, uploadPath, cleanup } = setup();
+  try {
+    const calls = [];
+    await runImport(db, meetingId, { uploadPath }, { dataDir: dir, runFfmpeg: fakeFfmpeg(calls),
+      summarizer: quietSummarizer(), transcribe: async () => DIARIZED });
+    const { args } = calls[0];
+    const guard = args.indexOf('-protocol_whitelist');
+    assert.ok(guard >= 0 && guard < args.indexOf('-i'), args.join(' '));
+    assert.equal(args[guard + 1], 'file,pipe');
+  } finally { cleanup(); }
+});
