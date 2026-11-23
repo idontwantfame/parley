@@ -444,7 +444,7 @@ export default function Setup() {
       // Switching the transcription backend may have auto-started/stopped the
       // local sidecar; refresh system status so its pill reflects reality.
       if (patch.sttProvider !== undefined) refreshSys?.();
-      return true;
+      return r;
     } catch (e) { setMsg(e.message); setMsgErr(true); return false; }
     finally { setTimeout(() => setMsg(''), 2400); }
   };
@@ -655,6 +655,7 @@ export default function Setup() {
 
         <Card title="Behavior">
           <AdminFieldset isAdmin={isAdmin}>
+          <BotNameSetting key={`${guildId}:${c.botNickname ?? ''}`} value={c.botNickname} save={save} />
           <Switch checked={c.autoJoin} onChange={(e) => save({ autoJoin: e.target.checked })}
             label="Auto-join voice" desc="Start recording automatically when a voice channel reaches the minimum below." />
           <Field label="Minimum people to auto-join" hint="Counts people only. Set to 1 to record solo sessions automatically.">
@@ -676,6 +677,43 @@ export default function Setup() {
         <SpeakerNames key={guildId} guildId={guildId} />
       </div>
     </Page>
+  );
+}
+
+// Discord nicknames are 32 characters; "[REC] " is added while recording.
+const BOT_NAME_MAX = 26;
+
+/** The bot's nickname in this server, applied in Discord as soon as it's saved. */
+function BotNameSetting({ value, save }) {
+  const [saving, setSaving] = useState(false);
+  const [note, setNote] = useState(null);
+
+  async function submit(event) {
+    event.preventDefault();
+    const name = String(new FormData(event.currentTarget).get('botName') ?? '').trim();
+    setSaving(true); setNote(null);
+    try {
+      const r = await save({ botNickname: name || null });
+      if (r?.nicknameError) {
+        const permission = /permission/i.test(r.nicknameError)
+          ? ' Give the bot the Change Nickname permission in this server.' : '';
+        setNote(`Saved, but Discord didn't apply it: ${r.nicknameError}.${permission}`);
+      }
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Field label="Bot name"
+      hint={`The bot's nickname in this server, shown as “[REC] name” while recording. Up to ${BOT_NAME_MAX} characters. Leave empty to use its Discord account name.`}>
+      <form className="flex items-center gap-2" onSubmit={submit}>
+        <input className="input flex-1" name="botName" aria-label="Bot name" defaultValue={value ?? ''}
+          placeholder="Discord account name" autoComplete="off" />
+        <button className="btn btn-primary" type="submit" disabled={saving}>{saving ? 'Saving…' : 'Save name'}</button>
+      </form>
+      {note && <p className="text-xs text-error mt-1.5" role="alert">{note}</p>}
+    </Field>
   );
 }
 

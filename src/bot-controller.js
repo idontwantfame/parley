@@ -122,6 +122,17 @@ export class BotController {
     return { ok: true };
   }
 
+  /**
+   * Apply a guild's bot name (nickname) now, e.g. after it changed in Settings.
+   * Resolves false when the bot isn't connected (it applies configured names
+   * when it connects); rejects if Discord refuses the change.
+   */
+  async applyNickname(guildId) {
+    if (!this.bot?.applyNickname || this.state !== 'ready') return false;
+    await this.bot.applyNickname(guildId);
+    return true;
+  }
+
   /** Stop then start — used after credentials change in the UI. */
   async restart() {
     await this.stop();

@@ -558,3 +558,51 @@ test('PATCH config validates a bare sttModel against the STORED stt provider', a
     assert.equal((await ok.json()).config.sttModel, 'whisper-1');
   } finally { close(); }
 });
+
+test('PATCH config botNickname is admin-only and applied to Discord right away', async () => {
+  const db = openDb(':memory:');
+  db.upsertGuild('g1', 'Guild One');
+  const applied = [];
+  const bot = { applyNickname: async (guildId) => { applied.push(guildId); } };
+  const app = express();
+  app.use(express.json());
+  app.use('/api', apiRouter({ db, bot, client: null }));
+  const { base, close } = await listen(app);
+  const member = await listen(appWithUser(db, { id: 2, username: 'm', isAdmin: false }));
+  try {
+    const patch = (b, body) => fetch(`${b}/api/guilds/g1/config`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    assert.equal((await patch(member.base, { botNickname: 'Nope' })).status, 403);
+
+    const ok = await patch(base, { botNickname: ' Scribe ' });
+    assert.equal(ok.status, 200);
+    const body = await ok.json();
+    assert.equal(body.config.botNickname, 'Scribe');
+    assert.equal(body.nicknameError, null);
+    assert.deepEqual(applied, ['g1']);
+
+    // Unrelated settings don't touch the nickname.
+    await patch(base, { useThread: false });
+    assert.deepEqual(applied, ['g1']);
+  } finally { close(); member.close(); }
+});
+
+test('PATCH config botNickname saves even when Discord refuses the nickname', async () => {
+  const db = openDb(':memory:');
+  db.upsertGuild('g1', 'Guild One');
+  const bot = { applyNickname: async () => { throw new Error('Missing Permissions'); } };
+  const app = express();
+  app.use(express.json());
+  app.use('/api', apiRouter({ db, bot, client: null }));
+  const { base, close } = await listen(app);
+  try {
+    const res = await fetch(`${base}/api/guilds/g1/config`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ botNickname: 'Scribe' }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.config.botNickname, 'Scribe');
+    assert.match(body.nicknameError, /Missing Permissions/);
+  } finally { close(); }
+});

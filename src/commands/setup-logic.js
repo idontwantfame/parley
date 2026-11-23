@@ -2,6 +2,7 @@ import { SUPPORTED_PROVIDERS } from '../adapters/summarizer/index.js';
 import { DEFAULT_MODELS } from '../adapters/summarizer/models.js';
 import { LANGUAGE_CODES, SUMMARY_LANGUAGE_VALUES } from '../adapters/summarizer/languages.js';
 import { STT_PROVIDERS, STT_MODELS, sttProviderReady } from '../adapters/stt/index.js';
+import { parseBotName } from '../voice/nickname.js';
 
 const WHISPER_MODELS = ['tiny', 'base', 'small', 'medium', 'large-v3', 'large-v3-turbo'];
 
@@ -142,6 +143,12 @@ export function validateSetup(input, env, current = null) {
       return { ok: false, error: `Invalid summary language. Use one of: ${[...SUMMARY_LANGUAGE_VALUES].join(', ')}.` };
     }
     patch.summaryLanguage = input.summary_language;
+  }
+
+  if (input.botNickname !== undefined) {
+    const name = parseBotName(input.botNickname);
+    if (!name.ok) return { ok: false, error: name.error };
+    patch.botNickname = name.value;
   }
 
   for (const [field, label, limit] of [

@@ -338,7 +338,9 @@ Edit speaker labels in **Settings → Speaker display names**. Overrides apply b
 
 In **Settings → Summarizer**, the **Summary prompt** instructs the model to extract structured JSON notes from the transcript. For long Ollama summaries, the **Overview prompt** controls the final recap from the chunk overviews. Ask for plain text in that field. The prompts are saved per server, and **Restore default** restores the built-in wording.
 
-Set `DISCORD_RECORDING_NICKNAME` in your environment to customize the bot's nickname while recording. The default is `[REC] Meeting Bot`, and custom nicknames can be up to 32 characters. For example, use `DISCORD_RECORDING_NICKNAME="[REC] Notes Bot"` to keep the recording indicator with a different name.
+To rename the bot in a server, set **Settings → Behavior → Bot name** (admins only). It becomes the bot's nickname there right away, and shows as `[REC] <name>` while recording; names can be up to 26 characters, and the bot needs Discord's **Change Nickname** permission. Leave it empty to keep the Discord account name.
+
+Without a bot name, set `DISCORD_RECORDING_NICKNAME` in your environment to customize the bot's nickname while recording. The default is `[REC] Meeting Bot`, and custom nicknames can be up to 32 characters. For example, use `DISCORD_RECORDING_NICKNAME="[REC] Notes Bot"` to keep the recording indicator with a different name.
 
 `/setup` (requires the **Manage Server** permission) writes per-guild config, applied without a restart.
 

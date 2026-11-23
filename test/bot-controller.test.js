@@ -160,3 +160,20 @@ test('a hung shutdown is cut off at the limit', async () => {
   await new Promise((r) => setTimeout(r, 60));
   assert.deepEqual(exits, [1]);
 });
+
+test('applyNickname forwards to the running bot; offline it defers to the next connect', async () => {
+  const bot = fakeBot();
+  bot.applyNickname = async (guildId) => { bot.calls.push(`nick:${guildId}`); };
+  const ctl = controller([bot]);
+  // Not an error: the bot applies configured names when it connects.
+  assert.equal(await ctl.applyNickname('g'), false);
+  await ctl.start();
+  // Still logging in: the guild cache is empty, so defer to the ready handler.
+  assert.equal(await ctl.applyNickname('g'), false);
+  bot.client.emit('clientReady', bot.client);
+  assert.equal(await ctl.applyNickname('g'), true);
+  assert.ok(bot.calls.includes('nick:g'));
+  // Discord refusing the change is surfaced to the caller.
+  bot.applyNickname = async () => { throw new Error('Missing Permissions'); };
+  await assert.rejects(ctl.applyNickname('g'), /Missing Permissions/);
+});

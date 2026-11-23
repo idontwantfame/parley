@@ -22,6 +22,7 @@ import { processMeeting } from './pipeline/orchestrator.js';
 import { getSummarizer } from './adapters/summarizer/index.js';
 import { resolveSummaryLanguage } from './adapters/summarizer/languages.js';
 import { shouldAutoJoin, shouldAutoLeave, botMovedAway } from './voice/decisions.js';
+import { nicknameFor } from './voice/nickname.js';
 import { validateSetup, formatConfigReply } from './commands/setup-logic.js';
 import { handleAutocomplete } from './commands/autocomplete.js';
 import { resolveGuildMeeting, renderStatus, renderHistory } from './commands/meeting-lookup.js';
@@ -116,10 +117,29 @@ export function startBot({ db, audioRoot }) {
   function humanCount(channel) {
     return channel.members.filter((m) => !m.user.bot).size;
   }
+  // The guild's nickname for the bot: its configured name (Settings → Bot
+  // name), with a "[REC] " prefix while recording so members can see it.
+  function nicknameIn(guildId, recording) {
+    const { botNickname } = getGuildConfig(db, guildId);
+    return nicknameFor({ name: botNickname, recording }, config.recordingNickname);
+  }
   function setRecIndicator(guild, on) {
-    guild.members.me?.setNickname(on ? config.recordingNickname : null).catch((e) => {
+    guild.members.me?.setNickname(nicknameIn(guild.id, on)).catch((e) => {
       console.warn('Nickname change failed:', e.message);
     });
+  }
+  // Apply the configured name now (recording-aware). Rejects with Discord's
+  // reason (e.g. missing Change Nickname permission) so callers can report it.
+  async function applyNickname(guildId) {
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild?.members.me) throw new Error('The bot is not in that server.');
+    await guild.members.me.setNickname(nicknameIn(guildId, Boolean(manager.activeInGuild(guildId))));
+  }
+  // On connect / joining a server: apply a configured name. Servers without
+  // one are left alone, so a nickname set by hand in Discord survives.
+  function applyConfiguredNickname(guild) {
+    if (!getGuildConfig(db, guild.id).botNickname) return;
+    applyNickname(guild.id).catch((e) => console.warn(`Bot name for guild ${guild.id} not applied: ${e.message}`));
   }
   function destroyConnection(connection) {
     if (connection && connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
@@ -314,6 +334,7 @@ export function startBot({ db, audioRoot }) {
       // Persist the guild's human name so the web UI can label it even when read
       // without a live Discord client (e.g. the standalone API server).
       db.upsertGuild(guildId, guild.name);
+      applyConfiguredNickname(guild);
       await deployCommands(config.discordClientId, config.discordToken, guildId)
         .then(() => console.log(`Registered commands in guild ${guildId}`))
         .catch((e) => console.error(`deploy to guild ${guildId} failed:`, e.message));
@@ -327,6 +348,7 @@ export function startBot({ db, audioRoot }) {
   // immediately without waiting for a restart.
   client.on('guildCreate', (guild) => {
     db.upsertGuild(guild.id, guild.name);
+    applyConfiguredNickname(guild);
     deployCommands(config.discordClientId, config.discordToken, guild.id)
       .then(() => console.log(`Registered commands in new guild ${guild.id}`))
       .catch((e) => console.error(`deploy to new guild ${guild.id} failed:`, e.message));
@@ -549,5 +571,5 @@ export function startBot({ db, audioRoot }) {
   client.login(config.discordToken).catch((err) => {
     client.emit('error', err instanceof Error ? err : new Error(String(err)));
   });
-  return { client, manager, stopAndLeave, cancelJoin, quiesce };
+  return { client, manager, stopAndLeave, cancelJoin, quiesce, applyNickname };
 }

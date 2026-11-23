@@ -228,3 +228,12 @@ test('the /setup reply still fits when the config itself is huge', () => {
   const big = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`k${i}`, 'v'.repeat(50)]));
   assert.ok(formatConfigReply(big).length <= 2000);
 });
+
+test('validateSetup accepts, trims and clears a bot name, and rejects an over-long one', () => {
+  assert.deepEqual(validateSetup({ botNickname: '  Scribe ' }, {}).patch, { botNickname: 'Scribe' });
+  assert.deepEqual(validateSetup({ botNickname: '' }, {}).patch, { botNickname: null });
+  assert.deepEqual(validateSetup({ botNickname: null }, {}).patch, { botNickname: null });
+  const tooLong = validateSetup({ botNickname: 'x'.repeat(27) }, {});
+  assert.equal(tooLong.ok, false);
+  assert.match(tooLong.error, /26 characters/);
+});

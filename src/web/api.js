@@ -474,6 +474,19 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
     });
   });
 
+  // Apply a changed bot name in Discord right away. Best-effort: the setting is
+  // saved either way, and a refusal (usually a missing Change Nickname
+  // permission) is returned so the UI can say why the name didn't change.
+  async function applyBotNickname(guildId) {
+    if (typeof bot?.applyNickname !== 'function') return null;
+    try {
+      await bot.applyNickname(guildId);
+      return null;
+    } catch (e) {
+      return e?.message || 'Discord refused the nickname change.';
+    }
+  }
+
   // Open to every user for everyday settings; ADMIN_CONFIG_FIELDS need an admin.
   r.patch('/guilds/:g/config', requireAdminForFields(ADMIN_CONFIG_FIELDS), async (req, res) => {
     const isKnown = db.isKnownGuild(req.params.g) || !!liveClient()?.guilds?.cache?.has?.(req.params.g);
@@ -500,7 +513,8 @@ export function apiRouter({ db, bot = null, client = null, sidecar = null, mixAu
         sidecarStatus = sidecar.status();
       } catch { /* surface via status only */ }
     }
-    res.json({ ok: true, config, sidecar: sidecarStatus });
+    const nicknameError = result.patch.botNickname !== undefined ? await applyBotNickname(req.params.g) : null;
+    res.json({ ok: true, config, sidecar: sidecarStatus, nicknameError });
   });
 
   // Full model catalog for a provider, queried live (Gemini ListModels, the

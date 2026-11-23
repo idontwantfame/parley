@@ -98,3 +98,46 @@ test('setGuildConfig persists sttProvider + sttModel', () => {
   assert.equal(c.sttModel, 'whisper-1');
   assert.equal(c.whisperModel, DEFAULTS.whisperModel); // sidecar model untouched
 });
+
+test('setGuildConfig persists the bot name and defaults it to null', () => {
+  const db = openDb(':memory:');
+  assert.equal(DEFAULTS.botNickname, null);
+  assert.equal(getGuildConfig(db, 'g').botNickname, null);
+  setGuildConfig(db, 'g', { botNickname: 'Scribe' });
+  assert.equal(getGuildConfig(db, 'g').botNickname, 'Scribe');
+  setGuildConfig(db, 'g', { autoJoin: false }); // unrelated update keeps it
+  assert.equal(getGuildConfig(db, 'g').botNickname, 'Scribe');
+  setGuildConfig(db, 'g', { botNickname: null });
+  assert.equal(getGuildConfig(db, 'g').botNickname, null);
+});
+
+test('openDb adds bot_nickname to an existing guild_config without losing its rows', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'parley-botname-'));
+  const path = join(dir, 'meetings.db');
+  let db;
+  try {
+    const raw = new DatabaseSync(path);
+    // The original guild_config: every column the migrations don't add.
+    raw.exec(`CREATE TABLE guild_config (
+      guild_id TEXT PRIMARY KEY, summarizer_provider TEXT, summarizer_model TEXT,
+      whisper_model TEXT, notes_channel_id TEXT, use_thread INTEGER, auto_join INTEGER, language TEXT
+    );`);
+    raw.prepare(`INSERT INTO guild_config (guild_id, summarizer_provider, use_thread) VALUES ('g', 'ollama', 0)`).run();
+    raw.close();
+
+    db = openDb(path);
+    assert.ok(db.sql.prepare(`PRAGMA table_info(guild_config)`).all().some((c) => c.name === 'bot_nickname'));
+    const before = getGuildConfig(db, 'g');
+    assert.equal(before.summarizerProvider, 'ollama');
+    assert.equal(before.botNickname, null);
+    setGuildConfig(db, 'g', { botNickname: 'Scribe' });
+    assert.equal(getGuildConfig(db, 'g').botNickname, 'Scribe');
+  } finally {
+    db?.sql.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

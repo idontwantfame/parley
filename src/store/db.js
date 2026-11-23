@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS guild_config (
   whisper_model TEXT, notes_channel_id TEXT,
   use_thread INTEGER, auto_join INTEGER, auto_join_min_people INTEGER, auto_join_channel_ids TEXT,
   language TEXT, summary_language TEXT,
-  summary_prompt TEXT, overview_prompt TEXT, keep_audio INTEGER
+  summary_prompt TEXT, overview_prompt TEXT, keep_audio INTEGER,
+  bot_nickname TEXT
 );
 CREATE TABLE IF NOT EXISTS guilds (
   guild_id TEXT PRIMARY KEY,
@@ -137,6 +138,9 @@ export function openDb(path) {
   }
   if (!sql.prepare('PRAGMA table_info(meetings)').all().some((c) => c.name === 'audio_retained')) {
     sql.exec('ALTER TABLE meetings ADD COLUMN audio_retained INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!cols.some((c) => c.name === 'bot_nickname')) {
+    sql.exec(`ALTER TABLE guild_config ADD COLUMN bot_nickname TEXT`);
   }
   if (!cols.some((c) => c.name === 'summary_language')) {
     sql.exec(`ALTER TABLE guild_config ADD COLUMN summary_language TEXT`);
